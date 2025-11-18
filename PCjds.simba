@@ -8,8 +8,8 @@ program WaspPestControl;
 {$I WaspLib/osr.simba}
 
 const
-  PointsPerGame = 7;//veterans boat, med diary = 7
-
+  PointsPerGame =   7;//veterans boat, med diary = 7
+  _PCWorld      = 344;// Pest Control World is 344
 {********************************************}
 {                 ENUM STATES                }
 {********************************************}
@@ -37,7 +37,7 @@ type
     PlankTile        : TPoint;
     CrossPlankTile   : TPoint;
 
-    // These used to be for Heartbeat; now effectively unused but harmless
+    // Legacy heartbeat fields (unused but harmless)
     LastBeat         : UInt64;
     HeartbeatInterval: Int32;
 
@@ -53,25 +53,48 @@ type
     GamesWon      : UInt32;
     LastWinTime   : UInt64;
     WinCooldown   : UInt64;
+
+    CachedPos      : TPoint;
+    CachedPosTime  : UInt64;
+    PosCacheDelay  : UInt32;   // milliseconds to trust cached pos
+  end;
+
+  {********************************************}
+  {                 HUD RECORD                 }
+  {********************************************}
+
+  TPestHUD = record
+    LastUpdate: UInt64;
+    Text      : TStringArray;
   end;
 
 var
   PestControl: TPestControl;
+  PestHUD    : TPestHUD;
+
+function HumanGauss(minVal, maxVal, mean, stdev: Double; bioWeight: Double = 0): Int32;
+var
+  r: Double;
+begin
+  // Generate base Gaussian
+  r := SRL.GaussRand(mean, stdev);
+
+  // Add user-specific noise (zero-mean, does not increase range)
+  if bioWeight <> 0 then
+    r += (BioHash - 0.5) * bioWeight;
+
+  // Clamp inside range
+  if r < minVal then r := minVal;
+  if r > maxVal then r := maxVal;
+
+  // Convert to ms
+  Result := Round(r * 1000);
+end;
 
 
 {********************************************}
 {                ANTIBAN SETUP               }
 {********************************************}
-
-procedure TAntiban.SetupBreaks(); override;
-begin
-  if Self.Breaks <> [] then
-    Exit;
-
-  Self.AddBreak(45  * ONE_MINUTE,  3 * ONE_MINUTE, 0.33, 0.15);
-  Self.AddBreak(90  * ONE_MINUTE,  6 * ONE_MINUTE, 0.33, 0.25 + BioHash);
-  Self.AddBreak(150 * ONE_MINUTE, 15 * ONE_MINUTE, 0.33, 0.45 + BioHash);
-end;
 
 procedure TAntiban.Setup(); override;
 begin
@@ -111,6 +134,71 @@ begin
 end;
 
 
+procedure TPestHUD.UpdateAndDraw();
+const
+  BG_COLOR      = $151515;
+  BORDER_COLOR  = $CC2A2A;
+  HEADER_COLOR  = $D6B43A;
+  TEXT_COLOR    = $E0E0E0;
+var
+  elapsed: UInt64;
+  winsPerHour: Double;
+  i, lineHeight: Int32;
+  tbox: TBox;
+  x, y: Int32;
+begin
+  // Run only every 10 seconds
+  if (GetSystemTime - LastUpdate) < 10000 then
+    Exit;
+  LastUpdate := GetSystemTime;
+
+  // ==== COMPUTE HUD TEXT ====
+  Text := [];
+
+  elapsed := PestControl.TimeRunning.ElapsedTime();
+  winsPerHour := NumberPerHour(PestControl.GamesWon, elapsed);
+
+  Text += 'Pest Control - Defender';
+  Text += 'Runtime: ' + SRL.MsToTime(elapsed, Time_Short).Trim();
+  Text += 'State: ' + ToStr(PestControl.State);
+  Text += 'Wins: ' + IntToStr(PestControl.GamesWon);
+  Text += 'Wins/hr: ' + SRL.FormatNumber(winsPerHour, 2);
+  Text += 'Points/hr: ' + SRL.FormatNumber(winsPerHour * PointsPerGame, 2);
+  Text += 'Total EXP: ' + SRL.FormatNumber(XPBar.TotalEarnedXP(), 2);
+  Text += 'XP/hr: ' + SRL.FormatNumber(
+                     NumberPerHour(XPBar.TotalEarnedXP(), elapsed), 2
+                   );
+
+  // ==== DRAW HUD ====
+  lineHeight := 14;
+
+  tbox := Box(
+    MainScreen.Bounds.X1 + 10,
+    MainScreen.Bounds.Y1 + 345,
+    MainScreen.Bounds.X1 + 200,
+    MainScreen.Bounds.Y1 + 345 + (lineHeight * (Length(Text)))
+  );
+
+  RSClient.Image().DrawBoxFilled(tbox.Expand(1), False, BORDER_COLOR);
+  RSClient.Image().DrawBoxFilled(tbox, False, BG_COLOR);
+
+  RSClient.Image().SetFontName('Arial');
+  RSClient.Image().SetFontSize(11);
+
+  x := tbox.X1 + 6;
+  y := tbox.Y1 + 6;
+
+  for i := 0 to High(Text) do
+  begin
+    if i = 0 then
+      RSClient.Image().DrawText(Text[i], Point(x, y), HEADER_COLOR)
+    else
+      RSClient.Image().DrawText(Text[i], Point(x, y), TEXT_COLOR);
+    y += lineHeight;
+  end;
+end;
+
+
 
 {********************************************}
 {           XP STATE / ATTACK LOGIC          }
@@ -134,6 +222,18 @@ begin
   Result := (GetSystemTime - Self.LastXPTime) > Self.NextAttackDelay;
 end;
 
+function TPestControl.GetPos(): TPoint;
+begin
+  // If cache younger than PosCacheDelay, return cached location
+  if (GetSystemTime - Self.CachedPosTime) < Self.PosCacheDelay then
+    Exit(Self.CachedPos);
+
+  // Otherwise refresh once
+  Self.CachedPos := Self.RSW.GetMyPos();
+  Self.CachedPosTime := GetSystemTime();
+
+  Result := Self.CachedPos;
+end;
 
 {********************************************}
 {               STATE DETECTION              }
@@ -194,37 +294,97 @@ end;
 {********************************************}
 {        SMART CLICK POINT FOR MONSTERS      }
 {********************************************}
-
 function TPestControl.GetMonsterClickPoint(): TPoint;
+const
+  BASE_RADIUS = 60; // radius at 50–100% zoom
+  BORDER_COLOR = $DD7A26FF;
 var
-  pts      : TPointArray;
-  clusters : T2DPointArray;
-  C, P     : TPoint;
-  R        : Double;
-  dx, dy   : Double;
+  tileMS     : TRectangle;
+  centerMS   : TPoint;
+  zoom       : Double;
+  radius     : Int32;
+  pts, inside: TPointArray;
+  clusters   : T2DPointArray;
+  pMean, pRand: TPoint;
+  dx, dy, s  : Double;
+  pt: TPoint;
 begin
   Result := [-1, -1];
 
+  //------------------------------------------------------
+  // 1. Convert CenterTile → MainScreen projection
+  //------------------------------------------------------
+  tileMS := Self.RSW.GetTileMS(Self.CenterTile);
+  if (tileMS.Top.X = 0) and (tileMS.Top.Y = 0) then
+    Exit;
+
+  centerMS := tileMS.Mean;
+
+  //------------------------------------------------------
+  // 2. Read real zoom level (0.0 → 1.0)
+  //------------------------------------------------------
+  zoom := MM2MS.ZoomLevel / 100.0;
+  if zoom < 0 then zoom := 0;
+  if zoom > 1 then zoom := 1;
+
+  //------------------------------------------------------
+  // 3. Convert zoom → search radius
+  //------------------------------------------------------
+  // zoom=1.0 → 100
+  // zoom=0.5 → 150
+  // zoom=0.0 → 200
+  radius := Round(BASE_RADIUS + (BASE_RADIUS * (1 - zoom)));
+
+  //------------------------------------------------------
+  // 4. Find monster colors in MS
+  //------------------------------------------------------
+  pts := [];
   SRL.FindColors(pts, CTS2(15921928, 2, 0.08, 5.42), MainScreen.Bounds);
-  if pts.Len() = 0 then Exit;
+  if pts.Len = 0 then Exit;
 
-  clusters := pts.Cluster(2);
-  if clusters.Len() = 0 then Exit;
+  //------------------------------------------------------
+  // 5. Keep only points inside the zoom-scaled circle
+  //------------------------------------------------------
+  inside := [];
+  for pt in pts do
+    if SRL.PointInCircle(pt, centerMS, radius) then
+      inside += pt;
 
-  clusters.SortByMiddle(MainScreen.Center);
-  C := clusters[0].Mean();
-  P := clusters[0].RandomValue();
+  if inside.Len = 0 then Exit;
 
-  R := SRL.GaussRand(0.70, 0.10);
-  if R < 0.55 then R := 0.55;
-  if R > 0.90 then R := 0.90;
+  //------------------------------------------------------
+  // 6. Cluster → pick closest cluster
+  //------------------------------------------------------
+  clusters := inside.Cluster(2);
+  if clusters.Len = 0 then Exit;
 
-  dx := (P.X - C.X);
-  dy := (P.Y - C.Y);
+  clusters.SortByMiddle(centerMS);
 
-  Result.X := C.X + Round(dx * R);
-  Result.Y := C.Y + Round(dy * R);
+  pMean := clusters[0].Mean();
+  pRand := clusters[0].RandomValue();
+
+  //------------------------------------------------------
+  // 7. Gaussian smoothly bias click from mean → point
+  //------------------------------------------------------
+  s := SRL.GaussRand(0.70, 0.10);
+  if s < 0.55 then s := 0.55;
+  if s > 0.90 then s := 0.90;
+
+  dx := (pRand.X - pMean.X);
+  dy := (pRand.Y - pMean.Y);
+
+  Result.X := pMean.X + Round(dx * s);
+  Result.Y := pMean.Y + Round(dy * s);
+
+  //------------------------------------------------------
+  // 8. Debug: draw outline of search region
+  //------------------------------------------------------
+
+  //RSClient.Image.DrawCircle(centerMS, radius, BORDER_COLOR);
 end;
+
+
+
 
 
 {********************************************}
@@ -347,18 +507,23 @@ end;
 
 
 {********************************************}
-{               INIT / RUN (WASP)            }
+{               INIT / RUN                   }
 {********************************************}
 
 procedure TPestControl.Init(maxActions: UInt32; maxTime: UInt64); override;
 begin
   Self.StartTime := GetSystemTime();
-  Self.Msg('Initializing Wasp Pest Control');
+  Self.Msg('Initializing JDS Pest Control');
 
   inherited;
 
   Self.RSW.Setup('C:\Users\jesse\AppData\Local\Simba\Scripts\waspscripts.com\PestControl.png');
   Self.RSW.ScreenWalk := False;
+
+  Self.PosCacheDelay := HumanGauss(0.75, 1.75, 1.0, 0.20, 0.15);
+  Self.CachedPos := Self.RSW.GetMyPos();
+  Self.CachedPosTime := GetSystemTime();
+  self.Msg('CachedPosTime: '+toStr(self.PosCacheDelay));
 
   Self.CenterTile     := Point(548, 188);
   Self.BoatTile       := Point(120, 172);
@@ -370,17 +535,33 @@ begin
 
   Self.LastXP      := XPBar.Read();
   Self.LastXPTime  := GetSystemTime();
-  Self.NextAttackDelay := Random(2299, 3600);
+  Self.NextAttackDelay := HumanGauss(2.3, 3.6, 2.9, 0.25, 0.10);
+  self.Msg('AttackDelay: '+toStr(self.NextAttackDelay));
 
   Self.GamesWon    := 0;
   Self.LastWinTime := 0;
   Self.WinCooldown := 60 * 1000; // 1 min
+
+  // Reset HUD timer
+  PestHUD.LastUpdate := 0;
 end;
 
 
 procedure TPestControl.Run(maxActions: UInt32; maxTime: UInt64);
 begin
   Self.Init(maxActions, maxTime);
+  login.Players[0].Worlds := [344];
+  Login.Players[Login.PlayerIndex].Worlds := [_PCWorld];
+
+  // ===== DO LOGIN IF NEEDED =====
+  if not rsclient.IsLoggedIn() then
+  begin
+    PestControl.Msg('Logging in Forced World ' + ToStr(_PCWorld));
+    Login.LoginPlayer(); // no index
+    WaitUntil(rsclient.IsLoggedIn(), 200, 15000);
+    Wait(Random(650, 1350));
+    Antiban.SmallCameraRotation();
+  end;
 
   repeat
     Self.State := Self.GetState();
@@ -392,11 +573,15 @@ begin
       PCS_DEFEND:       Self.DoDefend();
       PCS_AT_PLANK:     Self.DoAtPlank();
     else
-      Wait(200, 400);
+      Wait(200, 1200, wdleft);
     end;
 
     // Single Torwent-style antiban call per loop
     Self.DoAntiban(True, True);
+
+    // Low-frequency Shifter-themed HUD
+    PestHUD.UpdateAndDraw();
+
   until Self.ShouldStop();
 end;
 
@@ -452,8 +637,9 @@ begin
   obj := WLSettings.GetObject('remote_input');
 
   obj.Put('enabled', True);
-  obj.Put('hud_report', True);
-  obj.Put('hud_debug', True);
+  // We'll use our own HUD instead of WaspLib's internal HUD
+  obj.Put('hud_report', False);
+  obj.Put('hud_debug', False);
   obj.Put('hud_transparent', True);
   obj.Put('block_real_input', True);
 
