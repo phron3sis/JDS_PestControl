@@ -1,0 +1,507 @@
+{$UNDEF SCRIPT_ID}{$DEFINE SCRIPT_ID := 'pest_control_jds'}
+{$UNDEF SCRIPT_REVISION}{$DEFINE SCRIPT_REVISION := '6'}
+{$DEFINE SCRIPT_GUI}
+
+program WaspPestControl;
+
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+
+const
+  PointsPerGame = 7;//veterans boat, med diary = 7
+
+{********************************************}
+{                 ENUM STATES                }
+{********************************************}
+
+type
+  EPestState = (
+    PCS_IN_BOAT,
+    PCS_WALK_CENTER,
+    PCS_DEFEND,
+    PCS_AT_PLANK,
+    PCS_UNKNOWN,
+    PCS_END_SCRIPT
+  );
+
+{********************************************}
+{                 SCRIPT RECORD              }
+{********************************************}
+
+type
+  TPestControl = record(TBaseWalkerScript)
+    State            : EPestState;
+
+    CenterTile       : TPoint;
+    BoatTile         : TPoint;
+    PlankTile        : TPoint;
+    CrossPlankTile   : TPoint;
+
+    // These used to be for Heartbeat; now effectively unused but harmless
+    LastBeat         : UInt64;
+    HeartbeatInterval: Int32;
+
+    LastScan         : UInt64;
+
+    LastXP           : Int64;
+    LastXPTime       : UInt64;
+    NextAttackDelay  : Int32;
+
+    StartTime        : UInt64;
+
+    // === WIN TRACKING ===
+    GamesWon      : UInt32;
+    LastWinTime   : UInt64;
+    WinCooldown   : UInt64;
+  end;
+
+var
+  PestControl: TPestControl;
+
+
+{********************************************}
+{                ANTIBAN SETUP               }
+{********************************************}
+
+procedure TAntiban.SetupBreaks(); override;
+begin
+  if Self.Breaks <> [] then
+    Exit;
+
+  Self.AddBreak(45  * ONE_MINUTE,  3 * ONE_MINUTE, 0.33, 0.15);
+  Self.AddBreak(90  * ONE_MINUTE,  6 * ONE_MINUTE, 0.33, 0.25 + BioHash);
+  Self.AddBreak(150 * ONE_MINUTE, 15 * ONE_MINUTE, 0.33, 0.45 + BioHash);
+end;
+
+procedure TAntiban.Setup(); override;
+begin
+  Self.Skills := [
+    ERSSkill.ATTACK,
+    ERSSkill.STRENGTH,
+    ERSSkill.DEFENCE,
+    ERSSkill.HITPOINTS,
+    ERSSkill.TOTAL
+  ];
+
+  Self.MinZoom := 15;
+  Self.MaxZoom := 40;
+
+  inherited;
+end;
+
+
+{********************************************}
+{                 LOGGING                    }
+{********************************************}
+
+procedure TPestControl.Msg(const s: String);
+var
+  t: UInt64;
+  h, m, sec, ms: UInt64;
+begin
+  t := GetSystemTime() - Self.StartTime;
+
+  // Convert ms → hh:mm:ss:ms
+  h   := t div 3600000;
+  m   := (t div 60000) mod 60;
+  sec := (t div 1000) mod 60;
+  ms  := t mod 1000;
+
+  WriteLn(Format('[%.2d:%.2d:%.2d:%.3d]:[PCjds]: %s', [h, m, sec, ms, s]));
+end;
+
+
+
+{********************************************}
+{           XP STATE / ATTACK LOGIC          }
+{********************************************}
+
+procedure TPestControl.UpdateXPState();
+var
+  xp: Int64;
+begin
+  xp := XPBar.Read();
+  if xp <> Self.LastXP then
+  begin
+    Self.LastXP     := xp;
+    Self.LastXPTime := GetSystemTime();
+    Self.NextAttackDelay := Random(2299, 3600);
+  end;
+end;
+
+function TPestControl.XPStale(): Boolean;
+begin
+  Result := (GetSystemTime - Self.LastXPTime) > Self.NextAttackDelay;
+end;
+
+
+{********************************************}
+{               STATE DETECTION              }
+{********************************************}
+
+function TPestControl.GetState(): EPestState;
+var
+  pos: TPoint;
+begin
+  pos := Self.RSW.GetMyPos();
+
+  if Distance(pos, Self.BoatTile) < 5 then
+    Exit(PCS_IN_BOAT);
+
+  if Distance(pos, Self.PlankTile) < 7 then
+    Exit(PCS_AT_PLANK);
+
+  if Distance(pos, Self.CenterTile) > 15 then
+    Exit(PCS_WALK_CENTER);
+
+  Result := PCS_DEFEND;
+end;
+
+
+{********************************************}
+{                  ACTIONS                   }
+{********************************************}
+
+procedure TPestControl.DoInBoat();
+begin
+  Wait(700, 1300);
+end;
+
+procedure TPestControl.DoWalkCenter();
+var
+  ChancePrayer: Boolean;
+begin
+  ChancePrayer := (Random(0, 5) = 0);
+
+  if Self.RSW.AtTile(Self.CenterTile, 15) then
+  begin
+    Minimap.EnablePrayer();
+    Exit;
+  end;
+
+  if ChancePrayer then
+  begin
+    Minimap.EnablePrayer();
+    Wait(0, 1000, wdLeft);
+  end;
+
+  Self.RSW.WalkBlind(Self.CenterTile, 10);
+  Minimap.EnablePrayer();
+  Wait(0, 1000, wdLeft);
+end;
+
+
+{********************************************}
+{        SMART CLICK POINT FOR MONSTERS      }
+{********************************************}
+
+function TPestControl.GetMonsterClickPoint(): TPoint;
+var
+  pts      : TPointArray;
+  clusters : T2DPointArray;
+  C, P     : TPoint;
+  R        : Double;
+  dx, dy   : Double;
+begin
+  Result := [-1, -1];
+
+  SRL.FindColors(pts, CTS2(15921928, 2, 0.08, 5.42), MainScreen.Bounds);
+  if pts.Len() = 0 then Exit;
+
+  clusters := pts.Cluster(2);
+  if clusters.Len() = 0 then Exit;
+
+  clusters.SortByMiddle(MainScreen.Center);
+  C := clusters[0].Mean();
+  P := clusters[0].RandomValue();
+
+  R := SRL.GaussRand(0.70, 0.10);
+  if R < 0.55 then R := 0.55;
+  if R > 0.90 then R := 0.90;
+
+  dx := (P.X - C.X);
+  dy := (P.Y - C.Y);
+
+  Result.X := C.X + Round(dx * R);
+  Result.Y := C.Y + Round(dy * R);
+end;
+
+
+{********************************************}
+{                 DEFEND LOOP                }
+{********************************************}
+
+procedure TPestControl.DoDefend();
+var
+  M: TPoint;
+begin
+  // Antiban is handled once per main loop in Run()
+  Self.UpdateXPState();
+
+  if Self.XPStale() then
+  begin
+    M := Self.GetMonsterClickPoint();
+    if MainScreen.IsVisible(M) then
+    begin
+      Mouse.Move(M);
+      Wait(60, 120);
+
+      if WaitUntil(MainScreen.GetUpText().Contains('ttack'), 20, 300) then
+      begin
+        Mouse.Click(MOUSE_LEFT);
+        if MainScreen.DidRedClick() then
+          Wait(600, 1800);
+      end;
+    end;
+  end;
+
+  Wait(50, 100);
+end;
+
+
+{********************************************}
+{           NPC WIN DETECTION                }
+{********************************************}
+
+procedure TPestControl.CheckNPCWin();
+var
+  txt: String;
+begin
+  // Avoid double counting if chat sits there
+  if (GetSystemTime - Self.LastWinTime) < Self.WinCooldown then
+    Exit;
+
+  txt := LowerCase(Chat.GetChat());
+
+  if txt.Contains('managed to destroy') then
+  begin
+    Self.GamesWon += 1;
+    Self.LastWinTime := GetSystemTime();
+    Self.Msg('Win detected. Total wins: ' + IntToStr(Self.GamesWon));
+  end;
+end;
+
+
+{********************************************}
+{                PLANK LOGIC                 }
+{********************************************}
+
+function TPestControl.CrossPlank(): Boolean;
+var
+  TileRect : TRectangle;
+  ClickPt  : TPoint;
+  attempts : Int32;
+begin
+  Result := False;
+
+  TileRect := Self.RSW.GetTileMS(Self.CrossPlankTile);
+
+  attempts := 0;
+  repeat
+    Inc(attempts);
+
+    ClickPt := SRL.RandomPoint(TileRect, SRL_GAUSS_CUTOFF / 1.5);
+    Mouse.Move(ClickPt);
+    Wait(40, 90);
+
+    if WaitUntil(MainScreen.GetUpText().Contains('ross'), 20, 350) then
+    begin
+      Mouse.Click(MOUSE_LEFT);
+
+      if MainScreen.DidRedClick() then
+      begin
+        if WaitUntil(not Self.RSW.AtTile(Self.PlankTile, 2), 150, 4000) then
+        begin
+          Result := True;
+          Exit;
+        end;
+      end;
+    end;
+
+    Mouse.Move(ClickPt.Random(5, 15, True));
+    Wait(60, 120);
+
+    if (attempts mod 3 = 0) then
+      Antiban.SmallCameraRotation();
+
+  until attempts > 8;
+end;
+
+
+procedure TPestControl.DoAtPlank();
+begin
+  // Chat only visible here before we leave the island
+  Self.CheckNPCWin();
+
+  if not Self.CrossPlank() then
+  begin
+    Self.RSW.WalkBlind(Self.PlankTile, 4);
+    Wait(250, 450);
+
+    // One more chance to catch the win message
+    Self.CheckNPCWin();
+
+    Self.CrossPlank();
+  end;
+end;
+
+
+{********************************************}
+{               INIT / RUN (WASP)            }
+{********************************************}
+
+procedure TPestControl.Init(maxActions: UInt32; maxTime: UInt64); override;
+begin
+  Self.StartTime := GetSystemTime();
+  Self.Msg('Initializing Wasp Pest Control');
+
+  inherited;
+
+  Self.RSW.Setup('C:\Users\jesse\AppData\Local\Simba\Scripts\waspscripts.com\PestControl.png');
+  Self.RSW.ScreenWalk := False;
+
+  Self.CenterTile     := Point(548, 188);
+  Self.BoatTile       := Point(120, 172);
+  Self.PlankTile      := Point(136, 172);
+  Self.CrossPlankTile := Point(131, 172);
+
+  Self.LastBeat          := 0;
+  Self.HeartbeatInterval := Random(38000, 67000);
+
+  Self.LastXP      := XPBar.Read();
+  Self.LastXPTime  := GetSystemTime();
+  Self.NextAttackDelay := Random(2299, 3600);
+
+  Self.GamesWon    := 0;
+  Self.LastWinTime := 0;
+  Self.WinCooldown := 60 * 1000; // 1 min
+end;
+
+
+procedure TPestControl.Run(maxActions: UInt32; maxTime: UInt64);
+begin
+  Self.Init(maxActions, maxTime);
+
+  repeat
+    Self.State := Self.GetState();
+    Self.SetAction(ToStr(Self.State));
+
+    case Self.State of
+      PCS_IN_BOAT:      Self.DoInBoat();
+      PCS_WALK_CENTER:  Self.DoWalkCenter();
+      PCS_DEFEND:       Self.DoDefend();
+      PCS_AT_PLANK:     Self.DoAtPlank();
+    else
+      Wait(200, 400);
+    end;
+
+    // Single Torwent-style antiban call per loop
+    Self.DoAntiban(True, True);
+  until Self.ShouldStop();
+end;
+
+
+{********************************************}
+{           TEXT REPORT + HUD REPORT         }
+{********************************************}
+
+function TBaseScript.BuildTextReport(): TStringArray; override;
+var
+  elapsedTime: UInt64;
+  winsPerHour: Double;
+begin
+  Result := [];
+
+  elapsedTime := Self.TimeRunning.ElapsedTime();
+
+  Result += ' Action        : ' + Self.Action;
+  Result += ' Runtime       : ' + SRL.MsToTime(elapsedTime, Time_Short).Trim();
+  Result += ' Total Exp     : ' + SRL.FormatNumber(XPBar.TotalEarnedXP(), 2);
+  Result += ' Exp/Hour      : ' + SRL.FormatNumber(
+    NumberPerHour(XPBar.TotalEarnedXP(), elapsedTime), 2
+  );
+
+  winsPerHour := NumberPerHour(PestControl.GamesWon, elapsedTime);
+
+  Result += ' Games Won     : ' + IntToStr(PestControl.GamesWon);
+  Result += ' Wins / Hour   : ' + SRL.FormatNumber(winsPerHour, 2);
+  Result += ' Points / Hour : ' + SRL.FormatNumber(winsPerHour*PointsPerGame, 2);
+
+  Result += ' PestControl   : Footballjds <3''s' +  ' waspscripts.com';
+end;
+
+
+{********************************************}
+{                 SCRIPT GUI                 }
+{********************************************}
+
+{$IFDEF SCRIPT_GUI}
+type
+  TPestConfig = record(TScriptForm)
+    PCInfo: TLabel;
+  end;
+
+var
+  PestConfig: TPestConfig;
+
+procedure TPestConfig.StartScript(sender: TObject); override;
+var
+  obj: TJSONObject;
+begin
+  // Force-override the remote_input config that WaspLib actually uses
+  obj := WLSettings.GetObject('remote_input');
+
+  obj.Put('enabled', True);
+  obj.Put('hud_report', True);
+  obj.Put('hud_debug', True);
+  obj.Put('hud_transparent', True);
+  obj.Put('block_real_input', True);
+
+  // Optional: ensure text reports are also enabled
+  WLSettings.Put('reports', True);
+
+  inherited;
+end;
+
+
+procedure TPestConfig.Run(); override;
+var
+  tab: TTabSheet;
+begin
+  Self.Setup('Wasp Pest Control');
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+
+  Self.CreateAccountManager(tab);
+
+  with Self.PCInfo do
+  begin
+    Create(tab);
+    SetCaption('Stands at center and defends the knight.' + LINEENDING +
+               'Make sure you start next to veteran plank.');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(200));
+  end;
+
+  Self.CreateAntibanManager();
+  Self.CreateWaspLibSettings();
+  Self.CreateAPISettings();
+
+  inherited;
+end;
+{$ENDIF}
+
+
+{********************************************}
+{                    ENTRY                   }
+{********************************************}
+
+begin
+  {$IFDEF SCRIPT_GUI}
+  PestConfig.Run();
+  {$ENDIF}
+  PestControl.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+end.
+
