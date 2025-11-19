@@ -8,8 +8,9 @@ program WaspPestControl;
 {$I WaspLib/osr.simba}
 
 const
-  PointsPerGame =   7;//veterans boat, med diary = 7
-  _PCWorld      = 344;// Pest Control World is 344
+  PointsPerGame =   7;   // veterans boat, med diary = 7
+  _PCWorld      = 344;   // Pest Control World is 344
+
 {********************************************}
 {                 ENUM STATES                }
 {********************************************}
@@ -29,7 +30,7 @@ type
 {********************************************}
 
 type
-  TPestControl = record(TBaseWalkerScript)
+  TJdsPestControl = record(TBaseWalkerScript)
     State            : EPestState;
 
     CenterTile       : TPoint;
@@ -69,8 +70,68 @@ type
   end;
 
 var
-  PestControl: TPestControl;
+  PestControl: TJdsPestControl;
   PestHUD    : TPestHUD;
+
+procedure ApplyBioMouse();
+var
+  bh: Double;
+begin
+  bh := Login.GetPlayerBioHash();  // 0.00..1.00
+
+  // === Mouse speed ===
+  // 10–14 (safe human range)
+  Mouse.Speed := Round(10 + ((bh - 0.5) * 4));
+  Mouse.Speed := EnsureRange(Mouse.Speed, 9, 15);
+
+  // === Gravity ===
+  Mouse.Gravity := 8 + (bh * 3);
+
+  // === Wind ===
+  // 4–6 (smooth)
+  Mouse.Wind := 4 + (bh * 2);
+
+  // === Miss chance ===
+  // 10–18% (human-like)
+  Mouse.MissChance := 10 + (bh * 8);
+
+  // === Distribution ===
+  // GAUSS → ROWP → SKEWED
+  if bh < 0.33 then
+    Mouse.Distribution := MOUSE_DISTRIBUTION_GAUSS
+  else if bh < 0.66 then
+    Mouse.Distribution := MOUSE_DISTRIBUTION_ROWP
+  else
+    Mouse.Distribution := MOUSE_DISTRIBUTION_SKEWED;
+
+  // === Idle interval ===
+  Mouse.IdleInterval := 1.2 + (bh * 1.3);
+end;
+
+
+// --- BioHash-Aware Wait Override ---
+procedure Wait(Min, Max: Double; Weight: EWaitDir = wdMean);override;
+var
+  adjMin, adjMax, bias: Double;
+begin
+  // BioHash → range [-0.05..+0.05]
+  bias := (Login.GetPlayerBioHash() - 0.5) * 0.10;
+
+  adjMin := Min + (Min * bias);
+  adjMax := Max + (Max * bias);
+
+  case Weight of
+    wdLeft:
+      System.Wait(Round(SRL.TruncatedGauss(adjMin, adjMax)));
+
+    wdMean:
+      System.Wait(Round(SRL.NormalRange(adjMin, adjMax)));
+
+    wdRight:
+      System.Wait(Round(SRL.TruncatedGauss(adjMax, adjMin)));
+  end;
+end;
+
 
 function HumanGauss(minVal, maxVal, mean, stdev: Double; bioWeight: Double = 0): Int32;
 var
@@ -91,6 +152,32 @@ begin
   Result := Round(r * 1000);
 end;
 
+function TimeUntilNextBreak(): String;
+var
+  i: Int32;
+  soonest: PBreakTask;
+  remaining: Int64;
+begin
+  // No breaks scheduled
+  if Length(Antiban.Breaks) = 0 then
+    Exit('N/A');
+
+  // Initialize soonest pointer
+  soonest := @Antiban.Breaks[0];
+
+  // Find the break with the smallest NextAtTime
+  for i := 1 to High(Antiban.Breaks) do
+    if Antiban.Breaks[i].NextAtTime < soonest^.NextAtTime then
+      soonest := @Antiban.Breaks[i];
+
+  // Time until it fires (in ms)
+  remaining := Round(soonest^.NextAtTime - GetTimeRunning());
+  if remaining < 0 then
+    remaining := 0;
+
+  // Format like "02m 58s"
+  Result := SRL.MsToTime(remaining, Time_Short).Trim();
+end;
 
 {********************************************}
 {                ANTIBAN SETUP               }
@@ -117,7 +204,7 @@ end;
 {                 LOGGING                    }
 {********************************************}
 
-procedure TPestControl.Msg(const s: String);
+procedure TJdsPestControl.Msg(const s: String);
 var
   t: UInt64;
   h, m, sec, ms: UInt64;
@@ -144,7 +231,7 @@ var
   elapsed: UInt64;
   winsPerHour: Double;
   i, lineHeight: Int32;
-  tbox: TBox;
+  abox: TBox;
   x, y: Int32;
 begin
   // Run only every 10 seconds
@@ -168,25 +255,21 @@ begin
   Text += 'XP/hr: ' + SRL.FormatNumber(
                      NumberPerHour(XPBar.TotalEarnedXP(), elapsed), 2
                    );
+  Text += 'Next Break: ' + TimeUntilNextBreak();
 
   // ==== DRAW HUD ====
   lineHeight := 14;
 
-  tbox := Box(
-    MainScreen.Bounds.X1 + 10,
-    MainScreen.Bounds.Y1 + 345,
-    MainScreen.Bounds.X1 + 200,
-    MainScreen.Bounds.Y1 + 345 + (lineHeight * (Length(Text)))
-  );
+  abox := Box(7, 345, 175, 473);
 
-  RSClient.Image().DrawBoxFilled(tbox.Expand(1), False, BORDER_COLOR);
-  RSClient.Image().DrawBoxFilled(tbox, False, BG_COLOR);
+  RSClient.Image().DrawBoxFilled(abox.Expand(1), False, BORDER_COLOR);
+  RSClient.Image().DrawBoxFilled(abox, False, BG_COLOR);
 
   RSClient.Image().SetFontName('Arial');
   RSClient.Image().SetFontSize(11);
 
-  x := tbox.X1 + 6;
-  y := tbox.Y1 + 6;
+  x := abox.X1 + 3;
+  y := abox.Y1 + 3;
 
   for i := 0 to High(Text) do
   begin
@@ -204,7 +287,7 @@ end;
 {           XP STATE / ATTACK LOGIC          }
 {********************************************}
 
-procedure TPestControl.UpdateXPState();
+procedure TJdsPestControl.UpdateXPState();
 var
   xp: Int64;
 begin
@@ -217,12 +300,12 @@ begin
   end;
 end;
 
-function TPestControl.XPStale(): Boolean;
+function TJdsPestControl.XPStale(): Boolean;
 begin
   Result := (GetSystemTime - Self.LastXPTime) > Self.NextAttackDelay;
 end;
 
-function TPestControl.GetPos(): TPoint;
+function TJdsPestControl.GetPos(): TPoint;
 begin
   // If cache younger than PosCacheDelay, return cached location
   if (GetSystemTime - Self.CachedPosTime) < Self.PosCacheDelay then
@@ -239,7 +322,7 @@ end;
 {               STATE DETECTION              }
 {********************************************}
 
-function TPestControl.GetState(): EPestState;
+function TJdsPestControl.GetState(): EPestState;
 var
   pos: TPoint;
 begin
@@ -262,12 +345,12 @@ end;
 {                  ACTIONS                   }
 {********************************************}
 
-procedure TPestControl.DoInBoat();
+procedure TJdsPestControl.DoInBoat();
 begin
   Wait(700, 1300);
 end;
 
-procedure TPestControl.DoWalkCenter();
+procedure TJdsPestControl.DoWalkCenter();
 var
   ChancePrayer: Boolean;
 begin
@@ -294,7 +377,7 @@ end;
 {********************************************}
 {        SMART CLICK POINT FOR MONSTERS      }
 {********************************************}
-function TPestControl.GetMonsterClickPoint(): TPoint;
+function TJdsPestControl.GetMonsterClickPoint(): TPoint;
 const
   BASE_RADIUS = 60; // radius at 50–100% zoom
   BORDER_COLOR = $DD7A26FF;
@@ -386,12 +469,11 @@ end;
 
 
 
-
 {********************************************}
 {                 DEFEND LOOP                }
 {********************************************}
 
-procedure TPestControl.DoDefend();
+procedure TJdsPestControl.DoDefend();
 var
   M: TPoint;
 begin
@@ -423,7 +505,7 @@ end;
 {           NPC WIN DETECTION                }
 {********************************************}
 
-procedure TPestControl.CheckNPCWin();
+procedure TJdsPestControl.CheckNPCWin();
 var
   txt: String;
 begin
@@ -446,7 +528,7 @@ end;
 {                PLANK LOGIC                 }
 {********************************************}
 
-function TPestControl.CrossPlank(): Boolean;
+function TJdsPestControl.CrossPlank(): Boolean;
 var
   TileRect : TRectangle;
   ClickPt  : TPoint;
@@ -488,10 +570,16 @@ begin
 end;
 
 
-procedure TPestControl.DoAtPlank();
+procedure TJdsPestControl.DoAtPlank();
 begin
   // Chat only visible here before we leave the island
   Self.CheckNPCWin();
+
+  if antiban.BioDice(25) then
+  begin
+    chat.ClickContinue(antiban.BioDice(98));
+    wait(600, 1250, wdleft);
+  end;
 
   if not Self.CrossPlank() then
   begin
@@ -510,7 +598,7 @@ end;
 {               INIT / RUN                   }
 {********************************************}
 
-procedure TPestControl.Init(maxActions: UInt32; maxTime: UInt64); override;
+procedure TJdsPestControl.Init(maxActions: UInt32; maxTime: UInt64); override;
 begin
   Self.StartTime := GetSystemTime();
   Self.Msg('Initializing JDS Pest Control');
@@ -523,7 +611,7 @@ begin
   Self.PosCacheDelay := HumanGauss(0.75, 1.75, 1.0, 0.20, 0.15);
   Self.CachedPos := Self.RSW.GetMyPos();
   Self.CachedPosTime := GetSystemTime();
-  self.Msg('CachedPosTime: '+toStr(self.PosCacheDelay));
+  Self.Msg('CachedPosTime: ' + ToStr(Self.PosCacheDelay));
 
   Self.CenterTile     := Point(548, 188);
   Self.BoatTile       := Point(120, 172);
@@ -536,7 +624,7 @@ begin
   Self.LastXP      := XPBar.Read();
   Self.LastXPTime  := GetSystemTime();
   Self.NextAttackDelay := HumanGauss(2.3, 3.6, 2.9, 0.25, 0.10);
-  self.Msg('AttackDelay: '+toStr(self.NextAttackDelay));
+  Self.Msg('AttackDelay: ' + ToStr(Self.NextAttackDelay));
 
   Self.GamesWon    := 0;
   Self.LastWinTime := 0;
@@ -547,11 +635,12 @@ begin
 end;
 
 
-procedure TPestControl.Run(maxActions: UInt32; maxTime: UInt64);
+procedure TJdsPestControl.Run(maxActions: UInt32; maxTime: UInt64);
 begin
   Self.Init(maxActions, maxTime);
-  login.Players[0].Worlds := [344];
-  Login.Players[Login.PlayerIndex].Worlds := [_PCWorld];
+
+  //Use biohash to affect mouse
+  ApplyBioMouse();
 
   // ===== DO LOGIN IF NEEDED =====
   if not rsclient.IsLoggedIn() then
@@ -559,7 +648,9 @@ begin
     PestControl.Msg('Logging in Forced World ' + ToStr(_PCWorld));
     Login.LoginPlayer(); // no index
     WaitUntil(rsclient.IsLoggedIn(), 200, 15000);
-    Wait(Random(650, 1350));
+    Wait(650, 1250);
+    MainScreen.SetHighestPitch();
+    wait(0, 600);
     Antiban.SmallCameraRotation();
   end;
 
@@ -573,7 +664,7 @@ begin
       PCS_DEFEND:       Self.DoDefend();
       PCS_AT_PLANK:     Self.DoAtPlank();
     else
-      Wait(200, 1200, wdleft);
+      Wait(200, 1200, wdLeft);
     end;
 
     // Single Torwent-style antiban call per loop
@@ -592,8 +683,8 @@ end;
 
 function TBaseScript.BuildTextReport(): TStringArray; override;
 var
-  elapsedTime: UInt64;
-  winsPerHour: Double;
+  elapsedTime   : UInt64;
+  winsPerHour   : Double;
 begin
   Result := [];
 
@@ -610,10 +701,12 @@ begin
 
   Result += ' Games Won     : ' + IntToStr(PestControl.GamesWon);
   Result += ' Wins / Hour   : ' + SRL.FormatNumber(winsPerHour, 2);
-  Result += ' Points / Hour : ' + SRL.FormatNumber(winsPerHour*PointsPerGame, 2);
+  Result += ' Points / Hour : ' + SRL.FormatNumber(winsPerHour * PointsPerGame, 2);
+  Result += ' Next Break    : ' + TimeUntilNextBreak();
 
-  Result += ' PestControl   : Footballjds <3''s' +  ' waspscripts.com';
+  Result += ' PestControl   : Footballjds <3''s waspscripts.com';
 end;
+
 
 
 {********************************************}
@@ -645,6 +738,8 @@ begin
 
   // Optional: ensure text reports are also enabled
   WLSettings.Put('reports', True);
+
+  Login.Players[Login.PlayerIndex].Worlds := [_PCWorld];
 
   inherited;
 end;
