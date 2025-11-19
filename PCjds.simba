@@ -8,8 +8,27 @@ program WaspPestControl;
 {$I WaspLib/osr.simba}
 
 const
+  BoatToUtilize =   2;   //1 Novice, 2 Intermediate, 3 Veteran
   PointsPerGame =   7;   // veterans boat, med diary = 7
   _PCWorld      = 344;   // Pest Control World is 344
+
+  // Regions
+  PEST_ISLAND_BOX      : TBox = [5550, 5441, 5956, 5828];
+  PEST_OUTPOST_BOX     : TBox = [6022, 4504, 6399, 4851];
+
+  // Boat interiors
+  VETERAN_BOAT_BOX     : TBox = [6105, 4695, 6120, 4718];
+  INTER_BOAT_BOX       : TBox = [6129, 4723, 6144, 4746];
+  NOVICE_BOAT_BOX      : TBox = [6218, 4740, 6233, 4763];
+
+  // Plank tiles
+  VETERAN_PLANK_TILE   : TPoint = [6125, 4701];
+  INTER_PLANK_TILE     : TPoint = [6149, 4737];
+  NOVICE_PLANK_TILE    : TPoint = [6213, 4757];
+
+  // Island areas
+  DEFEND_KNIGHT_BOX    : TBox = [5741, 5605, 5775, 5639];
+  GAME_START_LANDING_BOX: TBox = [5752, 5532, 5773, 5562];
 
 {********************************************}
 {                 ENUM STATES                }
@@ -25,6 +44,7 @@ type
     PCS_END_SCRIPT
   );
 
+
 {********************************************}
 {                 SCRIPT RECORD              }
 {********************************************}
@@ -34,15 +54,8 @@ type
     State            : EPestState;
 
     CenterTile       : TPoint;
-    BoatTile         : TPoint;
     PlankTile        : TPoint;
     CrossPlankTile   : TPoint;
-
-    // Legacy heartbeat fields (unused but harmless)
-    LastBeat         : UInt64;
-    HeartbeatInterval: Int32;
-
-    LastScan         : UInt64;
 
     LastXP           : Int64;
     LastXPTime       : UInt64;
@@ -58,6 +71,9 @@ type
     CachedPos      : TPoint;
     CachedPosTime  : UInt64;
     PosCacheDelay  : UInt32;   // milliseconds to trust cached pos
+
+    PointsTotal    : UInt32;
+    PointsTime     : UInt64;
   end;
 
   {********************************************}
@@ -234,8 +250,8 @@ var
   abox: TBox;
   x, y: Int32;
 begin
-  // Run only every 10 seconds
-  if (GetSystemTime - LastUpdate) < 10000 then
+  // Run only every 5 seconds
+  if (GetSystemTime - LastUpdate) < 5000 then
     Exit;
   LastUpdate := GetSystemTime;
 
@@ -245,7 +261,7 @@ begin
   elapsed := PestControl.TimeRunning.ElapsedTime();
   winsPerHour := NumberPerHour(PestControl.GamesWon, elapsed);
 
-  Text += 'Pest Control - by Footballjds';
+  Text += 'Pest Control - by Footballjds | '+ToStr(PestControl.PointsTotal);
   Text += 'Runtime: ' + SRL.MsToTime(elapsed, Time_Short).Trim();
   Text += 'State: ' + ToStr(PestControl.State);
   Text += 'Wins: ' + IntToStr(PestControl.GamesWon);
@@ -260,7 +276,7 @@ begin
   // ==== DRAW HUD ====
   lineHeight := 14;
 
-  abox := Box(7, 345, 175, 473);
+  abox := Box(7, 345, 195, 473);
 
   RSClient.Image().DrawBoxFilled(abox.Expand(1), False, BORDER_COLOR);
   RSClient.Image().DrawBoxFilled(abox, False, BG_COLOR);
@@ -322,22 +338,68 @@ end;
 {               STATE DETECTION              }
 {********************************************}
 
+function TJdsPestControl.InBoat(): Boolean;
+var
+  _ourPos: TPoint;
+begin
+  _ourPos := self.rsw.GetMyPos();
+
+  result := _ourPos.InBox(VETERAN_BOAT_BOX) or
+    _ourPos.InBox(INTER_BOAT_BOX) or
+      _ourPos.InBox(NOVICE_BOAT_BOX);
+end;
+
 function TJdsPestControl.GetState(): EPestState;
 var
   pos: TPoint;
 begin
-  pos := Self.RSW.GetMyPos();
+  // Read cached/corrected location once
+  pos := Self.GetPos();
 
-  if Distance(pos, Self.BoatTile) < 5 then
-    Exit(PCS_IN_BOAT);
+  // ================================
+  // OUTPOST (boats + planks)
+  // ================================
+  if pos.InBox(RSRegions.PEST_CONTROL_OUTPOST) then
+  begin
+    // Inside any of the 3 boats → waiting for game
+    if pos.InBox(VETERAN_BOAT_BOX)
+    or pos.InBox(INTER_BOAT_BOX)
+    or pos.InBox(NOVICE_BOAT_BOX) then
+      Exit(PCS_IN_BOAT);
 
-  if Distance(pos, Self.PlankTile) < 7 then
-    Exit(PCS_AT_PLANK);
+    // At any plank → waiting to board or just returned from game
+    if (Distance(pos, VETERAN_PLANK_TILE) <= 5)
+    or (Distance(pos, INTER_PLANK_TILE)   <= 5)
+    or (Distance(pos, NOVICE_PLANK_TILE)  <= 5) then
+      Exit(PCS_AT_PLANK);
 
-  if Distance(pos, Self.CenterTile) > 15 then
+    // On outpost but not in boat or at plank
+    Exit(PCS_AT_PLANK);  // treat as plank wait (safe default)
+  end;
+
+
+  // ================================
+  // GAME ISLAND (actual minigame)
+  // ================================
+  if pos.InBox(RSRegions.PEST_CONTROL_ISLAND) then
+  begin
+    // Just spawned in landing boat → walk to center
+    if pos.InBox(GAME_START_LANDING_BOX) then
+      Exit(PCS_WALK_CENTER);
+
+    // In knight defending box → defend
+    if pos.InBox(DEFEND_KNIGHT_BOX) then
+      Exit(PCS_DEFEND);
+
+    // On island but not in defend box → walk to center
     Exit(PCS_WALK_CENTER);
+  end;
 
-  Result := PCS_DEFEND;
+
+  // ================================
+  // Outside all known regions
+  // ================================
+  Result := PCS_UNKNOWN;
 end;
 
 
@@ -345,8 +407,26 @@ end;
 {                  ACTIONS                   }
 {********************************************}
 
+procedure TJdsPestControl.UpdatePoints();
+var
+  BluePoints: Int32;
+  LastCheck : Int32 = 60000;
+  PEST_POINTS_BOX: Tbox = [72, 64, 123, 81];
+begin
+  if GetSystemTime < (LastCheck+Self.PointsTime) then
+    EXIT;
+  BluePoints := ocr.RecognizeNumber(PEST_POINTS_BOX, TOCRColorFilter.Create([16777113]), RS_FONT_PLAIN_12);
+
+  if BluePoints <= Self.PointsTotal then Exit;
+
+  Self.PointsTotal := BluePoints;
+  Self.PointsTime := GetSystemTime;
+  Self.Msg('Total Points: '+toStr(Self.PointsTotal));
+end;
+
 procedure TJdsPestControl.DoInBoat();
 begin
+  self.UpdatePoints();
   Wait(700, 1300);
 end;
 
@@ -533,10 +613,11 @@ var
   TileRect : TRectangle;
   ClickPt  : TPoint;
   attempts : Int32;
+  i        : Int32;
 begin
   Result := False;
 
-  TileRect := Self.RSW.GetTileMS(Self.CrossPlankTile);
+  TileRect := Self.RSW.GetTileMS(Self.CrossPlankTile, 2, 0, 1);
 
   attempts := 0;
   repeat
@@ -546,13 +627,13 @@ begin
     Mouse.Move(ClickPt);
     Wait(40, 90);
 
-    if WaitUntil(MainScreen.GetUpText().Contains('ross'), 20, 350) then
+    if WaitUntil(MainScreen.GetUpText().Contains('ross'), 120, 1200) then
     begin
       Mouse.Click(MOUSE_LEFT);
 
       if MainScreen.DidRedClick() then
       begin
-        if WaitUntil(not Self.RSW.AtTile(Self.PlankTile, 2), 150, 4000) then
+        if WaitUntil(self.InBoat(), 600, 4000) then
         begin
           Result := True;
           Exit;
@@ -605,7 +686,7 @@ begin
 
   inherited;
 
-  Self.RSW.Setup('C:\Users\jesse\AppData\Local\Simba\Scripts\waspscripts.com\PestControl.png');
+  Self.RSW.SetupRegions([RSRegions.PEST_CONTROL_ISLAND, RSRegions.PEST_CONTROL_OUTPOST], 8);
   Self.RSW.ScreenWalk := False;
 
   Self.PosCacheDelay := HumanGauss(0.75, 1.75, 1.0, 0.20, 0.15);
@@ -613,13 +694,15 @@ begin
   Self.CachedPosTime := GetSystemTime();
   Self.Msg('CachedPosTime: ' + ToStr(Self.PosCacheDelay));
 
-  Self.CenterTile     := Point(548, 188);
-  Self.BoatTile       := Point(120, 172);
-  Self.PlankTile      := Point(136, 172);
-  Self.CrossPlankTile := Point(131, 172);
+  Self.CenterTile     := DEFEND_KNIGHT_BOX.Middle;
 
-  Self.LastBeat          := 0;
-  Self.HeartbeatInterval := Random(38000, 67000);
+  if BoatToUtilize = 1 then
+    Self.PlankTile := NOVICE_PLANK_TILE else
+      if BoatToUtilize = 2 then
+        Self.PlankTile := INTER_PLANK_TILE else
+          Self.PlankTile := VETERAN_PLANK_TILE;
+
+  Self.CrossPlankTile := Point(Self.PlankTile.x-1, Self.PlankTile.y);
 
   Self.LastXP      := XPBar.Read();
   Self.LastXPTime  := GetSystemTime();
@@ -629,6 +712,9 @@ begin
   Self.GamesWon    := 0;
   Self.LastWinTime := 0;
   Self.WinCooldown := 60 * 1000; // 1 min
+
+  Self.PointsTotal := 0;
+  Self.PointsTime  := 0;
 
   // Reset HUD timer
   PestHUD.LastUpdate := 0;
@@ -647,7 +733,15 @@ begin
   begin
     PestControl.Msg('Logging in Forced World ' + ToStr(_PCWorld));
     Login.LoginPlayer(); // no index
-    WaitUntil(rsclient.IsLoggedIn(), 200, 15000);
+    WaitUntil(rsclient.IsLoggedIn(), 600, 15000);
+    Wait(650, 1250);
+    MainScreen.SetHighestPitch();
+    wait(0, 600);
+    Antiban.SmallCameraRotation();
+  end else if Login.GetCurrentWorld <> _PCWorld then
+  begin
+    WorldHopper.Hop([_PCWorld], False);
+    WaitUntil(rsclient.IsLoggedIn(), 600, 15000);
     Wait(650, 1250);
     MainScreen.SetHighestPitch();
     wait(0, 600);
