@@ -8,13 +8,9 @@ program WaspPestControl;
 {$I WaspLib/osr.simba}
 
 const
-  BoatToUtilize =   2;   //1 Novice, 2 Intermediate, 3 Veteran
+  BoatToUtilize =   3;   //1 Novice, 2 Intermediate, 3 Veteran
   PointsPerGame =   7;   // veterans boat, med diary = 7
   _PCWorld      = 344;   // Pest Control World is 344
-
-  // Regions
-  PEST_ISLAND_BOX      : TBox = [5550, 5441, 5956, 5828];
-  PEST_OUTPOST_BOX     : TBox = [6022, 4504, 6399, 4851];
 
   // Boat interiors
   VETERAN_BOAT_BOX     : TBox = [6105, 4695, 6120, 4718];
@@ -22,9 +18,9 @@ const
   NOVICE_BOAT_BOX      : TBox = [6218, 4740, 6233, 4763];
 
   // Plank tiles
-  VETERAN_PLANK_TILE   : TPoint = [6125, 4701];
-  INTER_PLANK_TILE     : TPoint = [6149, 4737];
-  NOVICE_PLANK_TILE    : TPoint = [6213, 4757];
+  VETERAN_PLANK_TILE   : TPoint = [6130, 4700];
+  INTER_PLANK_TILE     : TPoint = [6154, 4736];
+  NOVICE_PLANK_TILE    : TPoint = [6206, 4756];
 
   // Island areas
   DEFEND_KNIGHT_BOX    : TBox = [5741, 5605, 5775, 5639];
@@ -613,11 +609,10 @@ var
   TileRect : TRectangle;
   ClickPt  : TPoint;
   attempts : Int32;
-  i        : Int32;
 begin
   Result := False;
 
-  TileRect := Self.RSW.GetTileMS(Self.CrossPlankTile, 2, 0, 1);
+  TileRect := Self.RSW.GetTileMS(Self.CrossPlankTile);
 
   attempts := 0;
   repeat
@@ -696,13 +691,25 @@ begin
 
   Self.CenterTile     := DEFEND_KNIGHT_BOX.Middle;
 
-  if BoatToUtilize = 1 then
-    Self.PlankTile := NOVICE_PLANK_TILE else
-      if BoatToUtilize = 2 then
-        Self.PlankTile := INTER_PLANK_TILE else
-          Self.PlankTile := VETERAN_PLANK_TILE;
-
-  Self.CrossPlankTile := Point(Self.PlankTile.x-1, Self.PlankTile.y);
+  case BoatToUtilize of
+    1: begin
+        Self.PlankTile := NOVICE_PLANK_TILE;
+        Self.CrossPlankTile := Point(Self.PlankTile.x+4, Self.PlankTile.y);
+    end;
+    2: begin
+        Self.PlankTile := INTER_PLANK_TILE;
+        Self.CrossPlankTile := Point(Self.PlankTile.x-4, Self.PlankTile.y);
+    end;
+    3: begin
+        Self.PlankTile := VETERAN_PLANK_TILE;
+        Self.CrossPlankTile := Point(Self.PlankTile.x-4, Self.PlankTile.y);
+    end;
+  else
+    begin
+      Self.PlankTile := VETERAN_PLANK_TILE; // fallback end;
+      Self.CrossPlankTile := Point(Self.PlankTile.x-4, Self.PlankTile.y);
+    end;
+  end;
 
   Self.LastXP      := XPBar.Read();
   Self.LastXPTime  := GetSystemTime();
