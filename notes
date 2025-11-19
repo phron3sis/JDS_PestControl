@@ -1,0 +1,53 @@
+  
+//this is map region from map. this region is the pest control island with monsters to attack
+//this island has the void knight in the center to defend
+//this island has 4 portals to attack and 3 gates to open
+//this island also has the game start landing boat
+  RSRegions.PEST_CONTROL_ISLAND := [5550, 5441, 5956, 5828];
+  RSNamedRegionsArray += ['Pest Control Island', RSRegions.PEST_CONTROL_ISLAND];
+
+//this is map region from map. this region is the pest control island outpost
+//this is the island that contains the boats to enter
+  RSRegions.PEST_CONTROL_OUTPOST := [6022, 4504, 6399, 4851];
+  RSNamedRegionsArray += ['Pest Control Outpost', RSRegions.PEST_CONTROL_OUTPOST];
+
+//boxes for each boat we'll be inside waiting for enough players to start game
+VeteranBoat := [[6105, 4695], [6120, 4696], [6120, 4718], [6104, 4717]];
+IntermediateBoat := [[6129, 4723], [6144, 4724], [6144, 4746], [6128, 4747]];
+NoviceBoat := [[6218, 4740], [6232, 4739], [6233, 4763], [6217, 4764]];  
+
+//plank tiles-veteran,itermediate,novice
+//these tiles is where stand to enter boat and where be after game ends
+atpa := [
+  [[6125, 4701], [6149, 4737], [6213, 4757]]
+];  
+
+
+//this is the area we will run to at the start
+//this is also the area we will search for and attack monsters inside of
+//of course we'd need to convert to MS. but this will replace to centerPoint to ms raidus search we do now
+DefendKnightArea := [[5741, 5605], [5775, 5606], [5775, 5639], [5742, 5639]];
+
+//this is box we be in at very start of pest control game
+GameStartLandingBoat := [[5752, 5532], [5773, 5532], [5773, 5562], [5751, 5562]];
+
+PlankTiles
+  TILE_VETERAN 
+  TILE_INTERMEDIATE 
+  TILE_NOVICE 
+
+BoatBounds
+  BOAT_VETERAN
+  BOAT_INTERMEDIATE
+  BOAT_NOVICE
+
+KnightArea
+  CENTER_BOUNDS
+
+Objects:
+  4 different portals
+  3 different gates
+
+NPCs
+  OUTPOST_KNIGHT
+  ISLAND_KNIGHT_ESCAPE

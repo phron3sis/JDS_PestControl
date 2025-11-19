@@ -105,7 +105,7 @@ begin
     Mouse.Distribution := MOUSE_DISTRIBUTION_SKEWED;
 
   // === Idle interval ===
-  Mouse.IdleInterval := 1.2 + (bh * 1.3);
+  Mouse.IdleInterval := 3.9 + (bh * 1.3);
 end;
 
 
@@ -245,7 +245,7 @@ begin
   elapsed := PestControl.TimeRunning.ElapsedTime();
   winsPerHour := NumberPerHour(PestControl.GamesWon, elapsed);
 
-  Text += 'Pest Control - Defender';
+  Text += 'Pest Control - by Footballjds';
   Text += 'Runtime: ' + SRL.MsToTime(elapsed, Time_Short).Trim();
   Text += 'State: ' + ToStr(PestControl.State);
   Text += 'Wins: ' + IntToStr(PestControl.GamesWon);
@@ -726,23 +726,14 @@ procedure TPestConfig.StartScript(sender: TObject); override;
 var
   obj: TJSONObject;
 begin
-  // Force-override the remote_input config that WaspLib actually uses
   obj := WLSettings.GetObject('remote_input');
-
   obj.Put('enabled', True);
-  // We'll use our own HUD instead of WaspLib's internal HUD
-  obj.Put('hud_report', False);
-  obj.Put('hud_debug', False);
-  obj.Put('hud_transparent', True);
-  obj.Put('block_real_input', True);
-
-  // Optional: ensure text reports are also enabled
-  WLSettings.Put('reports', True);
 
   Login.Players[Login.PlayerIndex].Worlds := [_PCWorld];
 
   inherited;
 end;
+
 
 
 procedure TPestConfig.Run(); override;
