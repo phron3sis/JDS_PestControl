@@ -30,23 +30,14 @@ DefendKnightArea := [[5741, 5605], [5775, 5606], [5775, 5639], [5742, 5639]];
 //this is box we be in at very start of pest control game
 GameStartLandingBoat := [[5752, 5532], [5773, 5532], [5773, 5562], [5751, 5562]];
 
-PlankTiles
-  TILE_VETERAN 
-  TILE_INTERMEDIATE 
-  TILE_NOVICE 
 
-BoatBounds
-  BOAT_VETERAN
-  BOAT_INTERMEDIATE
-  BOAT_NOVICE
+VETERAN_GAME_ONLY:
+yellow shifter:
+CTS2(2347498, 12, 0.02, 1.15)
+yellow shifter 2nd color:
+CTS2(2177617, 4, 0.20, 0.90)
 
-KnightArea
-  CENTER_BOUNDS
-
-Objects:
-  4 different portals
-  3 different gates
-
-NPCs
-  OUTPOST_KNIGHT
-  ISLAND_KNIGHT_ESCAPE
+white shifter:
+CTS2(12963018, 3, 0.97, 0.47)
+white shifter 2nd color:
+CTS2(9406348, 3, 0.46, 0.26)

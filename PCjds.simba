@@ -9,7 +9,7 @@ program WaspPestControl;
 
 const
   BoatToUtilize =   3;   //1 Novice, 2 Intermediate, 3 Veteran
-  PointsPerGame =   7;   // veterans boat, med diary = 7
+  PointsPerGame =   4;   // veterans boat, med diary = 7
   _PCWorld      = 344;   // Pest Control World is 344
 
   // Boat interiors
@@ -52,6 +52,7 @@ type
     CenterTile       : TPoint;
     PlankTile        : TPoint;
     CrossPlankTile   : TPoint;
+    TheGangPlank     : TRSObject;
 
     LastXP           : Int64;
     LastXPTime       : UInt64;
@@ -246,8 +247,8 @@ var
   abox: TBox;
   x, y: Int32;
 begin
-  // Run only every 5 seconds
-  if (GetSystemTime - LastUpdate) < 5000 then
+  // Run only every X amount of MS
+  if (GetSystemTime - LastUpdate) < 600 then
     Exit;
   LastUpdate := GetSystemTime;
 
@@ -423,31 +424,130 @@ end;
 procedure TJdsPestControl.DoInBoat();
 begin
   self.UpdatePoints();
-  Wait(700, 1300);
+  Wait(220, 1300, wdleft);
 end;
 
 procedure TJdsPestControl.DoWalkCenter();
-var
-  ChancePrayer: Boolean;
 begin
-  ChancePrayer := (Random(0, 5) = 0);
-
   if Self.RSW.AtTile(Self.CenterTile, 15) then
   begin
     Minimap.EnablePrayer();
     Exit;
   end;
 
-  if ChancePrayer then
+  if Antiban.BioDice(25) then
   begin
     Minimap.EnablePrayer();
-    Wait(0, 1000, wdLeft);
+    Wait(60, 230, wdLeft);
   end;
 
   Self.RSW.WalkBlind(Self.CenterTile, 10);
   Minimap.EnablePrayer();
-  Wait(0, 1000, wdLeft);
 end;
+
+function TJdsPestControl.GetShifters(): TPointArray;
+var
+  // Yellow Shifter
+  Y1, Y2 : TCTS2Color;
+
+  // White Shifter
+  W1, W2 : TCTS2Color;
+
+  primaryTPA, secondTPA : TPointArray;
+  clusters: T2DPointArray;
+  c       : TPointArray;
+  abox    : TBox;
+  output  : TPointArray;
+
+  tileMS  : TRectangle;
+  centerMS: TPoint;
+  zoom    : Double;
+  radius  : Int32;
+
+const
+  EXPAND_PX   = 7;
+  MIN_PRIMARY = 8;
+  MIN_SECOND  = 4;
+
+  procedure Process(const C1, C2: TCTS2Color);
+  var
+    pt: TPoint;
+  begin
+    primaryTPA := [];
+    SRL.FindColors(primaryTPA, C1, MainScreen.Bounds);
+    if primaryTPA = [] then Exit;
+
+    clusters := primaryTPA.Cluster(6);
+
+    for c in clusters do
+    begin
+      if c.Len < MIN_PRIMARY then
+        Continue;
+
+      abox := c.Bounds().Expand(EXPAND_PX);
+
+      secondTPA := [];
+      SRL.FindColors(secondTPA, C2, abox.EnsureRange(MainScreen.Bounds));
+
+      if secondTPA.Len >= MIN_SECOND then
+      begin
+        pt := c.Mean();
+
+        // -------- RADIUS FILTER --------
+        if centerMS.DistanceTo(pt) <= radius then
+          output.Append(pt);
+        // --------------------------------
+      end;
+    end;
+  end;
+
+begin
+  // ======================================================
+  // 1. Convert Defend Knight tile → mainscreen
+  // ======================================================
+  tileMS := self.rsw.GetTileMS(DEFEND_KNIGHT_BOX.Middle());
+  if (tileMS = []) then
+    Exit;
+
+  centerMS := tileMS.Mean;
+
+  // ======================================================
+  // 2. Determine radius from zoom
+  // ======================================================
+  zoom := MM2MS.ZoomLevel / 100.0;
+
+  // Clamp
+  if zoom < 0 then zoom := 0;
+  if zoom > 1 then zoom := 1;
+
+  // Your rule of thumb:
+  // 25% zoom → ~100px
+  // 50% zoom → ~135px
+  // Scales nicely
+  radius := Round(100 + (zoom * 70)); // max ~170px at zoom=100
+
+  // ======================================================
+  // 3. Colors
+  // ======================================================
+  Y1 := CTS2(2347498, 12, 0.02, 1.15);
+  Y2 := CTS2(2177617, 4,  0.20, 0.90);
+
+  W1 := CTS2(12963018, 3, 0.97, 0.47);
+  W2 := CTS2(9406348,  3, 0.46, 0.26);
+
+  output := [];
+
+  // ======================================================
+  // 4. Run detection with radius-bounding
+  // ======================================================
+  Process(Y1, Y2);
+  Process(W1, W2);
+
+  Result := output;
+end;
+
+
+
 
 
 {********************************************}
@@ -552,13 +652,45 @@ end;
 procedure TJdsPestControl.DoDefend();
 var
   M: TPoint;
+  _shifters: TPointArray;
+  idx: UInt32;
 begin
   // Antiban is handled once per main loop in Run()
   Self.UpdateXPState();
+  if not Self.XPStale() then Exit;
 
-  if Self.XPStale() then
+  _shifters := self.GetShifters();
+  if _shifters.Len > 0 then
   begin
-    M := Self.GetMonsterClickPoint();
+    // === CASE 1: Only one ===
+    if _shifters.Len = 1 then
+      idx := 0
+
+    // === CASE 2: Two shifters ===
+    else if _shifters.Len = 2 then
+    begin
+      if Antiban.BioDice(70) then
+        idx := 0
+      else if Antiban.BioDice(90) then
+        idx := 1
+      else
+        idx := Random(0, 1);
+    end
+
+    // === CASE 3: Three or more ===
+    else
+    begin
+      if Antiban.BioDice(70) then
+        idx := 0
+      else if Antiban.BioDice(90) then
+        idx := 1
+      else
+        idx := Random(0, high(_shifters));
+    end;
+
+    // === Now attack chosen shifter ===
+    M := _shifters[idx];
+
     if MainScreen.IsVisible(M) then
     begin
       Mouse.Move(M);
@@ -569,9 +701,28 @@ begin
         Mouse.Click(MOUSE_LEFT);
         if MainScreen.DidRedClick() then
           Wait(600, 1800);
+        Exit;
       end;
     end;
   end;
+
+
+//  M := Self.GetMonsterClickPoint();
+//  if MainScreen.IsVisible(M) then
+//  begin
+//    Mouse.Move(M);
+//    Wait(60, 120);
+//
+//    if WaitUntil(MainScreen.GetUpText().Contains('ttack'), 20, 300) then
+//    begin
+//      Mouse.Click(MOUSE_LEFT);
+//      if MainScreen.DidRedClick() then
+//        Wait(600, 1800, wdleft);
+//      self.Msg('used wimpy srl plugin color...');
+//      Exit;
+//    end;
+//  end;
+
 
   Wait(50, 100);
 end;
@@ -605,44 +756,12 @@ end;
 {********************************************}
 
 function TJdsPestControl.CrossPlank(): Boolean;
-var
-  TileRect : TRectangle;
-  ClickPt  : TPoint;
-  attempts : Int32;
 begin
   Result := False;
 
-  TileRect := Self.RSW.GetTileMS(Self.CrossPlankTile);
-
-  attempts := 0;
-  repeat
-    Inc(attempts);
-
-    ClickPt := SRL.RandomPoint(TileRect, SRL_GAUSS_CUTOFF / 1.5);
-    Mouse.Move(ClickPt);
-    Wait(40, 90);
-
-    if WaitUntil(MainScreen.GetUpText().Contains('ross'), 120, 1200) then
-    begin
-      Mouse.Click(MOUSE_LEFT);
-
-      if MainScreen.DidRedClick() then
-      begin
-        if WaitUntil(self.InBoat(), 600, 4000) then
-        begin
-          Result := True;
-          Exit;
-        end;
-      end;
-    end;
-
-    Mouse.Move(ClickPt.Random(5, 15, True));
-    Wait(60, 120);
-
-    if (attempts mod 3 = 0) then
-      Antiban.SmallCameraRotation();
-
-  until attempts > 8;
+  if self.TheGangPlank.Click(Antiban.BioDice(83.7), random(3,7)) then
+    if WaitUntil(self.InBoat(), 600, 4000) then
+      EXIT(true);
 end;
 
 
@@ -660,7 +779,7 @@ begin
   if not Self.CrossPlank() then
   begin
     Self.RSW.WalkBlind(Self.PlankTile, 4);
-    Wait(250, 450);
+    Wait(600, 1250);
 
     // One more chance to catch the win message
     Self.CheckNPCWin();
@@ -694,20 +813,20 @@ begin
   case BoatToUtilize of
     1: begin
         Self.PlankTile := NOVICE_PLANK_TILE;
-        Self.CrossPlankTile := Point(Self.PlankTile.x+4, Self.PlankTile.y);
+        Self.CrossPlankTile := Point(6210, 4755);
     end;
     2: begin
         Self.PlankTile := INTER_PLANK_TILE;
-        Self.CrossPlankTile := Point(Self.PlankTile.x-4, Self.PlankTile.y);
+        Self.CrossPlankTile := Point(6149, 4735);
     end;
     3: begin
         Self.PlankTile := VETERAN_PLANK_TILE;
-        Self.CrossPlankTile := Point(Self.PlankTile.x-4, Self.PlankTile.y);
+        Self.CrossPlankTile := Point(6125, 4699);
     end;
   else
     begin
-      Self.PlankTile := VETERAN_PLANK_TILE; // fallback end;
-      Self.CrossPlankTile := Point(Self.PlankTile.x-4, Self.PlankTile.y);
+      Self.PlankTile := VETERAN_PLANK_TILE; // fallback
+      Self.CrossPlankTile := Point(6125, 4699);
     end;
   end;
 
@@ -725,6 +844,15 @@ begin
 
   // Reset HUD timer
   PestHUD.LastUpdate := 0;
+
+  with Self.TheGangPlank do
+  begin
+    SetupCoordinates([Self.CrossPlankTile]);
+    SetupUpText(['Cross', 'oss G', 'Gang']);
+    ShapeArray.SetShape([1,1,1]);
+    Finder.Colors := [CTS2(5402243, 8, 0.05, 0.06)];
+    ActionUpText := ['Cross'];
+  end;
 end;
 
 
@@ -768,11 +896,18 @@ begin
       Wait(200, 1200, wdLeft);
     end;
 
-    // Single Torwent-style antiban call per loop
-    Self.DoAntiban(True, True);
+    case Self.State of
+      PCS_DEFEND,
+      PCS_WALK_CENTER:
+        Self.DoAntiban(False, False);
+    else
+        Self.DoAntiban(True, True);
+    end;
 
-    // Low-frequency Shifter-themed HUD
     PestHUD.UpdateAndDraw();
+
+    //save CPU
+    wait(200, 600, wdleft);
 
   until Self.ShouldStop();
 end;
