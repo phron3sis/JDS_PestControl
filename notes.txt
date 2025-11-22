@@ -30,14 +30,32 @@ DefendKnightArea := [[5741, 5605], [5775, 5606], [5775, 5639], [5742, 5639]];
 //this is box we be in at very start of pest control game
 GameStartLandingBoat := [[5752, 5532], [5773, 5532], [5773, 5562], [5751, 5562]];
 
+Pest Control has 5 different shifters. Novice has 2, intermediate has 3 and veteran has 2
 
-VETERAN_GAME_ONLY:
+
+VETERAN GAME:
 yellow shifter:
 CTS2(2347498, 12, 0.02, 1.15)
-yellow shifter 2nd color:
 CTS2(2177617, 4, 0.20, 0.90)
-
 white shifter:
 CTS2(12963018, 3, 0.97, 0.47)
-white shifter 2nd color:
 CTS2(9406348, 3, 0.46, 0.26)
+
+Intermediate game:
+Green:
+CTS2(2177290, 5, 0.12, 6.09)
+CTS2(3822370, 4, 0.15, 0.81)
+Black:
+CTS2(5066333, 5, 0.23, 0.33)
+CTS2(5263713, 4, 0.30, 0.26)
+white shifter:
+CTS2(12963018, 3, 0.97, 0.47)
+CTS2(9406348, 3, 0.46, 0.26)
+
+NOVICE game:
+Red Shifter:
+CTS2(2107241, 5, 0.09, 0.60)
+CTS2(2173038, 4, 0.11, 0.67)
+Green:
+CTS2(2177290, 5, 0.12, 6.09)
+CTS2(3822370, 4, 0.15, 0.81)

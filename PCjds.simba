@@ -8,9 +8,9 @@ program WaspPestControl;
 {$I WaspLib/osr.simba}
 
 const
-  BoatToUtilize =   3;   //1 Novice, 2 Intermediate, 3 Veteran
-  PointsPerGame =   4;   // veterans boat, med diary = 7
-  _PCWorld      = 344;   // Pest Control World is 344
+  DEBUG_SHIFTERS    = True; //Debug shifter points/boxes/click circles
+  PointsPerGame     =   4;  //Depends on diary and boat
+  SHIFTER_LOG_FILE  = 'pest_shifters_log.csv'; // simple CSV in working dir
 
   // Boat interiors
   VETERAN_BOAT_BOX     : TBox = [6105, 4695, 6120, 4718];
@@ -60,17 +60,16 @@ type
 
     StartTime        : UInt64;
 
-    // === WIN TRACKING ===
+    // ===   TRACKING   ===
     GamesWon      : UInt32;
     LastWinTime   : UInt64;
     WinCooldown   : UInt64;
 
-    CachedPos      : TPoint;
-    CachedPosTime  : UInt64;
-    PosCacheDelay  : UInt32;   // milliseconds to trust cached pos
-
     PointsTotal    : UInt32;
     PointsTime     : UInt64;
+
+    OurCmbtLvl     : UInt32;
+    OurCmbtStyle   : String;
   end;
 
   {********************************************}
@@ -81,6 +80,16 @@ type
     LastUpdate: UInt64;
     Text      : TStringArray;
   end;
+
+  // === SHIFTER DETECTION TYPES ===
+  TShifterDetection = record
+    Mean: TPoint;
+    Cluster: TPointArray;     // primary (C1)
+    Secondary: TPointArray;   // secondary (C2)
+    ABox: TBox;
+  end;
+
+  TShifterDetectionArray = array of TShifterDetection;
 
 var
   PestControl: TJdsPestControl;
@@ -206,8 +215,8 @@ begin
     ERSSkill.TOTAL
   ];
 
-  Self.MinZoom := 15;
-  Self.MaxZoom := 40;
+  Self.MinZoom := 25;
+  Self.MaxZoom := 50;
 
   inherited;
 end;
@@ -216,7 +225,6 @@ end;
 {********************************************}
 {                 LOGGING                    }
 {********************************************}
-
 procedure TJdsPestControl.Msg(const s: String);
 var
   t: UInt64;
@@ -248,10 +256,11 @@ var
   x, y: Int32;
 begin
   // Run only every X amount of MS
-  if (GetSystemTime - LastUpdate) < 600 then
+  if (GetSystemTime - LastUpdate) < 1000 then
     Exit;
   LastUpdate := GetSystemTime;
 
+  wait(20);
   // ==== COMPUTE HUD TEXT ====
   Text := [];
 
@@ -275,7 +284,7 @@ begin
 
   abox := Box(7, 345, 195, 473);
 
-  RSClient.Image().DrawBoxFilled(abox.Expand(1), False, BORDER_COLOR);
+  RSClient.Image().DrawBoxFilled(abox.Expand(2), False, BORDER_COLOR);
   RSClient.Image().DrawBoxFilled(abox, False, BG_COLOR);
 
   RSClient.Image().SetFontName('Arial');
@@ -318,19 +327,6 @@ begin
   Result := (GetSystemTime - Self.LastXPTime) > Self.NextAttackDelay;
 end;
 
-function TJdsPestControl.GetPos(): TPoint;
-begin
-  // If cache younger than PosCacheDelay, return cached location
-  if (GetSystemTime - Self.CachedPosTime) < Self.PosCacheDelay then
-    Exit(Self.CachedPos);
-
-  // Otherwise refresh once
-  Self.CachedPos := Self.RSW.GetMyPos();
-  Self.CachedPosTime := GetSystemTime();
-
-  Result := Self.CachedPos;
-end;
-
 {********************************************}
 {               STATE DETECTION              }
 {********************************************}
@@ -350,8 +346,7 @@ function TJdsPestControl.GetState(): EPestState;
 var
   pos: TPoint;
 begin
-  // Read cached/corrected location once
-  pos := Self.GetPos();
+  pos := Self.RSW.GetMyPos();
 
   // ================================
   // OUTPOST (boats + planks)
@@ -424,7 +419,7 @@ end;
 procedure TJdsPestControl.DoInBoat();
 begin
   self.UpdatePoints();
-  Wait(220, 1300, wdleft);
+  Wait(300, 1500, wdleft);
 end;
 
 procedure TJdsPestControl.DoWalkCenter();
@@ -438,44 +433,89 @@ begin
   if Antiban.BioDice(25) then
   begin
     Minimap.EnablePrayer();
-    Wait(60, 230, wdLeft);
+    Wait(10, 230, wdLeft);
   end;
 
-  Self.RSW.WalkBlind(Self.CenterTile, 10);
+  Self.RSW.WalkBlind(Self.CenterTile.Random(-7,7,True), 10);
   Minimap.EnablePrayer();
 end;
 
-function TJdsPestControl.GetShifters(): TPointArray;
+procedure TJdsPestControl.DebugFoundShifters(
+  const detections: TShifterDetectionArray;
+  const centerMS: TPoint;
+  const radius: Int32
+);
 var
-  // Yellow Shifter
-  Y1, Y2 : TCTS2Color;
+  sh: TShifterDetection;
+  R: UInt32;
+begin
+  RSClient.Image.Clear();
 
-  // White Shifter
-  W1, W2 : TCTS2Color;
+  if MM2MS.GetZoomLevel() < 37 then
+    R := 7
+  else
+    R := 11;
 
-  primaryTPA, secondTPA : TPointArray;
+  for sh in detections do
+  begin
+    // draw primary cluster (yellow)
+    RSClient.Image.DrawTPA(sh.Cluster, $FFFF00);
+
+    // draw secondary (green)
+    RSClient.Image.DrawTPA(sh.Secondary, $00FF00);
+
+    // draw abox (orange)
+    RSClient.Image.DrawBox(sh.ABox, $00A5FF);
+
+    // draw mean point circle (cyan)
+    RSClient.Image.DrawCircle(sh.Mean, R, $00FFFF);
+
+    // counts label near the shifter
+    RSClient.Image.DrawText(
+      Format('P:%d S:%d', [sh.Cluster.Len, sh.Secondary.Len]),
+      Point(sh.Mean.X + 8, sh.Mean.Y - 8),
+      $FFFFFF
+    );
+  end;
+
+  // search radius (pink)
+  RSClient.Image.DrawCircle(centerMS, radius, $FF00FF);
+end;
+
+function TJdsPestControl.GetShifters(): TShifterDetectionArray;
+type
+  TColorPair = record
+    C1, C2: TCTS2Color;
+  end;
+
+var
+  Profiles: array of TColorPair;
+  P: TColorPair;
+
+  primaryTPA, secondTPA: TPointArray;
   clusters: T2DPointArray;
-  c       : TPointArray;
-  abox    : TBox;
-  output  : TPointArray;
+  c: TPointArray;
+  abox: TBox;
 
-  tileMS  : TRectangle;
+  tileMS: TRectangle;
   centerMS: TPoint;
-  zoom    : Double;
-  radius  : Int32;
+  zoom: Double;
+  radius: Int32;
+
+  detections: TShifterDetectionArray;
+  sh: TShifterDetection;
 
 const
   EXPAND_PX   = 7;
-  MIN_PRIMARY = 8;
-  MIN_SECOND  = 4;
+  MIN_PRIMARY = 7;
+  MIN_SECOND  = 7;
 
-  procedure Process(const C1, C2: TCTS2Color);
-  var
-    pt: TPoint;
+  procedure ProcessProfile(const CP: TColorPair);
   begin
     primaryTPA := [];
-    SRL.FindColors(primaryTPA, C1, MainScreen.Bounds);
-    if primaryTPA = [] then Exit;
+    SRL.FindColors(primaryTPA, CP.C1, MainScreen.Bounds);
+    if primaryTPA = [] then
+      Exit;
 
     clusters := primaryTPA.Cluster(6);
 
@@ -485,247 +525,220 @@ const
         Continue;
 
       abox := c.Bounds().Expand(EXPAND_PX);
+      abox := abox.EnsureRange(MainScreen.Bounds);
 
       secondTPA := [];
-      SRL.FindColors(secondTPA, C2, abox.EnsureRange(MainScreen.Bounds));
+      SRL.FindColors(secondTPA, CP.C2, abox);
 
       if secondTPA.Len >= MIN_SECOND then
       begin
-        pt := c.Mean();
+        sh.Mean      := c.Mean();
+        sh.Cluster   := c;
+        sh.Secondary := secondTPA;
+        sh.ABox      := abox;
 
-        // -------- RADIUS FILTER --------
-        if centerMS.DistanceTo(pt) <= radius then
-          output.Append(pt);
-        // --------------------------------
+        if centerMS.DistanceTo(sh.Mean) <= radius then
+        begin
+          SetLength(detections, Length(detections) + 1);
+          detections[High(detections)] := sh;
+        end;
       end;
     end;
   end;
 
 begin
-  // ======================================================
-  // 1. Convert Defend Knight tile → mainscreen
-  // ======================================================
-  tileMS := self.rsw.GetTileMS(DEFEND_KNIGHT_BOX.Middle());
-  if (tileMS = []) then
-    Exit;
+  SetLength(detections, 0);
 
-  centerMS := tileMS.Mean;
-
-  // ======================================================
-  // 2. Determine radius from zoom
-  // ======================================================
-  zoom := MM2MS.ZoomLevel / 100.0;
-
-  // Clamp
-  if zoom < 0 then zoom := 0;
-  if zoom > 1 then zoom := 1;
-
-  // Your rule of thumb:
-  // 25% zoom → ~100px
-  // 50% zoom → ~135px
-  // Scales nicely
-  radius := Round(100 + (zoom * 70)); // max ~170px at zoom=100
-
-  // ======================================================
-  // 3. Colors
-  // ======================================================
-  Y1 := CTS2(2347498, 12, 0.02, 1.15);
-  Y2 := CTS2(2177617, 4,  0.20, 0.90);
-
-  W1 := CTS2(12963018, 3, 0.97, 0.47);
-  W2 := CTS2(9406348,  3, 0.46, 0.26);
-
-  output := [];
-
-  // ======================================================
-  // 4. Run detection with radius-bounding
-  // ======================================================
-  Process(Y1, Y2);
-  Process(W1, W2);
-
-  Result := output;
-end;
-
-
-
-
-
-{********************************************}
-{        SMART CLICK POINT FOR MONSTERS      }
-{********************************************}
-function TJdsPestControl.GetMonsterClickPoint(): TPoint;
-const
-  BASE_RADIUS = 60; // radius at 50–100% zoom
-  BORDER_COLOR = $DD7A26FF;
-var
-  tileMS     : TRectangle;
-  centerMS   : TPoint;
-  zoom       : Double;
-  radius     : Int32;
-  pts, inside: TPointArray;
-  clusters   : T2DPointArray;
-  pMean, pRand: TPoint;
-  dx, dy, s  : Double;
-  pt: TPoint;
-begin
-  Result := [-1, -1];
-
-  //------------------------------------------------------
-  // 1. Convert CenterTile → MainScreen projection
-  //------------------------------------------------------
-  tileMS := Self.RSW.GetTileMS(Self.CenterTile);
+  // 1. Map defend knight tile → mainscreen
+  tileMS := Self.RSW.GetTileMS(DEFEND_KNIGHT_BOX.Middle());
   if (tileMS.Top.X = 0) and (tileMS.Top.Y = 0) then
     Exit;
 
   centerMS := tileMS.Mean;
 
-  //------------------------------------------------------
-  // 2. Read real zoom level (0.0 → 1.0)
-  //------------------------------------------------------
+  // 2. Dynamic search radius from zoom
   zoom := MM2MS.ZoomLevel / 100.0;
-  if zoom < 0 then zoom := 0;
-  if zoom > 1 then zoom := 1;
+  zoom := EnsureRange(zoom, 0.0, 1.0);
+  radius := Round(100 + (zoom * 70));
 
-  //------------------------------------------------------
-  // 3. Convert zoom → search radius
-  //------------------------------------------------------
-  // zoom=1.0 → 100
-  // zoom=0.5 → 150
-  // zoom=0.0 → 200
-  radius := Round(BASE_RADIUS + (BASE_RADIUS * (1 - zoom)));
+  // 3. Build color profiles based on combat level
+  if Self.OurCmbtLvl >= 100 then
+  begin
+    // VETERAN
+    SetLength(Profiles, 2);
 
-  //------------------------------------------------------
-  // 4. Find monster colors in MS
-  //------------------------------------------------------
-  pts := [];
-  SRL.FindColors(pts, CTS2(15921928, 2, 0.08, 5.42), MainScreen.Bounds);
-  if pts.Len = 0 then Exit;
+    // Yellow
+    Profiles[0].C1 := CTS2(2347498, 12, 0.02, 1.15);
+    Profiles[0].C2 := CTS2(2177617, 4,  0.20, 0.90);
 
-  //------------------------------------------------------
-  // 5. Keep only points inside the zoom-scaled circle
-  //------------------------------------------------------
-  inside := [];
-  for pt in pts do
-    if SRL.PointInCircle(pt, centerMS, radius) then
-      inside += pt;
+    // White
+    Profiles[1].C1 := CTS2(12963018, 3, 0.97, 0.47);
+    Profiles[1].C2 := CTS2(9406348,  3, 0.46, 0.26);
+  end
+  else if Self.OurCmbtLvl >= 70 then
+  begin
+    // INTERMEDIATE
+    SetLength(Profiles, 3);
 
-  if inside.Len = 0 then Exit;
+    // Green
+    Profiles[0].C1 := CTS2(2177290, 5, 0.12, 6.09);
+    Profiles[0].C2 := CTS2(3822370, 4, 0.15, 0.81);
 
-  //------------------------------------------------------
-  // 6. Cluster → pick closest cluster
-  //------------------------------------------------------
-  clusters := inside.Cluster(2);
-  if clusters.Len = 0 then Exit;
+    // Black
+    Profiles[1].C1 := CTS2(5066333, 5, 0.23, 0.33);
+    Profiles[1].C2 := CTS2(5263713, 4, 0.30, 0.26);
 
-  clusters.SortByMiddle(centerMS);
+    // Yellow
+    Profiles[2].C1 := CTS2(2347498, 12, 0.02, 1.15);
+    Profiles[2].C2 := CTS2(2177617, 4,  0.20, 0.90);
+  end
+  else if Self.OurCmbtLvl >= 40 then
+  begin
+    // NOVICE
+    SetLength(Profiles, 2);
 
-  pMean := clusters[0].Mean();
-  pRand := clusters[0].RandomValue();
+    // Red
+    Profiles[0].C1 := CTS2(2107241, 5, 0.09, 0.60);
+    Profiles[0].C2 := CTS2(2173038, 4, 0.11, 0.67);
 
-  //------------------------------------------------------
-  // 7. Gaussian smoothly bias click from mean → point
-  //------------------------------------------------------
-  s := SRL.GaussRand(0.70, 0.10);
-  if s < 0.55 then s := 0.55;
-  if s > 0.90 then s := 0.90;
+    // Green
+    Profiles[1].C1 := CTS2(2177290, 5, 0.12, 6.09);
+    Profiles[1].C2 := CTS2(3822370, 4, 0.15, 0.81);
+  end
+  else
+  begin
+    Self.Msg('[x0!2x] CmbtLVL: ' + ToStr(Self.OurCmbtLvl));
+    TerminateScript('Combat level matters');
+  end;
 
-  dx := (pRand.X - pMean.X);
-  dy := (pRand.Y - pMean.Y);
+  // 4. Run detection for all profiles tied to this boat
+  for P in Profiles do
+    ProcessProfile(P);
 
-  Result.X := pMean.X + Round(dx * s);
-  Result.Y := pMean.Y + Round(dy * s);
+  if DEBUG_SHIFTERS then
+    DebugFoundShifters(detections, centerMS, radius);
 
-  //------------------------------------------------------
-  // 8. Debug: draw outline of search region
-  //------------------------------------------------------
-
-  //RSClient.Image.DrawCircle(centerMS, radius, BORDER_COLOR);
+  Result := detections;
 end;
-
-
 
 
 {********************************************}
 {                 DEFEND LOOP                }
 {********************************************}
-
 procedure TJdsPestControl.DoDefend();
 var
-  M: TPoint;
-  _shifters: TPointArray;
+  shifters: TShifterDetectionArray;
+  sh: TShifterDetection;
   idx: UInt32;
+  theRadius, dx, dy: Int32;
+  clickPoint: TPoint;
+  radius, theta: Double;
+
+  logHeader, logLine: String;
+  f: Int32;
+
+const
+  EXPAND_PX = 7;
+
 begin
-  // Antiban is handled once per main loop in Run()
   Self.UpdateXPState();
-  if not Self.XPStale() then Exit;
+  if not Self.XPStale() then
+    Exit;
 
-  _shifters := self.GetShifters();
-  if _shifters.Len > 0 then
+  shifters := Self.GetShifters();
+  if Length(shifters) < 1 then
   begin
-    // === CASE 1: Only one ===
-    if _shifters.Len = 1 then
-      idx := 0
-
-    // === CASE 2: Two shifters ===
-    else if _shifters.Len = 2 then
-    begin
-      if Antiban.BioDice(70) then
-        idx := 0
-      else if Antiban.BioDice(90) then
-        idx := 1
-      else
-        idx := Random(0, 1);
-    end
-
-    // === CASE 3: Three or more ===
-    else
-    begin
-      if Antiban.BioDice(70) then
-        idx := 0
-      else if Antiban.BioDice(90) then
-        idx := 1
-      else
-        idx := Random(0, high(_shifters));
-    end;
-
-    // === Now attack chosen shifter ===
-    M := _shifters[idx];
-
-    if MainScreen.IsVisible(M) then
-    begin
-      Mouse.Move(M);
-      Wait(60, 120);
-
-      if WaitUntil(MainScreen.GetUpText().Contains('ttack'), 20, 300) then
-      begin
-        Mouse.Click(MOUSE_LEFT);
-        if MainScreen.DidRedClick() then
-          Wait(600, 1800);
-        Exit;
-      end;
-    end;
+    Wait(50, 100);
+    Exit;
   end;
 
+  { === PICK SHIFTER === }
+  if Length(shifters) = 1 then
+    idx := 0
+  else if Length(shifters) = 2 then
+  begin
+    if Antiban.BioDice(70) then idx := 0
+    else if Antiban.BioDice(90) then idx := 1
+    else idx := Random(0,1);
+  end
+  else
+  begin
+    if Antiban.BioDice(70) then idx := 0
+    else if Antiban.BioDice(90) then idx := 1
+    else idx := Random(0, High(shifters));
+  end;
 
-//  M := Self.GetMonsterClickPoint();
-//  if MainScreen.IsVisible(M) then
-//  begin
-//    Mouse.Move(M);
-//    Wait(60, 120);
-//
-//    if WaitUntil(MainScreen.GetUpText().Contains('ttack'), 20, 300) then
-//    begin
-//      Mouse.Click(MOUSE_LEFT);
-//      if MainScreen.DidRedClick() then
-//        Wait(600, 1800, wdleft);
-//      self.Msg('used wimpy srl plugin color...');
-//      Exit;
-//    end;
-//  end;
+  sh := shifters[idx];
 
+  { === HUMAN CLICK OFFSET === }
+  if MM2MS.GetZoomLevel() < 37 then
+    theRadius := 6
+  else
+    theRadius := 10;
 
-  Wait(50, 100);
+  repeat
+    radius := Abs(SRL.GaussRand(0, theRadius / 2));
+  until radius <= theRadius;
+
+  theta := Random() * 2 * PI;
+
+  dx := Round(radius * Cos(theta));
+  dy := Round(radius * Sin(theta));
+
+  clickPoint := Point(sh.Mean.X + dx, sh.Mean.Y + dy);
+
+  Mouse.Move(clickPoint);
+  Wait(60, 120, wdLeft);
+
+  if MainScreen.GetUpText().Contains('ttack') then
+  begin
+    Antiban.BioClick(MOUSE_LEFT, 2);
+
+    if MainScreen.DidRedClick() then
+    begin
+      { ------------------------------------------------------- }
+      {                LOG SUCCESSFUL ATTACK                    }
+      { ------------------------------------------------------- }
+
+      { If file does not exist, create it and write header }
+      if not FileExists(SHIFTER_LOG_FILE) then
+      begin
+        f := CreateFile(SHIFTER_LOG_FILE);
+        if f <> -1 then
+          CloseFile(f);
+
+        logHeader :=
+          'timestamp,zoom,primary_count,secondary_count,' +
+          'expand_px,abox_width,abox_height,dist_to_center,mean_x,mean_y';
+
+        WriteFileContents(SHIFTER_LOG_FILE, logHeader + STR_NEW_LINE, true);
+      end;
+
+      { Build CSV line }
+      logLine := Format(
+        '%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d',
+        [
+          GetSystemTime(),
+          Double(MM2MS.GetZoomLevel()),
+          sh.Cluster.Len,
+          sh.Secondary.Len,
+          EXPAND_PX,
+          sh.ABox.X2 - sh.ABox.X1,
+          sh.ABox.Y2 - sh.ABox.Y1,
+          Distance(Self.CenterTile, sh.Mean),
+          sh.Mean.X,
+          sh.Mean.Y
+        ]
+      );
+
+      { Append row }
+      WriteFileContents(SHIFTER_LOG_FILE, logLine + STR_NEW_LINE, true);
+
+      Wait(500, 1400);
+    end;
+  end;
 end;
+
 
 
 {********************************************}
@@ -778,7 +791,7 @@ begin
 
   if not Self.CrossPlank() then
   begin
-    Self.RSW.WalkBlind(Self.PlankTile, 4);
+    Self.RSW.WalkBlind(Self.PlankTile.Random(-7,7,True), 4);
     Wait(600, 1250);
 
     // One more chance to catch the win message
@@ -803,37 +816,7 @@ begin
   Self.RSW.SetupRegions([RSRegions.PEST_CONTROL_ISLAND, RSRegions.PEST_CONTROL_OUTPOST], 8);
   Self.RSW.ScreenWalk := False;
 
-  Self.PosCacheDelay := HumanGauss(0.75, 1.75, 1.0, 0.20, 0.15);
-  Self.CachedPos := Self.RSW.GetMyPos();
-  Self.CachedPosTime := GetSystemTime();
-  Self.Msg('CachedPosTime: ' + ToStr(Self.PosCacheDelay));
-
   Self.CenterTile     := DEFEND_KNIGHT_BOX.Middle;
-
-  case BoatToUtilize of
-    1: begin
-        Self.PlankTile := NOVICE_PLANK_TILE;
-        Self.CrossPlankTile := Point(6210, 4755);
-    end;
-    2: begin
-        Self.PlankTile := INTER_PLANK_TILE;
-        Self.CrossPlankTile := Point(6149, 4735);
-    end;
-    3: begin
-        Self.PlankTile := VETERAN_PLANK_TILE;
-        Self.CrossPlankTile := Point(6125, 4699);
-    end;
-  else
-    begin
-      Self.PlankTile := VETERAN_PLANK_TILE; // fallback
-      Self.CrossPlankTile := Point(6125, 4699);
-    end;
-  end;
-
-  Self.LastXP      := XPBar.Read();
-  Self.LastXPTime  := GetSystemTime();
-  Self.NextAttackDelay := HumanGauss(2.3, 3.6, 2.9, 0.25, 0.10);
-  Self.Msg('AttackDelay: ' + ToStr(Self.NextAttackDelay));
 
   Self.GamesWon    := 0;
   Self.LastWinTime := 0;
@@ -844,15 +827,6 @@ begin
 
   // Reset HUD timer
   PestHUD.LastUpdate := 0;
-
-  with Self.TheGangPlank do
-  begin
-    SetupCoordinates([Self.CrossPlankTile]);
-    SetupUpText(['Cross', 'oss G', 'Gang']);
-    ShapeArray.SetShape([1,1,1]);
-    Finder.Colors := [CTS2(5402243, 8, 0.05, 0.06)];
-    ActionUpText := ['Cross'];
-  end;
 end;
 
 
@@ -866,21 +840,59 @@ begin
   // ===== DO LOGIN IF NEEDED =====
   if not rsclient.IsLoggedIn() then
   begin
-    PestControl.Msg('Logging in Forced World ' + ToStr(_PCWorld));
+    PestControl.Msg('Logging in Forced World ' + ToStr(344));
     Login.LoginPlayer(); // no index
     WaitUntil(rsclient.IsLoggedIn(), 600, 15000);
     Wait(650, 1250);
     MainScreen.SetHighestPitch();
     wait(0, 600);
     Antiban.SmallCameraRotation();
-  end else if Login.GetCurrentWorld <> _PCWorld then
+  end else if Login.GetCurrentWorld <> 344 then
   begin
-    WorldHopper.Hop([_PCWorld], False);
+    WorldHopper.Hop([344], False);
     WaitUntil(rsclient.IsLoggedIn(), 600, 15000);
     Wait(650, 1250);
     MainScreen.SetHighestPitch();
     wait(0, 600);
     Antiban.SmallCameraRotation();
+  end;
+
+  Self.LastXP      := XPBar.Read();
+  Self.LastXPTime  := GetSystemTime();
+  Self.NextAttackDelay := HumanGauss(2.3, 3.6, 2.9, 0.25, 0.10);
+  Self.Msg('AttackDelay: ' + ToStr(Self.NextAttackDelay));
+
+  Self.OurCmbtStyle := Combat.GetCombatStyle;
+  Self.OurCmbtLvl := combat.GetCombatLevel;
+  Self.Msg('Combat Level: '+ToStr(Self.OurCmbtLvl));
+  Self.Msg('Combat Style: '+Combat.GetCombatStyle);
+
+  // Decide plank + cross-plank tile based on combat level.
+  if Self.OurCmbtLvl >= 100 then
+  begin
+    Self.PlankTile      := VETERAN_PLANK_TILE;
+    Self.CrossPlankTile := Point(6125, 4699);
+  end
+  else if Self.OurCmbtLvl >= 70 then
+  begin
+    Self.PlankTile      := INTER_PLANK_TILE;
+    Self.CrossPlankTile := Point(6149, 4735);
+  end
+  else if Self.OurCmbtLvl >= 40 then
+  begin
+    Self.PlankTile      := NOVICE_PLANK_TILE;
+    Self.CrossPlankTile := Point(6210, 4755);
+  end
+  else
+    TerminateScript('Combat Level: ' + ToStr(self.OurCmbtLvl));
+
+  with Self.TheGangPlank do
+  begin
+    SetupCoordinates([Self.CrossPlankTile]);
+    SetupUpText(['Cross', 'oss G', 'Gang']);
+    ShapeArray.SetShape([1,1,1]);
+    Finder.Colors := [CTS2(5402243, 8, 0.05, 0.06)];
+    ActionUpText := ['Cross'];
   end;
 
   repeat
@@ -965,7 +977,7 @@ begin
   obj := WLSettings.GetObject('remote_input');
   obj.Put('enabled', True);
 
-  Login.Players[Login.PlayerIndex].Worlds := [_PCWorld];
+  Login.Players[Login.PlayerIndex].Worlds := [344];
 
   inherited;
 end;
@@ -976,7 +988,7 @@ procedure TPestConfig.Run(); override;
 var
   tab: TTabSheet;
 begin
-  Self.Setup('Wasp Pest Control');
+  Self.Setup('Pest Control by Footballjds');
   Self.Start.SetOnClick(@Self.StartScript);
 
   Self.AddTab('Script Settings');
