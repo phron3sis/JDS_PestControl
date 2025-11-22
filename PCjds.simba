@@ -11,6 +11,7 @@ const
   DEBUG_SHIFTERS    = True; //Debug shifter points/boxes/click circles
   PointsPerGame     =   4;  //Depends on diary and boat
   SHIFTER_LOG_FILE  = 'pest_shifters_log.csv';
+  SHIFTER_FAIL_LOG_FILE = 'pest_shifters_fail_log.csv';
 
   // Boat interiors
   VETERAN_BOAT_BOX     : TBox = [6105, 4695, 6120, 4718];
@@ -621,6 +622,54 @@ begin
   Result := detections;
 end;
 
+procedure TJdsPestControl.LogShifterFail(sh: TShifterDetection; const uptext: String);
+var
+  logHeader, logLine: String;
+  f: Int32;
+  cleanUptext: String;
+const
+  EXPAND_PX = 7;
+begin
+  { Create file with header if it doesn't exist }
+  if not FileExists(SHIFTER_FAIL_LOG_FILE) then
+  begin
+    f := CreateFile(SHIFTER_FAIL_LOG_FILE);
+    if f <> -1 then
+      CloseFile(f);
+
+    logHeader :=
+      'timestamp,zoom,primary_count,secondary_count,' +
+      'expand_px,abox_width,abox_height,dist_to_center,mean_x,mean_y,uptext';
+
+    WriteFileContents(SHIFTER_FAIL_LOG_FILE, logHeader + STR_NEW_LINE, true);
+  end;
+
+  { Sanitize uptext - replace commas and newlines to preserve CSV format }
+  cleanUptext := StringReplace(uptext, ',', ';', [rfReplaceAll]);
+  cleanUptext := StringReplace(cleanUptext, #13, ' ', [rfReplaceAll]);
+  cleanUptext := StringReplace(cleanUptext, #10, ' ', [rfReplaceAll]);
+
+  { Build CSV line }
+  logLine := Format(
+    '%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%s',
+    [
+      GetSystemTime(),
+      Double(MM2MS.GetZoomLevel()),
+      sh.Cluster.Len,   //compiler error on this line
+      sh.Secondary.Len,
+      EXPAND_PX,
+      sh.ABox.X2 - sh.ABox.X1,
+      sh.ABox.Y2 - sh.ABox.Y1,
+      Distance(Self.CenterTile, sh.Mean),
+      sh.Mean.X,
+      sh.Mean.Y,
+      cleanUptext
+    ]
+  );
+
+  { Append row }
+  WriteFileContents(SHIFTER_FAIL_LOG_FILE, logLine + STR_NEW_LINE, true);
+end;
 
 {********************************************}
 {                 DEFEND LOOP                }
@@ -634,7 +683,7 @@ var
   clickPoint: TPoint;
   radius, theta: Double;
 
-  logHeader, logLine: String;
+  logHeader, logLine, theUpText: String;
   f: Int32;
 
 const
@@ -688,9 +737,11 @@ begin
   clickPoint := Point(sh.Mean.X + dx, sh.Mean.Y + dy);
 
   Mouse.Move(clickPoint);
-  Wait(60, 120, wdLeft);
+  Wait(80, 150, wdLeft);
 
-  if MainScreen.GetUpText().Contains('ttack') then
+  theUpText := MainScreen.GetUpText();
+
+  if theUpText.Contains('ttack') then
   begin
     Antiban.BioClick(MOUSE_LEFT, 2);
 
@@ -736,6 +787,10 @@ begin
 
       Wait(500, 1400);
     end;
+  end else
+  begin
+    if (theUpText <> 'Walk here') then
+    Self.LogShifterFail(sh, theUpText);
   end;
 end;
 
