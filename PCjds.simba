@@ -10,7 +10,7 @@ program WaspPestControl;
 const
   DEBUG_SHIFTERS    = True; //Debug shifter points/boxes/click circles
   PointsPerGame     =   4;  //Depends on diary and boat
-  SHIFTER_LOG_FILE  = 'pest_shifters_log.csv'; // simple CSV in working dir
+  SHIFTER_LOG_FILE  = 'pest_shifters_log.csv';
 
   // Boat interiors
   VETERAN_BOAT_BOX     : TBox = [6105, 4695, 6120, 4718];
@@ -424,7 +424,7 @@ end;
 
 procedure TJdsPestControl.DoWalkCenter();
 begin
-  if Self.RSW.AtTile(Self.CenterTile, 15) then
+  if Self.RSW.AtTile(Self.CenterTile, 11) then
   begin
     Minimap.EnablePrayer();
     Exit;
@@ -866,6 +866,7 @@ begin
   Self.OurCmbtLvl := combat.GetCombatLevel;
   Self.Msg('Combat Level: '+ToStr(Self.OurCmbtLvl));
   Self.Msg('Combat Style: '+Combat.GetCombatStyle);
+  Self.Msg('Auto retaliate active: '+ToStr(Combat.SetAutoRetaliate(False)));
 
   // Decide plank + cross-plank tile based on combat level.
   if Self.OurCmbtLvl >= 100 then
