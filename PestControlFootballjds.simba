@@ -25,8 +25,6 @@ var
 const
   SHIFTER_LOG_FILE = 'pest_shifters_log.csv';
   SHIFTER_FAIL_LOG_FILE = 'pest_shifters_fail_log.csv';
-  BANNER_URL = 'https://i.imgur.com/IywAt0A.png';
-  BANNER_PATH = 'Resources/PestControlBanner.png';
 
   // Boat interiors
   VETERAN_BOAT_BOX: TBox = [6105, 4695, 6120, 4718];
@@ -77,6 +75,8 @@ type
   TPestHUD = record
     LastUpdate: UInt64;
     Text: TStringArray;
+    SpiderBmp: Int32;  // Add this - stores the bitmap handle
+    SpiderLoaded: Boolean; // Track if loaded
   end;
 
   TShifterDetection = record
@@ -175,6 +175,60 @@ begin
   WriteLn(Format('[%.2d:%.2d:%.2d:%.3d]:[PCjds]: %s', [h, m, sec, ms, s]));
 end;
 
+procedure TPestHUD.Free();
+begin
+  if Self.SpiderLoaded then
+  begin
+    FreeBitmap(Self.SpiderBmp);
+    Self.SpiderLoaded := False;
+    WriteLn('[HUD] Spider icon freed');
+  end;
+end;
+
+// Add this new initialization procedure
+procedure TPestHUD.Init();
+begin
+  Self.LastUpdate := 0;
+  Self.SpiderLoaded := False;
+
+  // Load spider icon once
+  try
+    Self.SpiderBmp := BitmapFromString(68, 75, 'meJztmN1LU2Ecx/+ChQccTjd39O' +
+        'R7S+c2kYlu5pxJTLRQKUVDsCSw0JQiyV4kSLKbiFSCVQZCVhgFWiF' +
+        'kdmO0GyOILktDDC8Cu+qu7/zFOG5ze5zDczyeL5+rZ+fl+zk855xn' +
+        'x+mUIHZ7FbDZKsDy8ooUFeKWXeriPnwClJcfJQqsbYATHvrh74PFp' +
+        'T9Sd2SNMlxWfq0Cd9VxEHA5YD4DuHSvH+MomP/088fSbyB130ipqm' +
+        '4CbncjqHDVE1rhCeBS76wzBDQp/ZqUy0DqvpGiAJdjJ7/p8nyAytP' +
+        'UcjhqCU54BDQpN/wk9/nRntNoz4K03C4gdf0NUYYLx4+CRGFCm/EC' +
+        'lJQeAfQq0QrjBMffAxpdj591hQQujeO0QOr6G6IkF4qn4Tnd2hZbO' +
+        'fhfniYV0HWBvDwTIIUAUhcPE9VFni4jI97e3n6QYLgKGhqaQU1NPe' +
+        'FyVQO73QFUl53M2NjEwMBt0N3dB9rbO0FTUxtRV9cIxAqLi4tSV94' +
+        '0SnJZWPg6N/cR9F+5Cbq6LwEyAi2tp4DqspNZW/sLfL4vs7PzwOf7' +
+        'DN68/QCePpsmUvhOoEttB+TifTz/8vV3IHX9DVFd5OlC8Xhqg14cQ' +
+        'KsrF0ODupx3YJ9+iJYEUhcPEyW5hE2oXYBE/i79HZC6I2uU4RLBQn' +
+        'WRMLvapafnGn0Toy8wUV3kvOZXkktHx/miIheg7zBRFUymYrO5FNB' +
+        '/aqK5uZVQXbYf9ukUwUUmE2+XurgqGwiaTrFZBEFfOFlcDIY0kJSU' +
+        'Cug6qC7Kc6FnFBAEExCfXa9P5/ksIN6SeoZWBQcLSuhOyc21gQguY' +
+        'a9AUpIRqC4Wi5+sLDPB8/tB2LOICxQXVxJUmyYGLQxsRS6r7RCIep' +
+        'CoP+1lF5Z7M3R7ekQAcjGZ7KCsrAbk5FgzM82A/SmxWZ+96TI4eAs' +
+        'EHZYGxUxOvpqZeQ+8D8YBbZadXUgUWhzAaMwGNGIwZOj1AqAt04U8' +
+        'EJjDYc+1WSt2F8aL1tJ6+sLF60C8tkxO5gm6UyLsXmh1gtJSD8F42' +
+        'fegC/s0DkL8ZmHfS7zyDyw12S/4XnAJOot4kN037EqendX1qC6hDV' +
+        'kGIxjR2oy9fNChtlNVdZGzS2w/xZb8fIvqwtgq7oW32kd1YRncyVC' +
+        'BqalpYkt7sQzuZJTkQhkeHiW2cxDVJe6Ji4tMstXnmJyzHRe5XQfV' +
+        'RZ5RXeQZ1UWeic1FMfpOZbn8A2OplHA=');
+    Self.SpiderLoaded := (Self.SpiderBmp > 0);
+    if Self.SpiderLoaded then
+      WriteLn('[HUD] Spider icon loaded successfully')
+    else
+      WriteLn('[HUD] Spider icon failed to load');
+  except
+    WriteLn('[HUD] Exception loading spider icon');
+    Self.SpiderLoaded := False;
+  end;
+  AddOnTerminate(@Self.Free);
+end;
+
 procedure TPestHUD.UpdateAndDraw();
 const
   BG_COLOR = $151515;
@@ -196,7 +250,7 @@ begin
   Text := [];
   elapsed := PestControl.TimeRunning.ElapsedTime();
   winsPerHour := NumberPerHour(PestControl.GamesWon, elapsed);
-  Text += 'Pest Control - by Footballjds | ' + ToStr(PestControl.PointsTotal);
+  Text += 'Pest Control - by Footballjds | Total Points: ' + ToStr(PestControl.PointsTotal);
   Text += 'Runtime: ' + SRL.MsToTime(elapsed, Time_Short).Trim();
   Text += 'State: ' + ToStr(PestControl.State);
   Text += 'Wins: ' + IntToStr(PestControl.GamesWon);
@@ -207,9 +261,19 @@ begin
   Text += 'Next Break: ' + TimeUntilNextBreak();
 
   lineHeight := 14;
-  abox := Box(7, 345, 195, 473);
+  abox := Box(7, 345, 255, 473);
   RSClient.Image().DrawBoxFilled(abox.Expand(2), False, BORDER_COLOR);
   RSClient.Image().DrawBoxFilled(abox, False, BG_COLOR);
+
+  if Self.SpiderLoaded then
+  begin
+    try
+      RSClient.Image().DrawBitmap(GetMufasaBitmap(Self.SpiderBmp), Point(abox.X1 + 180, abox.Y1 + 20));
+    except
+      WriteLn('[HUD] Error drawing spider icon');
+    end;
+  end;
+
   RSClient.Image().SetFontName('Arial');
   RSClient.Image().SetFontSize(11);
   x := abox.X1 + 3;
@@ -283,10 +347,11 @@ end;
 procedure TJdsPestControl.UpdatePoints();
 var
   BluePoints: Int32;
-  LastCheck: Int32 = 60000;
+const
+  CHECK_INTERVAL: Int32 = 60000;
   PEST_POINTS_BOX: Tbox = [72, 64, 123, 81];
 begin
-  if GetSystemTime < (LastCheck + Self.PointsTime) then
+  if GetSystemTime < (CHECK_INTERVAL + Self.PointsTime) then
     EXIT;
   BluePoints := ocr.RecognizeNumber(PEST_POINTS_BOX, TOCRColorFilter.Create([16777113]), RS_FONT_PLAIN_12);
   if BluePoints <= Self.PointsTotal then
@@ -636,7 +701,7 @@ begin
   Self.WinCooldown := 60 * 1000;
   Self.PointsTotal := 0;
   Self.PointsTime := 0;
-  PestHUD.LastUpdate := 0;
+  PestHUD.Init(); // Initialize HUD with spider ico
 end;
 
 procedure TJdsPestControl.Run(maxActions: UInt32; maxTime: UInt64);
@@ -844,11 +909,12 @@ begin
   begin
     Create(tab);
     SetCaption('Stands at center and defends the knight.' + LINEENDING +
-                'Script will automatically detect your combat level and use the appropriate boat.');
+                'Script detects combat level and uses appropriate boat.');
     SetLeft(TControl.AdjustToDPI(30));
     SetTop(nextTop);
     SetAutoSize(True);
-    GetFont().SetSize(10);
+    GetFont().setName('Comic Sans MS');
+    GetFont().SetSize(14);
     GetFont().SetStyle([fsBold]);
   end;
 
@@ -861,6 +927,8 @@ begin
   Self.GameSettingsPanel.SetTop(nextTop);
   Self.GameSettingsPanel.SetWidth(TControl.AdjustToDPI(350));
   Self.GameSettingsPanel.SetHeight(TControl.AdjustToDPI(75));
+  Self.GameSettingsPanel.Caption.SetFontSize(12);
+
 
   // Remove all borders and bevels
   Self.GameSettingsPanel.Panel.SetBorderStyle(bsNone);
@@ -879,6 +947,7 @@ begin
     SetItemIndex(POINTS_GAME - 3);
     SetHint('Select points awarded per game (depends on boat level and diary)');
     ComboBox.SetOnChange(@Self.PointsGameChanged);
+    setName('Courier New');
   end;
 
   nextTop += Self.GameSettingsPanel.GetHeight + TControl.AdjustToDPI(10);
@@ -890,6 +959,7 @@ begin
   Self.DebugSettingsPanel.SetTop(nextTop);
   Self.DebugSettingsPanel.SetWidth(TControl.AdjustToDPI(500));
   Self.DebugSettingsPanel.SetHeight(TControl.AdjustToDPI(95));
+  Self.DebugSettingsPanel.Caption.SetFontSize(12);
 
   // Remove all borders and bevels
   Self.DebugSettingsPanel.Panel.SetBorderStyle(bsNone);
