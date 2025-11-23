@@ -245,7 +245,6 @@ begin
   if (GetSystemTime - LastUpdate) < 1000 then
     Exit;
   LastUpdate := GetSystemTime;
-  wait(20);
 
   Text := [];
   elapsed := PestControl.TimeRunning.ElapsedTime();
@@ -290,14 +289,15 @@ end;
 
 procedure TJdsPestControl.UpdateXPState();
 var
-  xp: Int64;
+  xp: UInt64;
 begin
   xp := XPBar.Read();
+
   if xp <> Self.LastXP then
   begin
     Self.LastXP := xp;
     Self.LastXPTime := GetSystemTime();
-    Self.NextAttackDelay := Random(2299, 3600);
+    Self.NextAttackDelay := HumanGauss(2.3, 3.6, 2.9, 0.25, 0.10);
   end;
 end;
 
@@ -565,22 +565,19 @@ begin
     idx := 0
   else if Length(shifters) = 2 then
   begin
-    if Antiban.BioDice(70) then
+    // Some players always attack closest, others pick randomly
+    if BioHash < 0.6 then  // 60% prefer closest
       idx := 0
-    else if Antiban.BioDice(90) then
-      idx := 1
     else
       idx := Random(0, 1);
   end
-  else
+  else if Length(shifters) > 2 then
   begin
-    if Antiban.BioDice(70) then
-      idx := 0
-    else if Antiban.BioDice(90) then
-      idx := 1
-    else
-      idx := Random(0, High(shifters));
+    // Gaussian weighted toward front (closest)
+    idx := Round(Abs(SRL.GaussRand(0, High(shifters) * (0.3 + BioHash * 0.4))));
+    idx := EnsureRange(idx, 0, High(shifters));
   end;
+
   sh := shifters[idx];
 
   if MM2MS.GetZoomLevel() < 37 then
@@ -588,8 +585,10 @@ begin
   else
     theRadius := 10;
 
+  theRadius := Round(theRadius * (0.8 + BioHash * 0.4));
+
   repeat
-    radius := Abs(SRL.GaussRand(0, theRadius / 2));
+  radius := Abs(SRL.GaussRand(0, theRadius * (0.4 + BioHash * 0.3)));
   until radius <= theRadius;
 
   theta := Random() * 2 * PI;
