@@ -588,7 +588,7 @@ begin
   theRadius := Round(theRadius * (0.8 + BioHash * 0.4));
 
   repeat
-  radius := Abs(SRL.GaussRand(0, theRadius * (0.4 + BioHash * 0.3)));
+    radius := Abs(SRL.GaussRand(0, theRadius * (0.4 + BioHash * 0.3)));
   until radius <= theRadius;
 
   theta := Random() * 2 * PI;
