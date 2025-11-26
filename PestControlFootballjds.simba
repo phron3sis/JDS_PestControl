@@ -8,9 +8,10 @@ program WaspPestControl;
 {$I WaspLib/osr.simba}
 
 var
-  GENERATE_DATA_SETS: Boolean = False;
-  DEBUG_SHIFTERS: Boolean = False;
-  POINTS_GAME: Int32 = 4;
+  USE_QUICK_PRAYERS  : Boolean = True; //Want to use prayer?
+  POINTS_GAME        : Int32   = 4;    //Med/Hard CA's increase
+  GENERATE_DATA_SETS : Boolean = False;//Leave false
+  DEBUG_SHIFTERS     : Boolean = False;//Leave false
 
 {             END * USER * SETUP
            )  (       (                       (
@@ -371,16 +372,16 @@ procedure TJdsPestControl.DoWalkCenter();
 begin
   if Self.RSW.AtTile(Self.CenterTile, 11) then
   begin
-    Minimap.EnablePrayer();
+    if USE_QUICK_PRAYERS then Minimap.EnablePrayer();
     Exit;
   end;
-  if Antiban.BioDice(25) then
+  if Antiban.BioDice(25) and USE_QUICK_PRAYERS then
   begin
     Minimap.EnablePrayer();
     Wait(10, 230, wdLeft);
   end;
   Self.RSW.WalkBlind(Self.CenterTile.Random(-7, 7, True), 10);
-  Minimap.EnablePrayer();
+  if USE_QUICK_PRAYERS then Minimap.EnablePrayer();
 end;
 
 procedure TJdsPestControl.DebugFoundShifters(const detections: TShifterDetectionArray; const centerMS: TPoint; const radius: Int32);
@@ -850,21 +851,21 @@ begin
   WriteLn('[Config] Saved: Points=', POINTS_GAME, ', DataSets=', GENERATE_DATA_SETS, ', Debug=', DEBUG_SHIFTERS);
 end;
 
-procedure TPestConfig.PointsGameChanged(sender: TObject);
+procedure TPestConfig.PointsGameChanged();
 begin
   POINTS_GAME := Self.PointsGameCombo.GetItemIndex() + 3;
   WriteLn('[GUI] Points per game changed to: ', POINTS_GAME);
   Self.SaveSettings();
 end;
 
-procedure TPestConfig.GenerateDataChanged(sender: TObject);
+procedure TPestConfig.GenerateDataChanged();
 begin
   GENERATE_DATA_SETS := Self.GenerateDataCheckBox.IsChecked();
   WriteLn('[GUI] Generate data sets: ', GENERATE_DATA_SETS);
   Self.SaveSettings();
 end;
 
-procedure TPestConfig.DebugShiftersChanged(sender: TObject);
+procedure TPestConfig.DebugShiftersChanged();
 begin
   DEBUG_SHIFTERS := Self.DebugShiftersCheckBox.IsChecked();
   WriteLn('[GUI] Debug shifters: ', DEBUG_SHIFTERS);
