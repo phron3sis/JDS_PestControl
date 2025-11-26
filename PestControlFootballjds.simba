@@ -1,5 +1,5 @@
 {$UNDEF SCRIPT_ID}
-{$DEFINE SCRIPT_ID := 'pest_control_jds'}
+{$DEFINE SCRIPT_ID := 'LITE_pest_control_jds'}
 {$UNDEF SCRIPT_REVISION}
 {$DEFINE SCRIPT_REVISION := '1'}
 {$DEFINE SCRIPT_GUI}
