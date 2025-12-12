@@ -1093,7 +1093,7 @@ begin
     if MainScreen.DidRedClick(Round(JDSBioGauss(300, 50))) then
     begin
       vNxtAttk := bModEx(0.8, 0.4)*0.2;
-      Self.NextAttackTime := GetSystemTime + lognormal(900, vNxtAttk);;
+      Self.NextAttackTime := GetSystemTime + lognormal(800, vNxtAttk);;
       Wait(LogNormal(400, vNxtAttk+0.05));
     end;
   end
