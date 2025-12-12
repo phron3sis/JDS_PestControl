@@ -14,7 +14,7 @@ const
   USE_QUICK_PRAYERS:        Boolean = True;//Use quick prayer
   CHILL_IF_ACTIVE:          Boolean = True;//relax if activity is high
   DEFAULT_ACTIVITY_THRESHOLD: Int32 = 75;//Threshold to relax if desired
-  POINTS_PER_GAME:            Int32 = 5;//Med/Hard CA's increase
+  POINTS_PER_GAME:            Int32 = 7;//Med/Hard CA's increase
 //USERS - DO NOT MODIFY BELOW THIS LINE
   WARNING_DISABLED: boolean = FALSE;
 const
@@ -63,7 +63,8 @@ type
     BoatAnchorPoint: TPoint;
     LastTimeBoatMove: UInt64;
     BoatMoveDelayTime: Double;
-    NextAttackDelay: Double;
+    XPAttackDelay: Double;
+    NextAttackTime: Double;
     AttackTempo: TAttackTempoProfile;
     StartTime: UInt64;
     GamesWon: UInt32;
@@ -102,6 +103,13 @@ type
 var
   PestControl: TJdsPestControl;
   PestHUD: TPestHUD;
+
+//don't wanna enable prayer at 0
+function TRSMinimap.EnablePrayer(): Boolean; override;
+begin
+  if self.GetPrayerLevel <= 0 then exit;
+  inherited;
+end;
 
 function TimeUntilNextBreak(onBreakOrSleep: boolean = False): String;
 var
@@ -194,6 +202,41 @@ end;
 procedure BioGWaitMin(baseWait: Int32; Mean, Dev: Double);
 begin
   Wait(Abs(baseWait+Round(JDSBioGauss(Mean, Dev))));
+end;
+
+// LOGNORMAL (math form):
+//   If Z ~ N(muLog, sigmaLog), then X = exp(Z) is lognormal.
+//   Use when you want strictly positive, right-skewed reaction times.
+function LogNormalEx(muLog, sigmaLog: Double): Double;
+var
+  z: Double;
+begin
+  // Gaussian using SRL RNG (non-deterministic)
+  z := SRL.GaussRand(0.0, 1.0);
+
+  // Lognormal transform
+  Result := Exp(muLog + sigmaLog * z);
+
+  if Result < 0 then
+    Result := 0;
+end;
+
+// LOGNORMAL (human form):
+//   base_ms       = typical delay (median-ish RT)
+//   variation_pct = 0..1 (0.2–0.6 typical humans)
+function LogNormal(base, variation: Double): Int32;
+var
+  muLog, sigma: Double;
+begin
+  if base <= 1 then
+    base := 1;
+  if variation < 0 then
+    variation := 0;
+
+  muLog := Ln(base);
+  sigma := variation;
+
+  Result := Round(LogNormalEx(muLog, sigma));
 end;
 
 procedure TAntiban.Setup(); override;
@@ -436,7 +479,7 @@ begin
     xpStr        := SRL.FormatNumber(XPBar.TotalEarnedXP(), 2);
     xpHrStr      := SRL.FormatNumber(NumberPerHour(XPBar.TotalEarnedXP(), elapsed), 2);
     breakStr     := TimeUntilNextBreak();
-    atkDelayStr  := toStr(round(PestControl.NextAttackDelay, 2));
+    atkDelayStr  := toStr(round(PestControl.XPAttackDelay, 2));
 
     prayerStr := '';
     if PestControl.UseQuickPrayers then
@@ -619,7 +662,7 @@ begin
   Self.CurrentActivity := Result;
 end;
 
-procedure TJdsPestControl.SetActivityThreshold();
+procedure TJdsPestControl.SetActivThresh();
 var
   theMean: Double;
   v: Int32;
@@ -635,7 +678,7 @@ begin
 end;
 
 //redo this procedure, clean and actually what you want
-procedure TJdsPestControl.SetAttackDelay();
+procedure TJdsPestControl.SetXPAttkDelay();
 var
   p: TAttackTempoProfile;
   candidate, blended: Double;
@@ -657,12 +700,12 @@ begin
     candidate := p.Ceil;
 
   // 4) Stickiness: blend with previous delay (slowly drifting tempo)
-  if Self.NextAttackDelay > 0 then
-    blended := p.Stick * Self.NextAttackDelay + (1.0 - p.Stick) * candidate
+  if Self.XPAttackDelay > 0 then
+    blended := p.Stick * Self.XPAttackDelay + (1.0 - p.Stick) * candidate
   else
     blended := candidate;
 
-  Self.NextAttackDelay := blended;
+  Self.XPAttackDelay := blended;
 end;
 
 //should we set attack delay based on xp or when we attack?
@@ -676,8 +719,20 @@ begin
   begin
     Self.LastXP := xp;
     Self.LastXPTime := GetSystemTime();
-    Self.SetAttackDelay();
+    Self.SetXPAttkDelay();
   end;
+end;
+
+function TJdsPestControl.XPFresh(): Boolean;
+var
+  lowActivityMod: Double = 0;
+begin
+  if Self.ActivityThreshold < (37*bMod()) then
+  begin
+    lowActivityMod := JDSBioGauss(1300,300);
+    Debugln('[XPStl]Activity is low, attacking more often');
+  end;
+  Result := (GetSystemTime - Self.LastXPTime) < (Self.XPAttackDelay-lowActivityMod);
 end;
 
 function TJdsPestControl.XPStale(): Boolean;
@@ -689,7 +744,7 @@ begin
     lowActivityMod := JDSBioGauss(1300,300);
     Debugln('[XPStl]Activity is low, attacking more often');
   end;
-  Result := (GetSystemTime - Self.LastXPTime) > (Self.NextAttackDelay-lowActivityMod);
+  Result := (GetSystemTime - Self.LastXPTime) > (Self.XPAttackDelay-lowActivityMod);
 end;
 
 function TJdsPestControl.InBoat(): Boolean;
@@ -749,12 +804,9 @@ begin
   curTick := (GetSystemTime - Self.WalkStartTime) div round(500*bMod());
   if (curTick >= Self.PrayerRunTick) and (self.UseQuickPrayers) then
   begin
-    if Antiban.BioDice() then BioGWait(1000, 300);
     if Minimap.EnablePrayer() then
     begin
       Self.DebugLn('[OnWlk]Enabled prayer - curTick: '+ToStr(curTick));
-      BioGWait(1200,400);
-      if antiban.BioDice() then BioGWait(400,125);
       if JDSBioGauss(70, 20) > (70*bMod()) then
         Mouse.Move(Mainscreen.Bounds, true, MOUSE_DISTRIBUTION_GAUSS);
     end;
@@ -953,10 +1005,9 @@ begin
   if self.ReadActivityBar() < self.ActivityThreshold then exit;
   anyShifters := self.GetShifters();
   if length(anyShifters) > 0 then exit;
-  if srl.Dice(15*bMod) and (Self.GetState() = PCS_DEFEND) and
+  if srl.Dice(15+(bMod*10)) and (Self.GetState() = PCS_DEFEND) and
     FindColors(platTPA_MM, platformClr, Minimap.Bounds) then
     begin
-      DebugLn('pace made it this far');
       if platTPA_MM.len() < 100 then exit;
       platTPA_MM := platTPA_MM.FilterDist(0, 30+Round(biohash*15), platTPA_MM.mean.x, platTPA_MM.mean.y);
       platTPA_MM := platTPA_MM.FilterDist(0, 70, Minimap.Center.x, Minimap.Center.y);
@@ -964,16 +1015,14 @@ begin
       platTPA_MS.SortCircle(platTPA_MS.mean, random(100)+round(100*biohash), random(2) =0);
       aPoint := platTPA_MS[random(high(platTPA_MS))];
       Mouse.Move(aPoint, 5, true);
-      BioGWait(120, 30);
       DebugLn('[PaceM]pacing...');
       if mainscreen.IsUpText(['alk-her', 'Walk-here', 'alk here'], round(JDSBioGauss(120, 30))) then
         Mouse.Click(MOUSE_LEFT) else
       begin
-        BioGWait(60, 20);
         Mouse.Click(MOUSE_RIGHT);
         if ChooseOption.IsOpen(Round(JDSBioGauss(300, 100)), 10) then
         begin
-          BioGWaitMin(20, 80, 20);
+          Wait(LogNormal(200, 0.33));
           ChooseOption.Select(['alk-her', 'Walk-here', 'alk here'], MOUSE_LEFT, false, true);
         end;
       end;
@@ -987,11 +1036,13 @@ var
   idx: UInt32;
   theRadius, dx, dy: Int32;
   clickPoint: TPoint;
-  radius, theta: Double;
+  radius, theta, vNxtAttk: Double;
 begin
   Self.MaybeLeaveGame();
+  if (Self.NextAttackTime > GetSystemTime) then
+    Exit;
   Self.UpdateXPState();
-  if not Self.XPStale() then
+  if Self.XPFresh() then
     Exit;
   if self.ChillIfActive and antiban.BioDice(50) then
     if self.ReadActivityBar() > self.ActivityThreshold then
@@ -1034,21 +1085,24 @@ begin
   dy := Round(radius * Sin(theta));
   clickPoint := Point(sh.Mean.X + dx, sh.Mean.Y + dy);
   Mouse.Move(clickPoint);
-  BioGWaitMin(60, 80, 30);
-  if srl.Dice(0.3*bMod()) then
-    BioGWaitMin(50, 2000, 500);
-  if MainScreen.IsUpText('ttack', BioHash.GetDigit(5)*25) then
+  if MainScreen.IsUpText('ttack', logNormal(100, 0.4)) then
   begin
-    Antiban.BioClick(MOUSE_LEFT, 3);
-    if MainScreen.DidRedClick() then
-      BioGWaitMin(Round(200*bMod()), 1000, 300);
+    if (JDSBioGauss(100, 30) > 100) then
+      Antiban.BioClick(MOUSE_LEFT, 3) else
+        Mouse.click(MOUSE_LEFT);
+    if MainScreen.DidRedClick(Round(JDSBioGauss(300, 50))) then
+    begin
+      vNxtAttk := bModEx(0.8, 0.4)*0.2;
+      Self.NextAttackTime := GetSystemTime + lognormal(900, vNxtAttk);;
+      Wait(LogNormal(400, vNxtAttk+0.05));
+    end;
   end
   else
   begin
     if Antiban.BioDice(20) then
       Mouse.Click(MOUSE_LEFT);
     if Antiban.BioDice() then
-      BioGWait(500, 120);
+      BioGWait(300, 70);
   end;
 end;
 
@@ -1090,7 +1144,7 @@ begin
       //Change per-game randomness here
       //That way every game our behavior changes
       //but is still unique per player
-      Self.SetActivityThreshold();
+      Self.SetActivThresh();
       Self.PrayerRunTick := EnsureRange(Round(SRL.GaussRand(Self.PrayerBaseTick, 2.0)), 4, 26);
       self.DebugLn('Self.PrayerRunTick: '+toStr(Self.PrayerRunTick));
 
@@ -1137,16 +1191,15 @@ begin
     self.BoatAnchorPoint.EnsureRange(Self.OurBoatBox);
 end;
 
-procedure TJdsPestControl.SetupAttackTempoProfile();
+procedure TJdsPestControl.SetAttkProfile();
 var
   d, rs: Int32;
-  bh: Double;
   u, t, t3, s: Double;
   meanMid, meanHalf: Double;
 const
   // Mean range
-  MEAN_MIN_MS      = 3790.0;//3790.0
-  MEAN_MAX_MS      = 4763.0;//5413.0
+  MEAN_MIN_MS      = 2493.0;//3790.0
+  MEAN_MAX_MS      = 3563.0;//5413.0
 
   // Floor / Ceil offsets around Mean
   FLOOR_BASE_MS    = 470.0;   // fastest bucket below mean
@@ -1173,9 +1226,6 @@ begin
   // Stable behavior buckets from BioHash digits
   d  := Antiban.GetBehavior(EBioBehavior.REACTION_SPEED);     // 0..9
   rs := Antiban.GetBehavior(EBioBehavior.SPAM_CLICK_CHANCE);  // 0..9
-
-  // Global BioHash (0..1), unique per account
-  bh := BioHash;
 
   // Chaotic BioHash → [0,1) seed using digits + behaviour buckets
   // Uses BioHash.GetDigit() like Antiban.GetBehavior/GetChance.
@@ -1226,7 +1276,7 @@ begin
     STICK_BASE + (9 - rs) * STICK_PER_RS;
 
   // Start near the personal mean
-  Self.NextAttackDelay := (Self.AttackTempo.Mean+random(-324, 324));
+  Self.XPAttackDelay := (Self.AttackTempo.Mean+JDSBioGauss(300, 100));
 end;
 
 procedure TJdsPestControl.LoadDefaults();
@@ -1235,8 +1285,8 @@ begin
   Self.LeaveGameEarly     := LEAVE_GAME_EARLY;
   Self.UseQuickPrayers    := USE_QUICK_PRAYERS;
   Self.ChillIfActive      := CHILL_IF_ACTIVE;
-  Self.InitActivityThreshold  := DEFAULT_ACTIVITY_THRESHOLD;
-  Self.PointsGame         := POINTS_PER_GAME;
+  Self.InitActivityThreshold  := EnsureRange(DEFAULT_ACTIVITY_THRESHOLD, 45, 100);
+  Self.PointsGame         := EnsureRange(POINTS_PER_GAME, 3, 8);
 end;
 
 procedure TJdsPestControl.Init(maxActions: UInt32; maxTime: UInt64); override;
@@ -1265,7 +1315,7 @@ begin
   Login.Players[Login.PlayerIndex].Worlds := [344];
   RSClient.Image().DrawClear(clRed);
   RSClient.Image().Clear();
-  Self.SetActivityThreshold();
+  Self.SetActivThresh();
   // 80% mid-run, 7.5% early, 7.5% late
   if SRL.Dice(85*bMod()) then
     Self.PrayerMode := pmMid
@@ -1273,8 +1323,8 @@ begin
     Self.PrayerMode := pmEarly
   else
     Self.PrayerMode := pmLate;
-  self.SetupAttackTempoProfile();
-  Self.DebugLn('AttackDelay: ' + ToStr(Self.NextAttackDelay));
+  self.SetAttkProfile();
+  Self.DebugLn('AttackDelay: ' + ToStr(Self.XPAttackDelay));
   Self.DebugLn('Prayer mode is: '+toStr(self.PrayerMode));
   Self.PrayerBaseTick := Antiban.GetUniqueInt(16, 6, 24);
   Self.DebugLn('Self.PrayerBaseTick = '+toStr(Self.PrayerBaseTick));
@@ -1344,7 +1394,7 @@ begin
       end else
         if (self.State = PCS_DEFEND) or (self.State = PCS_WALK_CENTER) then
           Self.DoAntiban(False, False) else Self.DoAntiban(True, True);
-    bioGwait(200, 50);
+    wait(LogNormal(120, 0.4*bModEx(0.7, 0.55)));
     if (self.PointsTotal >= 3900) then
       TerminateScript('Too many points my friend...');
   until Self.ShouldStop();
@@ -1389,7 +1439,7 @@ type
 var
   PestConfig: TPestConfig;
 
-procedure TPestConfig.OnActivitySliderChanged(sender: TObject);
+procedure TPestConfig.OnSliderChanged(sender: TObject);
 begin
   // Copy slider value into your existing LabeledEdit
   boxActivityThreshold.SetText(IntToStr(Self.slActivity.GetPosition()));
@@ -1445,6 +1495,7 @@ begin
   if (e <> nil) then
   begin
     PestControl.InitActivityThreshold := 45 + Round((StrToInt(e.getText) - 10) * 0.611111);
+    EnsureRange(PestControl.InitActivityThreshold, 37, 100);
     Self.Config.Put('activity_threshold', IntToStr(PestControl.InitActivityThreshold));
   end;
 
@@ -1452,9 +1503,7 @@ begin
   c := Self.Form.GetChild('box_pointspergame_combobox');
   if (c <> nil) then
   begin
-    pts := StrToInt(c.getText);
-    if not InRange(pts, 3, 8) then
-      pts := POINTS_PER_GAME;
+    pts := EnsureRange(StrToInt(c.getText), 3, 8);
 
     PestControl.PointsGame := pts;
     Self.Config.Put('points_per_game', IntToStr(PestControl.PointsGame));
@@ -1575,7 +1624,7 @@ begin
     Self.slActivity.SetPosition(DEFAULT_ACTIVITY_THRESHOLD);
 
   // Bind event
-  Self.slActivity.SetOnChange(@Self.OnActivitySliderChanged);
+  Self.slActivity.SetOnChange(@Self.OnSliderChanged);
 
   boxPointsPerGame.Create(tab);
   boxPointsPerGame.SetName('box_pointspergame');
