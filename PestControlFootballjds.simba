@@ -827,13 +827,13 @@ begin
   anchorMS := minimap.PointToMS(rsw.WorldToMM(self.BoatAnchorPoint));
   if not MainScreen.Bounds.Contains(anchorMS) then
     EXIT;
-  clickSpot := SRL.RandomPoint(anchorMS, 150);
+  clickSpot := SRL.RandomPoint(anchorMS, Round(133*BMod()));
   clickSpot := clickSpot.EnsureRange(MainScreen.Bounds);
   Mouse.Move(clickSpot);
   if MainScreen.IsUpText(['Walk here', 'Walk-here'], Random(80, 350)) then
     Mouse.Click(MOUSE_LEFT);
   Self.LastTimeBoatMove := GetSystemTime();
-  Self.BoatMoveDelayTime := JDSBioGauss(25*ONE_SECOND, 11*ONE_SECOND);
+  Self.BoatMoveDelayTime := JDSBioGauss(25*ONE_SECOND, 8*ONE_SECOND);
   self.DebugLn('[MBoat]'+tostr(self.BoatMoveDelayTime));
 end;
 
@@ -1005,12 +1005,11 @@ begin
   if self.ReadActivityBar() < self.ActivityThreshold then exit;
   anyShifters := self.GetShifters();
   if length(anyShifters) > 0 then exit;
-  if srl.Dice(15+(bMod*10)) and (Self.GetState() = PCS_DEFEND) and
+  if srl.Dice(5+(bMod*10)) and (Self.GetState() = PCS_DEFEND) and
     FindColors(platTPA_MM, platformClr, Minimap.Bounds) then
     begin
       if platTPA_MM.len() < 100 then exit;
-      platTPA_MM := platTPA_MM.FilterDist(0, 30+Round(biohash*15), platTPA_MM.mean.x, platTPA_MM.mean.y);
-      platTPA_MM := platTPA_MM.FilterDist(0, 70, Minimap.Center.x, Minimap.Center.y);
+      platTPA_MM := platTPA_MM.FilterDist(0, 25+Round(biohash*10), platTPA_MM.mean.x, platTPA_MM.mean.y);
       platTPA_MS := minimap.PointsToMS(platTPA_MM);
       platTPA_MS.SortCircle(platTPA_MS.mean, random(100)+round(100*biohash), random(2) =0);
       aPoint := platTPA_MS[random(high(platTPA_MS))];
@@ -1022,10 +1021,11 @@ begin
         Mouse.Click(MOUSE_RIGHT);
         if ChooseOption.IsOpen(Round(JDSBioGauss(300, 100)), 10) then
         begin
-          Wait(LogNormal(200, 0.33));
+          Wait(LogNormal(130, 0.33));
           ChooseOption.Select(['alk-her', 'Walk-here', 'alk here'], MOUSE_LEFT, false, true);
         end;
       end;
+      wait(LogNormal(700, 0.431*bMod()));
     end;
 end;
 
@@ -1044,11 +1044,11 @@ begin
   Self.UpdateXPState();
   if Self.XPFresh() then
     Exit;
-  if self.ChillIfActive and antiban.BioDice(50) then
-    if self.ReadActivityBar() > self.ActivityThreshold then
+  if self.ChillIfActive and antiban.BioDice(50) and
+    (self.ReadActivityBar() > self.ActivityThreshold) then
     begin
       PaceMidGame();
-      BioGWait(2000, 650);
+      BioGWait(1200, 300);
       EXIT;
     end;
   shifters := Self.GetShifters();
@@ -1093,7 +1093,7 @@ begin
     if MainScreen.DidRedClick(Round(JDSBioGauss(300, 50))) then
     begin
       vNxtAttk := bModEx(0.8, 0.4)*0.2;
-      Self.NextAttackTime := GetSystemTime + lognormal(800, vNxtAttk);;
+      Self.NextAttackTime := GetSystemTime + lognormal(1100, vNxtAttk);;
       Wait(LogNormal(400, vNxtAttk+0.05));
     end;
   end
@@ -1303,7 +1303,7 @@ begin
   Self.CenterTile := DEFEND_KNIGHT_BOX.Middle;
   Self.GamesWon := 0;
   Self.LastWinTime := 0;
-  Self.WinCooldown := 60 * 1000;
+  Self.WinCooldown := 1 * ONE_MINUTE;
   Self.PointsTotal := 0;
   Self.PointsTime := 0;
 end;
@@ -1385,7 +1385,10 @@ begin
       PCS_DEFEND: Self.DoDefend();
       PCS_AT_PLANK: Self.DoAtPlank();
       else
-        BioGWait(1200, 300);
+      begin
+        DebugLn('UNKNOWN STATE - ');
+        wait(logNormal(300, 0.34));
+      end;
     end;
     if (self.State = PCS_DEFEND) or (self.State = PCS_WALK_CENTER) and
       (self.ReadActivityBar() < self.ActivityThreshold) then
@@ -1394,7 +1397,7 @@ begin
       end else
         if (self.State = PCS_DEFEND) or (self.State = PCS_WALK_CENTER) then
           Self.DoAntiban(False, False) else Self.DoAntiban(True, True);
-    wait(LogNormal(120, 0.4*bModEx(0.7, 0.55)));
+    wait(10+LogNormal(140, 0.4*bModEx(0.7, 0.55)));
     if (self.PointsTotal >= 3900) then
       TerminateScript('Too many points my friend...');
   until Self.ShouldStop();
