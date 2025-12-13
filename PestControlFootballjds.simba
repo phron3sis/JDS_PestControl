@@ -34,6 +34,8 @@ const
   DEFEND_KNIGHT_BOX: TBox = [5741, 5605, 5775, 5639];
   GAME_START_LANDING_BOX: TBox = [5752, 5532, 5773, 5562];
   KNIGHT_HP_BOX: TBox = [10, 172, 75, 192];
+  // OCR
+  PEST_POINTS_BOX: Tbox = [72, 64, 123, 81];
 type
   EPestState = (PCS_IN_BOAT, PCS_WALK_CENTER, PCS_DEFEND, PCS_AT_PLANK, PCS_UNKNOWN, PCS_END_SCRIPT);
 
@@ -42,8 +44,7 @@ type
 
 type
   TAttackTempoProfile = record
-    Floor, Mean, Ceil, Jitter: Double;
-    TailChance, TailScale, Stick: Double;
+    Mean, Stick: Double;
   end;
 type
   TJdsPestControl = record(TBaseWalkerScript)
@@ -66,20 +67,22 @@ type
     XPAttackDelay: Double;
     NextAttackTime: Double;
     AttackTempo: TAttackTempoProfile;
+    bRT: Double;//Base Response Time
     StartTime: UInt64;
     GamesWon: UInt32;
     LastWinTime: UInt64;
     WinCooldown: UInt64;
     CoinCountS: UInt64;
     CoinCountC: UInt64;
-    PointsTotal: UInt32;
+    PointsStart: Int32;
+    PointsEarned: Int32;
+    PointsTotal: Int32;
     PointsTime: UInt64;
-    OurCmbtLvl: UInt32;
+    OurCmbtLvl: Int32;
     OurCmbtStyle: String;
     PrayerMode: TPrayerMode;
-    PrayerBaseTick: Int32;
-    PrayerRunTick: Int32;
     WalkStartTime: Int64;
+    PrayerRunTime: Double;
     UseScreenWalk: Boolean;
     LeaveGameEarly: Boolean;
     InitActivityThreshold: UInt32;
@@ -100,6 +103,7 @@ type
     ABox: TBox;
   end;
   TShifterDetectionArray = array of TShifterDetection;
+
 var
   PestControl: TJdsPestControl;
   PestHUD: TPestHUD;
@@ -107,7 +111,7 @@ var
 //don't wanna enable prayer at 0
 function TRSMinimap.EnablePrayer(): Boolean; override;
 begin
-  if self.GetPrayerLevel <= 0 then exit;
+  if self.GetPrayerLevel <= 0 then Exit;
   inherited;
 end;
 
@@ -136,6 +140,16 @@ const
   s:double = 0.2;//spread/range
 begin
   Result := b + s * Frac(Sin(BioHash * 12.9898) * 43758.5453);
+end;
+
+//bModEx with salt
+function bModExS(salt, base, spread: Double): Double;
+var
+  x: Double;
+begin
+  if spread < 0 then spread := 0;
+  x := Frac(Sin((BioHash + salt) * 12.9898) * 43758.5453);
+  Result := base + spread * x;
 end;
 
 //use to modify a number
@@ -239,12 +253,90 @@ begin
   Result := Round(LogNormalEx(muLog, sigma));
 end;
 
+// EX-GAUSSIAN (math form):
+//   X = Gaussian(mu, sigma) + Exponential(tau)
+//   This is the classic RT model: Gaussian core + exponential tail.
+function ExpoGaussEx(mu, sigma, tau: Double): Double;
+var
+  z, expPart: Double;
+begin
+  // Gaussian core
+  z := SRL.GaussRand(mu, sigma);
+
+  // Exponential tail (rate = 1/tau)
+  expPart := -tau * Ln(1.0 - nzRandom());
+
+  Result := z + expPart;
+
+  if Result < 0 then
+    Result := 0;
+end;
+
+// EX-GAUSSIAN (human form):
+//   base_ms       = typical delay (Gaussian center)
+//   variation_pct = Gaussian spread (0..1)
+//   tail_pct      = exponential tail strength (0..1)
+function ExpoGauss(base, variation, tail: Double): Int32;
+var
+  mu, sigma, tau: Double;
+begin
+  if base <= 1 then
+    base := 1;
+  if variation < 0 then
+    variation := 0;
+  if tail < 0 then
+    tail := 0;
+
+  mu    := base;
+  sigma := base * variation * 0.25;
+  tau   := base * tail;
+
+  Result := Round(ExpoGaussEx(mu, sigma, tau));
+end;
+
+// WEIBULL (math form):
+//   CDF: 1 - exp(-(x/scale)^shape)
+//   shape_k > 0, scale_lambda > 0
+//   Useful for fatigue / hazard-rate modeling.
+function WeibullEx(shape_k, scale_lambda: Double): Double;
+var
+  u: Double;
+begin
+  if shape_k <= 0 then
+    shape_k := 0.000001;
+  if scale_lambda <= 0 then
+    scale_lambda := 0.000001;
+
+  u := nzRandom(); // uniform [0,1)
+
+  // Inverse CDF
+  result := scale_lambda * Power(-Ln(1.0 - u), 1.0 / shape_k);
+
+  if Result < 0 then
+    Result := 0;
+end;
+
 procedure TAntiban.Setup(); override;
 begin
   Self.Skills := [ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.HITPOINTS, ERSSkill.TOTAL];
   Self.MinZoom := 25;
   Self.MaxZoom := 50;
   inherited;
+end;
+
+function TJdsPestControl.ReadActivityBar(): Int32;
+var
+  greenCount: Int32;
+begin
+  Result := - 1;
+  greenCount := CountColor(CLR_ACTIVITY_GREEN, 368, 126, 509, 126);
+  greenCount += Antiban.GetUniqueInt(random(2, 4), 0, 5);
+  if greenCount > 0 then
+  begin
+    Result := Round((greenCount / 141) * 100);
+    Result := Max(0, Min(100, Result));
+  end;
+  Self.CurrentActivity := Result;
 end;
 
 procedure TPestHUD.DrawActivityBar(const hudBox, headerBox: TBox;
@@ -390,7 +482,7 @@ begin
     xValue := xLabel + maxLabelWidth + 10;
 
     // ===== Activity block =====
-    actPercent := PestControl.CurrentActivity;
+    actPercent := PestControl.ReadActivityBar();
     if actPercent < 0 then
       actPercent := 0;
     if actPercent > 100 then
@@ -485,7 +577,7 @@ begin
     if PestControl.UseQuickPrayers then
     begin
       prayerStr := ToStr(PestControl.PrayerMode).Trim('pm');
-      prayerStr += '(' + IntToStr(PestControl.PrayerRunTick) + ')';
+      prayerStr += '(' + toStr(Round(PestControl.PrayerRunTime/ONE_SECOND, 2)) + ')';
     end;
 
     // ===== Body rows =====
@@ -604,6 +696,24 @@ begin
       TEXT_COLOR
     );
 
+    // "Pts Gain" label
+    SetFontSize(13);
+    size := TextSize('Pts Gain');
+    DrawText(
+      'Pts Gain',
+      Point(abox.X2 - 60 + (70 - size.X) div 2, headerBox.Y2 + 187),
+      HEADER_TEXT_COLOR
+    );
+
+    // Total points on account
+    SetFontSize(11);
+    size := TextSize(toStr(PestControl.PointsEarned));
+    DrawText(
+      toStr(PestControl.PointsEarned),
+      Point(abox.X2 - 60 + (70 - size.X) div 2, headerBox.Y2 + 201),
+      TEXT_COLOR
+    );
+
     // Footer
     DrawBoxFilled(footerBox, False, HEADER_BG_COLOR);
     sigLine := Box(footerBox.X1 + 4, footerBox.Y1 + 4, footerBox.X2 - 4, footerBox.Y1 + 4);
@@ -646,22 +756,6 @@ begin
   end;
 end;
 
-
-function TJdsPestControl.ReadActivityBar(): Int32;
-var
-  greenCount: Int32;
-begin
-  Result := - 1;
-  greenCount := CountColor(CLR_ACTIVITY_GREEN, 368, 126, 509, 126);
-  greenCount += Antiban.GetUniqueInt(random(2, 4), 0, 9);
-  if greenCount > 0 then
-  begin
-    Result := Round((greenCount / 141) * 100);
-    Result := Max(0, Min(100, Result));
-  end;
-  Self.CurrentActivity := Result;
-end;
-
 procedure TJdsPestControl.SetActivThresh();
 var
   theMean: Double;
@@ -677,7 +771,6 @@ begin
   Self.DebugLn('[SetAT]Activity threshold: ' + toStr(self.ActivityThreshold));
 end;
 
-//redo this procedure, clean and actually what you want
 procedure TJdsPestControl.SetXPAttkDelay();
 var
   p: TAttackTempoProfile;
@@ -685,28 +778,19 @@ var
 begin
   p := Self.AttackTempo;
 
-  // 1) Gaussian core around personal mean
-  candidate := SRL.GaussRand(p.Mean, p.Jitter);
+  // Use ExpoGauss instead of GaussRand + manual tail
+  // variation=0.15 gives ~15% spread, tail=0.3 gives occasional 2x lapses
+  candidate := ExpoGauss(p.Mean, 0.15, 0.3);
 
-  // 2) replace with jds or srl dice
-  if Antiban.BioDice(p.TailChance) then
-    candidate := candidate + p.Mean * p.TailScale;
-
-  // 3) Respect this account's envelope,
-  if candidate < p.Floor then
-    candidate := p.Floor
-  else
-  if candidate > p.Ceil then
-    candidate := p.Ceil;
-
-  // 4) Stickiness: blend with previous delay (slowly drifting tempo)
-  if Self.XPAttackDelay > 0 then
-    blended := p.Stick * Self.XPAttackDelay + (1.0 - p.Stick) * candidate
+  // Lower stickiness (0.2-0.4 range is more human)
+  if XPAttackDelay > 0 then
+    blended := p.Stick * XPAttackDelay + (1.0 - p.Stick) * candidate
   else
     blended := candidate;
 
-  Self.XPAttackDelay := blended;
+  XPAttackDelay := blended;
 end;
+
 
 //should we set attack delay based on xp or when we attack?
 //you don't get activity unless you get xp, so
@@ -754,6 +838,7 @@ begin
   rswPos := self.rsw.GetMyPos();
   result := rswPos.InBox(VETERAN_BOAT_BOX) or rswPos.InBox(INTER_BOAT_BOX) or
     rswPos.InBox(NOVICE_BOAT_BOX);
+  result := result and (CountColor(16777113, PEST_POINTS_BOX) > 1);
 end;
 
 function TJdsPestControl.GetState(): EPestState;
@@ -776,37 +861,64 @@ begin
   Result := PCS_UNKNOWN;
 end;
 
+function TJdsPestControl.PrayerSampleMS(): Int32;
+var
+  k, p, lam: Double;
+begin
+  // shape: controls peak + hazard (k>1 => more likely as time passes)
+  // range ~1.6..2.6 gives modes roughly ~3..6 seconds when p90/p92 is pinned to 10s
+  k := 1.6 + bModExS(3.33, 0.0, 1.0); // 1.6..2.6
+
+  // per-account late-rate target: p in [0.90..0.94] => P(>10s) in [10%..6%]
+  p := 0.90 + 0.04 * bModExS(4.44, 0.0, 1.0);
+
+  // choose scale so that Quantile(p) = 10000ms:
+  // t_p = lam * (-ln(1-p))^(1/k)  => lam = t_p / (-ln(1-p))^(1/k)
+  lam := 10000.0 / Power(-Ln(1.0 - p), 1.0 / k);
+
+  Result := Round(WeibullEx(k, lam));
+end;
+
+
 procedure TJdsPestControl.UpdatePoints();
 var
   BluePoints: Int32;
-
 const
-  CHECK_INTERVAL: Int32 = 1*ONE_MINUTE;
-  PEST_POINTS_BOX: Tbox = [72, 64, 123, 81];
+  CHECK_INTERVAL: Int32 = 30*ONE_SECOND;
 begin
   if GetSystemTime < (CHECK_INTERVAL + Self.PointsTime) then
     EXIT;
+  if CountColor(16777113, PEST_POINTS_BOX) < 1 then exit;
   BluePoints := ocr.RecognizeNumber(PEST_POINTS_BOX, TOCRColorFilter.Create([16777113]), RS_FONT_PLAIN_12);
-  if BluePoints <= Self.PointsTotal then
-    Exit;
+
+  //update starting points if we haven't yet
+  if (self.PointsStart < 0) then
+  begin
+    Self.PointsStart := BluePoints;
+    Self.DebugLn('[UpPts]Points \ Game:' + ToStr(Self.PointsGame));
+    Self.DebugLn('[UpPts]Points  Start: ' + ToStr(Self.PointsStart));
+  end;
   Self.PointsTotal := BluePoints;
   Self.PointsTime := GetSystemTime;
-  Self.DebugLn('[UpPts]Total Points: ' + toStr(Self.PointsTotal));
+  Self.PointsEarned := Self.PointsTotal-Self.PointsStart;
+  Self.GamesWon := Round(Self.PointsEarned/Self.PointsGame);
+  Self.DebugLn('[UpPts]Points  Total: ' + toStr(Self.PointsTotal));
+  Self.DebugLn('[UpPts]Points Earned: ' + ToStr(Self.PointsEarned));
 end;
 
 procedure TJdsPestControl.OnWalkingEvent(Sender: PRSWalker; Position: TPoint; Destination: TPoint);
 var
-  curTick: Int32;
+  curT: Double;
 begin
   if (Self.State <> PCS_WALK_CENTER) or (Minimap.IsPrayerEnabled()) or
-    (Self.PrayerMode <> pmMid) or (Self.PrayerRunTick < 0) then
+    (Self.PrayerMode <> pmMid) or (Minimap.GetPrayerLevel < 1) then
       Exit;
-  curTick := (GetSystemTime - Self.WalkStartTime) div round(500*bMod());
-  if (curTick >= Self.PrayerRunTick) and (self.UseQuickPrayers) then
+  curT := (GetSystemTime - Self.WalkStartTime);
+  if (curT >= Self.PrayerRunTime) and (self.UseQuickPrayers) then
   begin
     if Minimap.EnablePrayer() then
     begin
-      Self.DebugLn('[OnWlk]Enabled prayer - curTick: '+ToStr(curTick));
+      Self.DebugLn('[OnWlk]Enabled prayer: '+toStr(curT));
       if JDSBioGauss(70, 20) > (70*bMod()) then
         Mouse.Move(Mainscreen.Bounds, true, MOUSE_DISTRIBUTION_GAUSS);
     end;
@@ -847,6 +959,7 @@ end;
 
 procedure TJdsPestControl.DoWalkCenter();
 begin
+  Wait(ExpoGauss(Self.bRT * 0.8, 0.15, 0.25));
   Self.WalkStartTime := GetSystemTime();
   if (Self.PrayerMode = pmEarly) and self.UseQuickPrayers then
     Minimap.EnablePrayer();
@@ -974,8 +1087,7 @@ var
 begin
   if self.LeaveGameEarly and (self.GetState = PCS_DEFEND) and (self.ReadActivityBar() < 1) then
   begin
-    if Antiban.BioDice() then
-      BioGWait(3000, 800);
+    Wait(ExpoGauss(1500, 0.2, 0.4));
     tmpPos := Self.RSW.GetMyPos();
     if tmpPos.InBox(RSRegions.PEST_CONTROL_ISLAND) then
       for 0 to 2 do
@@ -1051,6 +1163,7 @@ begin
       BioGWait(1200, 300);
       EXIT;
     end;
+  Wait(ExpoGauss(Self.bRT, 0.15, 0.25));
   shifters := Self.GetShifters();
   if Length(shifters) < 1 then
   begin
@@ -1092,9 +1205,11 @@ begin
         Mouse.click(MOUSE_LEFT);
     if MainScreen.DidRedClick(Round(JDSBioGauss(300, 50))) then
     begin
-      vNxtAttk := bModEx(0.8, 0.4)*0.2;
-      Self.NextAttackTime := GetSystemTime + lognormal(1100, vNxtAttk);;
-      Wait(LogNormal(400, vNxtAttk+0.05));
+      Self.NextAttackTime := GetSystemTime + ExpoGauss(800, 0.18, 0.25);
+      Wait(ExpoGauss(350, 0.15, 0.2));
+    end else
+    begin
+      Self.NextAttackTime := GetSystemTime + ExpoGauss(450, 0.2, 0.3);
     end;
   end
   else
@@ -1103,21 +1218,6 @@ begin
       Mouse.Click(MOUSE_LEFT);
     if Antiban.BioDice() then
       BioGWait(300, 70);
-  end;
-end;
-
-procedure TJdsPestControl.CheckNPCWin();
-var
-  txt: String;
-begin
-  if (GetSystemTime - Self.LastWinTime) < Self.WinCooldown then
-    Exit;
-  txt := LowerCase(Chat.GetChat());
-  if txt.Contains('managed to destroy') then
-  begin
-    Self.GamesWon += 1;
-    Self.LastWinTime := GetSystemTime();
-    Self.DebugLn('[IsWin]Win detected. Total wins: ' + IntToStr(Self.GamesWon));
   end;
 end;
 
@@ -1144,9 +1244,10 @@ begin
       //Change per-game randomness here
       //That way every game our behavior changes
       //but is still unique per player
+      Self.UpdatePoints();
       Self.SetActivThresh();
-      Self.PrayerRunTick := EnsureRange(Round(SRL.GaussRand(Self.PrayerBaseTick, 2.0)), 4, 26);
-      self.DebugLn('Self.PrayerRunTick: '+toStr(Self.PrayerRunTick));
+      Self.PrayerRunTime := PrayerSampleMS();
+      self.DebugLn('Self.PrayerRunTime: '+toStr(Self.PrayerRunTime));
 
       Self.UpdateCoinCount();
 
@@ -1160,20 +1261,18 @@ end;
 
 procedure TJdsPestControl.DoAtPlank();
 begin
-  Self.CheckNPCWin();
-  BioGWait(500, 150);
+  Wait(ExpoGauss(Self.bRT * 1.2, 0.18, 0.3));
   if antiban.BioDice then
     BioGWait(1500, 300);
   if antiban.BioDice(25) then
   begin
     chat.ClickContinue(antiban.BioDice(98));
-    BioGWait(2000, 500);
+    BioGWait(1000, 300);
   end;
   if not Self.CrossPlank() then
   begin
     Self.RSW.WalkBlind(Self.PlankTile.Random(- 7, 7, True), 4);
     biogwait(800, 250);
-    Self.CheckNPCWin();
     Self.CrossPlank();
   end;
 end;
@@ -1197,86 +1296,26 @@ var
   u, t, t3, s: Double;
   meanMid, meanHalf: Double;
 const
-  // Mean range
-  MEAN_MIN_MS      = 2493.0;//3790.0
-  MEAN_MAX_MS      = 3563.0;//5413.0
-
-  // Floor / Ceil offsets around Mean
-  FLOOR_BASE_MS    = 470.0;   // fastest bucket below mean
-  FLOOR_PER_D_MS   = 12.0;    // slower buckets have slightly deeper floor
-
-  CEIL_BASE_MS     = 650.0;   // slack above mean
-  CEIL_PER_D_MS    = 150.0;   // slower buckets get more slack
-
-  // Gaussian jitter (σ), driven by spam-click bucket
-  JITTER_BASE_MS   = 180.0;
-  JITTER_PER_RS_MS = 25.0;
-
-  // Tail behaviour (lapses)
-  TAIL_BASE_CH     = 2.0;     // TailChance = 2,4,...,20
-  TAIL_PER_D_CH    = 2.0;
-
-  TAILSCALE_BASE   = 0.50;    // TailScale = 0.50..1.58
-  TAILSCALE_PER_D  = 0.12;
-
-  // Stickiness (serial smoothing)
-  STICK_BASE       = 0.45;    // more “lag” between delays
-  STICK_PER_RS     = 0.03;
+  MEAN_MIN_MS = 2573.0;
+  MEAN_MAX_MS = 3563.0;
+  STICK_BASE  = 0.20;
+  STICK_PER_RS = 0.02;
 begin
-  // Stable behavior buckets from BioHash digits
-  d  := Antiban.GetBehavior(EBioBehavior.REACTION_SPEED);     // 0..9
-  rs := Antiban.GetBehavior(EBioBehavior.SPAM_CLICK_CHANCE);  // 0..9
+  d  := Antiban.GetBehavior(EBioBehavior.REACTION_SPEED);
+  rs := Antiban.GetBehavior(EBioBehavior.SPAM_CLICK_CHANCE);
 
-  // Chaotic BioHash → [0,1) seed using digits + behaviour buckets
-  // Uses BioHash.GetDigit() like Antiban.GetBehavior/GetChance.
-  // This is discrete and jumps around as digits change, so nearby BioHashes decorrelate harder.
-  u := (
-    BioHash.GetDigit(1)          +   // 0..9
-    BioHash.GetDigit(3) * 10     +   // 0..90
-    BioHash.GetDigit(5) * 100    +   // 0..900
-    d                 * 1000     +   // 0..9000
-    rs                * 10000        // 0..90000
-  ) / 100000.0;                      // u ∈ [0, ~0.9999]
-
-  // Map [0,1) -> [-0.5,0.5)
+  u := Frac(bModExS(1.11, 0.0, 1.0) + (d * 0.07) + (rs * 0.03));
   t := u - 0.5;
-
-
-  // Smooth S-shaped mapping to (-1,1):
-  // s = (4*t^3 + 2*t) / 1.5
   t3 := t * t * t;
-  s  := (4.0 * t3 + 2.0 * t) / 1.5;
+  s := (4.0 * t3 + 2.0 * t) / 1.5;
 
-  // Mean in [MEAN_MIN_MS, MEAN_MAX_MS]
-  meanMid  := (MEAN_MIN_MS + MEAN_MAX_MS) * 0.5;
+  meanMid := (MEAN_MIN_MS + MEAN_MAX_MS) * 0.5;
   meanHalf := (MEAN_MAX_MS - MEAN_MIN_MS) * 0.5;
   Self.AttackTempo.Mean := meanMid + meanHalf * s;
 
-  // ----- Personal envelope (no clamping needed) -----
-  // Floor always < Mean, Ceil always > Mean for bh∈[0,1], d∈[0..9]
-  Self.AttackTempo.Floor :=
-    Self.AttackTempo.Mean - (FLOOR_BASE_MS + d * FLOOR_PER_D_MS);
+  Self.AttackTempo.Stick := STICK_BASE + (9 - rs) * STICK_PER_RS;
 
-  Self.AttackTempo.Ceil :=
-    Self.AttackTempo.Mean + (CEIL_BASE_MS + d * CEIL_PER_D_MS);
-
-  // ----- Gaussian jitter (σ) -----
-  Self.AttackTempo.Jitter :=
-    JITTER_BASE_MS + rs * JITTER_PER_RS_MS;
-
-  // ----- Tail frequency / magnitude (BioDice uses BioHash internally) -----
-  Self.AttackTempo.TailChance :=
-    TAIL_BASE_CH + d * TAIL_PER_D_CH;
-
-  Self.AttackTempo.TailScale :=
-    TAILSCALE_BASE + d * TAILSCALE_PER_D;
-
-  // ----- Stickiness (higher when spam-click bucket is low) -----
-  Self.AttackTempo.Stick :=
-    STICK_BASE + (9 - rs) * STICK_PER_RS;
-
-  // Start near the personal mean
-  Self.XPAttackDelay := (Self.AttackTempo.Mean+JDSBioGauss(300, 100));
+  Self.XPAttackDelay := Self.AttackTempo.Mean + SRL.GaussRand(0, 100);
 end;
 
 procedure TJdsPestControl.LoadDefaults();
@@ -1293,9 +1332,8 @@ procedure TJdsPestControl.Init(maxActions: UInt32; maxTime: UInt64); override;
 begin
   Self.StartTime := GetSystemTime();
   Self.Name := 'PCjds';
-  Self.DebugLn('[INIT]: Initializing JDS Pest Control');
+  Self.DebugLn('[INIT]Initializing JDS Pest Control');
   inherited;
-  Self.DebugLn('[INIT]: Points/game = ' + ToStr(Self.PointsGame));
   Self.RSW.SetupRegions([RSRegions.PEST_CONTROL_ISLAND, RSRegions.PEST_CONTROL_OUTPOST], 8);
   Self.RSW.ScreenWalk := Self.UseScreenWalk;
   if not Self.UseScreenWalk then
@@ -1306,6 +1344,7 @@ begin
   Self.WinCooldown := 1 * ONE_MINUTE;
   Self.PointsTotal := 0;
   Self.PointsTime := 0;
+  Self.PointsStart := -1;
 end;
 
 procedure TJdsPestControl.Run(maxActions: UInt32; maxTime: UInt64);
@@ -1323,12 +1362,13 @@ begin
     Self.PrayerMode := pmEarly
   else
     Self.PrayerMode := pmLate;
+  self.bRT := bModExS(2.71, 180, 120); // 180-300ms, uniform
   self.SetAttkProfile();
-  Self.DebugLn('AttackDelay: ' + ToStr(Self.XPAttackDelay));
-  Self.DebugLn('Prayer mode is: '+toStr(self.PrayerMode));
-  Self.PrayerBaseTick := Antiban.GetUniqueInt(16, 6, 24);
-  Self.DebugLn('Self.PrayerBaseTick = '+toStr(Self.PrayerBaseTick));
-  Self.PrayerRunTick := Self.PrayerBaseTick;
+  Self.DebugLn('[INIT]AttackDelay: ' + ToStr(Self.XPAttackDelay));
+  Self.DebugLn('[INIT]Prayer mode is: '+toStr(self.PrayerMode));
+  Self.PrayerRunTime := PrayerSampleMS();
+  Self.DebugLn('[INIT]PrayerRunTime: '+toStr(Self.PrayerRunTime));
+
   Self.RSW.OnWalkingEvent := @ Self.OnWalkingEvent;
   Self.BoatMoveDelayTime := JDSBioGauss(25*ONE_SECOND, 11*ONE_SECOND);
   Self.LastTimeBoatMove := 0;
@@ -1336,8 +1376,8 @@ begin
   Self.LastXPTime := GetSystemTime();
   Self.OurCmbtStyle := Combat.GetCombatStyle;
   Self.OurCmbtLvl := combat.GetCombatLevel;
-  Self.DebugLn('Combat Level: ' + ToStr(Self.OurCmbtLvl));
-  Self.DebugLn('Combat Style: ' + Combat.GetCombatStyle);
+  Self.DebugLn('[INIT]Combat Level: ' + ToStr(Self.OurCmbtLvl));
+  Self.DebugLn('[INIT]Combat Style: ' + Combat.GetCombatStyle);
   if Self.OurCmbtLvl >= 100 then
   begin
     Self.PlankTile := VETERAN_PLANK_TILE;
@@ -1357,7 +1397,7 @@ begin
     Self.CrossPlankTile := Point(6210, 4755);
   end
   else
-    TerminateScript('Combat Level: ' + ToStr(self.OurCmbtLvl));
+    TerminateScript('[INIT]Combat Level: ' + ToStr(self.OurCmbtLvl));
   self.InitBoatAnchor();
   with Self.GangplankObj do
   begin
@@ -1397,9 +1437,9 @@ begin
       end else
         if (self.State = PCS_DEFEND) or (self.State = PCS_WALK_CENTER) then
           Self.DoAntiban(False, False) else Self.DoAntiban(True, True);
-    wait(10+LogNormal(140, 0.4*bModEx(0.7, 0.55)));
-    if (self.PointsTotal >= 3900) then
-      TerminateScript('Too many points my friend...');
+    wait(50);
+    if (self.PointsTotal >= 3800+Round(100*bmod())) then
+      TerminateScript('Too many points my friend - Points: '+ToStr(Self.PointsTotal));
   until Self.ShouldStop();
 end;
 
@@ -1410,16 +1450,17 @@ var
 begin
   Result := [];
   elapsedTime := Self.TimeRunning.ElapsedTime();
+  winsPerHour := NumberPerHour(PestControl.GamesWon, elapsedTime);
   Result += ' Action        : ' + Self.Action;
   Result += ' Runtime       : ' + SRL.MsToTime(elapsedTime, Time_Short).Trim();
-  Result += ' Total Exp     : ' + SRL.FormatNumber(XPBar.TotalEarnedXP(), 2);
+  Result += ' Points Gained : ' + IntToStr(PestControl.PointsEarned);
   Result += ' Exp/Hour      : ' + SRL.FormatNumber(NumberPerHour(XPBar.TotalEarnedXP(), elapsedTime), 2);
-  winsPerHour := NumberPerHour(PestControl.GamesWon, elapsedTime);
   Result += ' Games Won     : ' + IntToStr(PestControl.GamesWon);
-  Result += ' Wins / Hour   : ' + SRL.FormatNumber(winsPerHour, 2);
-  Result += ' Points / Hour : ' + SRL.FormatNumber(winsPerHour * PestControl.PointsGame, 2);
+  Result += ' Wins/Hour     : ' + SRL.FormatNumber(winsPerHour, 2);
+  Result += ' Total Exp     : ' + SRL.FormatNumber(XPBar.TotalEarnedXP(), 2);
+  Result += ' Points/Hour   : ' + SRL.FormatNumber(winsPerHour * PestControl.PointsGame, 2);
+  Result += ' Total Points  : ' + IntToStr(PestControl.PointsTotal);
   Result += ' Next Break    : ' + TimeUntilNextBreak();
-  Result += ' PestControl   : Footballjds <3' 's waspscripts.com';
 end;
 {$IFDEF SCRIPT_GUI}
 
