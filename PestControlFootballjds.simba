@@ -1214,6 +1214,7 @@ begin
   end
   else
   begin
+    Wait(ExpoGauss(Self.bRT, 0.15, 0.25));
     if Antiban.BioDice(20) then
       Mouse.Click(MOUSE_LEFT);
     if Antiban.BioDice() then
@@ -1356,7 +1357,7 @@ begin
   RSClient.Image().Clear();
   Self.SetActivThresh();
   // 80% mid-run, 7.5% early, 7.5% late
-  if SRL.Dice(85*bMod()) then
+  if SRL.Dice(75*bMod()) then
     Self.PrayerMode := pmMid
   else if BioHash < 0.5 then
     Self.PrayerMode := pmEarly
@@ -1451,8 +1452,8 @@ begin
   Result := [];
   elapsedTime := Self.TimeRunning.ElapsedTime();
   winsPerHour := NumberPerHour(PestControl.GamesWon, elapsedTime);
-  Result += ' Action        : ' + Self.Action;
-  Result += ' Runtime       : ' + SRL.MsToTime(elapsedTime, Time_Short).Trim();
+  Result += ' Action        : ' + Self.Action.Trim('PCS_');
+  Result += ' Runtime       : ' + SRL.MsToTime(elapsedTime, Time_Short).Trim(' ');
   Result += ' Points Gained : ' + IntToStr(PestControl.PointsEarned);
   Result += ' Exp/Hour      : ' + SRL.FormatNumber(NumberPerHour(XPBar.TotalEarnedXP(), elapsedTime), 2);
   Result += ' Games Won     : ' + IntToStr(PestControl.GamesWon);
