@@ -1,0 +1,1689 @@
+{$DEFINE SCRIPT_ID := 'pest_control_jds'}
+{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_GUI}
+{$I WaspLib/osrs.simba}
+const
+  USE_AUTO_START = True;//auto-start
+  GUI_AUTO_START = 30;  //delay (in seconds) before auto-starting
+  USE_GAME_HUD   = TRUE;//draw HUD overlay with metrics
+type
+  TPCTier = record
+    AtPlank, PlankObj: TPoint;
+    BoatBox: TBox;
+  end;
+
+  TPCPortals = record
+    W, SW, SE, E: TPoint;
+  end;
+
+  TPCOCR = record
+    KnightHP: TBox;
+    ActivBox, PointsBox, W, E, SE, SW: TBox;
+    Shield_W, Shield_E, Shield_SE, Shield_SW: TBox;
+    ActivGreen, ActivRed: Int32;
+  end;
+
+  TPestControlGameData = record
+    Nov, Inter, Vet: TPCTier;
+    Portals: TPCPortals;
+    Knight, Spawn, LeaveNPC: TPoint;
+    OCR: TPCOCR;
+    GameIsland, OutpostIsland: TBox;
+  end;
+
+var
+  PCData: TPestControlGameData;
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+type
+  EPestState = (
+    INIT,
+    LOGIN,
+    CMBT_LVL,
+    
+    IN_BOAT,
+    WALK_MID,
+    DEFEND,
+    AT_PLANK,
+    EXIT_GAME,
+    
+    NO_ACTIVITY, UNKNOWN, MAX_ACTIONS, MAX_TIME, END_SCRIPT
+  );
+  EAttackChoices = (HP, Dist, Knight, Rand);
+// =============================================================================
+// TYPES
+// =============================================================================
+type
+  TAttackTempo = record
+    XPMean: Double;         // see SetAttackTempo
+    XPStick: Double;        // 0.20-0.38
+    LowMean: Double;        // see SetAttackTempo
+    LowStick: Double;       // 0.20-0.38
+  end;
+type
+  TStateTimer = record
+    Times: array[EPestState] of Int64;  // milliseconds per state
+  end;
+
+type
+  TPestControl = record
+    State: EPestState;
+    StateT: UInt64;//track state time
+    StateTimer: TStateTimer;
+    
+    // Map coordinates
+    Center, AtPlank, CrossPlank: TPoint;
+    BoatBox: TBox;
+    
+    // Objects & Entities  
+    Gangplank: TRSObject;
+    Squire, Shifter: TRSEntity;
+    
+    // Timing
+    bRT, RT_U1, RT_U2, RTC_U: Double;
+    Tempo: TAttackTempo;
+    XPAttkDelay: Double;
+    NextAttkDelay, LastAttack: Double;
+    LastXP: UInt64;
+    LastXPTime: UInt64;
+    HUDLastUpdate: UInt64;
+    GameStart: UInt64;
+    GameStarted: Boolean;
+
+    // Prayer
+    PrayerEnableTime: Double;
+    
+    // Boat movement
+    LastBoatMove: UInt64;
+    BoatMoveDelay: Double;
+    
+    // Activity
+    ActivityThresh: Int32;
+    
+    // Stats
+    Start, LastWin: UInt64;
+    KnightHP, wHP, eHP, seHP, swHP, portalsHP: Int32;
+    WShielded, EShielded, SEShielded, SWShielded: Boolean;
+    CoinCountC, CoinCountS: Int32;
+    GamesWon, PtsPerGame: UInt32;
+    PtsStart, PtsEarned, PtsTotal: Int32;
+    
+    // Config
+    CombatLevel: Int32;
+    Actions, MaxActions, MaxTime: UInt64;
+    UserActiveThreshold: Int32;
+    QuickPrayer, ChillIfActive: Boolean;
+  end;
+
+var
+  PestControl: TPestControl;
+  bhM, _P1, _P2, _P3: Double;
+
+// =============================================================================
+// HELPER FUNCTIONS - Distribution Math
+// =============================================================================
+
+// 0 < Random < 1
+function NZRandom: Double;
+begin
+  repeat
+    Result := Random;
+  until (Result > 0) and (Result < 1);
+end;
+
+// LOGNORMAL (math form):
+//   If Z ~ N(muLog, sigmaLog), then X = exp(Z) is lognormal.
+//   Use when you want strictly positive, right-skewed reaction times.
+function LogNormalEx(muLog, sigmaLog: Double): Double;
+begin
+  // Lognormal transform
+  Result := Exp(muLog + sigmaLog * GaussRand(0.0, 1.0));
+end;
+
+// LOGNORMAL (human form):
+//   mean          = typical delay (mean-ish RT)
+//   variation_pct = 0..1 (0.2–0.6 typical humans)
+function LogNormal(mean, sigma: Double): Double;
+begin
+  Result := LogNormalEx(Ln(mean) - 0.5 * sigma * sigma, sigma);
+end;
+
+function LogNormalInt(mean, sigma:Double): UInt64;
+begin
+  Result := Round(LogNormal(mean, sigma));
+end;
+
+// EX-GAUSSIAN (math form):
+//   X = Gaussian(mu, sigma) + Exponential(tau)
+//   This is the classic RT model: Gaussian core + exponential tail.
+function ExpoGaussEx(mu, sigma, tau: Double): Double;
+begin
+  // Gaussian core + Exponential tail (rate = 1/tau)
+  Result := GaussRand(mu, sigma) + (-tau * Ln(NZRandom));
+
+  if Result < 0 then
+    Result := 0;
+end;
+
+//use expogauss for RT and automatically adjust values per account
+function ExpoGaussRT(mean, variance, tail: Double): Double;
+var
+  mu, sigma, tau: Double;
+begin
+  if mean < 1 then mean := 1;
+  if variance < 0 then variance := 0;
+  if tail < 0 then tail := 0;
+
+  mu := mean;
+  sigma := mean * (0.23 + 0.09 * variance);
+  tau := mean * (0.20 + 0.15*tail);
+
+  Result := ExpoGaussEx(mu, sigma, tau);
+end;
+
+function ExGaussInt(mean: Double): UInt64;
+begin
+  Result := Round(ExpoGaussRT(mean, PestControl.RT_U1, PestControl.RT_U2));
+end;
+
+// WEIBULL (math form):
+//   CDF: 1 - exp(-(x/scale)^shape)
+//   shape_k > 0, scale_lambda > 0
+//   Useful for fatigue / hazard-rate modeling.
+function WeibullEx(shape_k, scale_lambda: Double): Double;
+var
+  u: Double;
+begin
+  if shape_k <= 0 then
+    shape_k := 0.000001;
+  if scale_lambda <= 0 then
+    scale_lambda := 0.000001;
+
+  u := NZRandom; // uniform [0,1)
+
+  // Inverse CDF
+  Result := scale_lambda * Power(-Ln(u), 1.0 / shape_k);
+
+  if Result < 0 then
+    Result := 0;
+end;
+
+//override include to set zoom if it is wrong
+function TRSOptions.GetZoomLevel(useCache: Boolean = True): Integer; override;
+begin
+  if useCache and (Self.ZoomLevel > -1) then
+    Exit(Self.ZoomLevel);
+
+  WriteLn GetDebugLn('Options', 'Unknown zoom level, reading from the gametab...');
+  if Self.OpenTab(ERSOptionsTab.DISPLAY) then
+    Self.ZoomLevel := Self.Sliders[ERSOptionsSlider.ZOOM].GetLevel();
+  if Self.ZoomLevel = -1 then
+    WriteLn GetDebugLn('Options', 'Failed to read zoom!', ELogLevel.ERROR)
+  else
+    WriteLn GetDebugLn('Options', 'Current zoom level: ' + ToString(Self.ZoomLevel), ELogLevel.SUCCESS);
+
+  Result := Self.ZoomLevel;
+  if InRange(Result, 30, 50) then exit;
+  if Self.SetZoomLevel(RandomMode(35+Round(10*bhm), 30, 50)) then
+  begin
+    Result := Self.ZoomLevel;
+    WriteLn GetDebugLn('Options', 'Zoom adjusted level: ' + ToString(Self.ZoomLevel), ELogLevel.SUCCESS);
+  end;
+end;
+
+//override include
+function TRSEntity._HoverHelper(action: TStringArray; attempts: Integer): Boolean; override;
+var
+  shouldExit: Boolean;
+  attempt, i: Integer;
+  atpa: T2DPointArray;
+  coordinates, tpa: TPointArray;
+begin
+  Result := Self._UpTextCheck(shouldExit, action);
+  if shouldExit then Exit;
+
+  for attempt := 0 to attempts do
+  begin
+    if Self.Find(coordinates, atpa) then
+    begin
+      if Length(coordinates) <> Length(atpa) then
+        raise 'SOMETHING WENT WRONG CACHING COORDINATES.';
+
+      if attempt < 2 then i := 0
+      else if Length(atpa) > (attempt - 2) then i := attempt - 2
+      else i := Random(Low(atpa), High(atpa));
+
+      tpa := atpa[i];
+      Self.LastCoordinate := coordinates[i];
+
+      Mouse.Move(tpa.RandomMean());
+
+      if Self.UpText = [] then Exit(True);
+    end;
+
+    if MainScreen.IsUpText(Self.UpText) then Exit(True);
+
+    if attempt <> (attempts - 1) then
+      Continue;
+    if not self.UpText.Contains('tack Shifter') then
+      Minimap.CompassRadians := Minimap.CompassRadians + PI/3.6 * Random(-1,1);
+  end;
+end;
+
+// =============================================================================
+// PEST CONTROL METHODS
+// =============================================================================
+
+function TPestControl.GetReportValues(): TStringArray;
+var
+  playTime: UInt64;
+  winsPerHour, ptsPerHour: Double;
+  actionsStr, sleepInfo: String;
+begin
+  actionsStr := ToStr(Self.Actions);
+  if Self.MaxActions <> 0 then
+    actionsStr += '/' + ToStr(Self.MaxActions);
+
+  if Antiban.Sleeps = [] then
+    sleepInfo := 'No sleep'
+  else
+    sleepInfo := Antiban.TimeUntilSleep(Antiban.Sleeps.First, TIME_SHORT);
+
+  playTime := Logger.TimeRunning.Elapsed;
+  Self.GamesWon := Round(Self.PtsEarned/Self.PtsPerGame);
+  winsPerHour := (Self.GamesWon / Max(1, playTime)) * ONE_HOUR;
+  ptsPerHour := (Self.PtsEarned / Max(1, playTime)) * ONE_HOUR;
+
+
+  Result := [
+    GetTimeStamp(TIME_SHORT),
+    Logger.TimeRunning.ElapsedFmt(TIME_SHORT),
+    Antiban.TimeRunning.ElapsedFmt(TIME_SHORT),
+    sleepInfo,
+    ToStr(Self.GamesWon),
+    FormatNumber(winsPerHour, 2),
+    ToStr(Self.PtsEarned),
+    FormatNumber(ptsPerHour, 2),
+    actionsStr
+  ];
+end;
+
+function TPestControl.InGame(): Boolean;
+const
+  sBox: Tbox = [11, 94, 49, 108];
+begin
+  result := Target.CountColor($CCCCCC, 0, sBox) > 35;
+  if not result then Self.GameStarted := False;
+end;
+
+function TPestControl.ReadActivityBar(): Int32;
+var
+  greenCount: Int32;
+  activBox: TBox = [368, 126, 508, 126];
+begin
+  result := -1;
+  if not Self.InGame() then Exit;
+  greenCount := Target.CountColor(PCData.OCR.ActivGreen, 0, activBox);
+  Result := Round((greenCount / 141) * 100);
+end;
+
+function TPestControl.ReadKnightHP(): Int32;
+begin
+  Self.KnightHP := OCR.RecognizeNumber(PCData.OCR.KnightHP, RSFonts.PLAIN_11, [$00F800, $0000F8], 0);
+  result := Self.KnightHP;
+end;
+
+function TPestControl.ReadPortalHP(): Int32;
+begin
+  Self.wHP := OCR.RecognizeNumber(PCData.OCR.W, RSFonts.PLAIN_11, [$0000F8, $00F800], 0);
+  Self.eHP := OCR.RecognizeNumber(PCData.OCR.E, RSFonts.PLAIN_11, [$0000F8, $00F800], 0);
+  Self.seHP := OCR.RecognizeNumber(PCData.OCR.SE, RSFonts.PLAIN_11, [$0000F8, $00F800], 0);
+  Self.swHP := OCR.RecognizeNumber(PCData.OCR.SW, RSFonts.PLAIN_11, [$0000F8, $00F800], 0);
+  Self.portalsHP := Self.wHP + Self.eHP + Self.seHP + Self.swHP;
+  result := Self.portalsHP;
+end;
+
+procedure TPestControl.UpdatePortalShields();
+const
+  SHIELD_COLOR = $73737A;
+  TOL = 1;
+begin
+  Self.ReadPortalHP();
+  Self.WShielded := SimilarColors(Target.GetColor(Point(382, 95)), SHIELD_COLOR, TOL);
+  Self.EShielded := SimilarColors(Target.GetColor(Point(420, 95)), SHIELD_COLOR, TOL);
+  Self.SEShielded := SimilarColors(Target.GetColor(Point(457, 95)), SHIELD_COLOR, TOL);
+  Self.SWShielded := SimilarColors(Target.GetColor(Point(495, 95)), SHIELD_COLOR, TOL);
+  //writeln('W: ', Self.WShielded, '| E: ', Self.EShielded, '| SE: ', Self.SEShielded, '| SW: ', Self.SWShielded);
+end;
+
+function FmtTime(ms: Int64): String;
+begin
+  if ms < 60000 then
+    Result := FormatFloat('0.0', ms / 1000) + 's'
+  else if ms < 3600000 then
+    Result := FormatMilliseconds(ms, 'm\m s\s')
+  else
+    Result := FormatMilliseconds(ms, 'h\h m\m');
+end;
+
+procedure TPestControl.UpdateAndDrawHUD(onBreak: Boolean = False; onSleep: Boolean = False; remaining: UInt64 = 0; Force: Boolean = False);
+const
+  REFRESH_RATE = 250;//milliseconds
+  HUD_BG_COLOR = $181818;
+  HUD_BORDER_COLOR = $404040;
+  HUD_HEADER_TEXT = $3B9FFF;
+  HUD_TEXT_COLOR = $F0F0F0;
+  HUD_TEXT_MUTED = $A5A5A5;
+  HUD_SEP_COLOR = $404040;
+  HUD_ACTIVITY_RED = $0000F8;
+  HUD_ACTIVITY_WARN = $57C8FF;
+  HUD_ACTIVITY_GREEN = $47FF47;
+  THRESHOLD_COLOR = $F0F0F0;
+  TRACK_COLOR = $202020;
+  PAD = 8;
+  ROW_GAP = 11;
+  SEP_MARGIN = 3;
+  SEP_HEIGHT = 2;
+var
+  elapsed: UInt64;
+  winsPerHour, ptsPerHour, xpPerHour: Double;
+  abox, aboxBorder, headerBox, footerBox, barBox, barBorder, fillBox: TBox;
+  xLabel, xVal, xRate, y, fullWidth, filledWidth, thrX, totalWidth: Int32;
+  activityValue, runtimeStr, stateStr, winsStr, winsHrStr, ptsStr, ptsHrStr, portalStr: String;
+  xpStr, xpHrStr, prayerStr, atkDelayStr, breakStr, sleepStr, maxActStr, maxTimeStr: String;
+  barColor, valueColor, actPercent, currentMinutes, xPos: Int32;
+
+  function DrawSep(cy: Int32): Int32;
+  begin
+    Inc(cy, SEP_MARGIN);
+    RSClient.Canvas.DrawColor := HUD_SEP_COLOR;
+    RSClient.Canvas.DrawBoxFilled(Box(abox.X1 + 6, cy -1, abox.X2 - 6, cy + 1));
+    Result := cy + SEP_HEIGHT + SEP_MARGIN;
+  end;
+
+  function DrawRow(const lbl, val: String; cy: Int32; const rate: String = ''): Int32;
+  begin
+    RSClient.Canvas.DrawColor := HUD_TEXT_MUTED;
+    RSClient.Canvas.DrawText(lbl, Point(xLabel, cy));
+    RSClient.Canvas.DrawColor := HUD_TEXT_COLOR;
+    RSClient.Canvas.DrawText(val, Point(xVal, cy));
+    if rate <> '' then
+      RSClient.Canvas.DrawText(rate, Point(xRate, cy));
+    Result := cy + ROW_GAP;
+  end;
+
+begin
+  if not USE_GAME_HUD then Exit;
+  if ((Time - Self.HUDLastUpdate) < REFRESH_RATE) and
+    not Force then Exit;
+  Self.HUDLastUpdate := Time;
+
+  Self.PtsEarned := Self.PtsTotal - Self.PtsStart;
+  Self.GamesWon := Round(Self.PtsEarned / Self.PtsPerGame);
+  elapsed := Logger.TimeRunning.Elapsed;
+  winsPerHour := (Self.GamesWon / Max(1, elapsed)) * ONE_HOUR;
+  ptsPerHour := (Self.PtsEarned / Max(1, elapsed)) * ONE_HOUR;
+  xpPerHour := (XPBar.TotalEarnedXP() / Max(1, elapsed)) * ONE_HOUR;
+
+  runtimeStr := FormatMilliseconds(elapsed, TIME_SHORT);
+  stateStr := ToStr(Self.State).After('EPestState.');
+
+  if onBreak then
+  begin
+    breakStr := FormatMilliseconds(remaining, TIME_SHORT);
+    stateStr := 'ON_BREAK';
+  end else
+  begin
+    breakStr := 'None';
+    if Length(Antiban.Breaks) > 0 then
+      breakStr := Antiban.TimeUntilBreak(Antiban.Breaks[0], TIME_SHORT);
+  end;
+  if onSleep then
+  begin
+    sleepStr := FormatMilliseconds(remaining, TIME_SHORT);
+    stateStr := 'ON_SLEEP';
+  end else
+  begin
+    sleepStr := 'None';
+    if Length(Antiban.Sleeps) > 0 then
+      sleepStr := Antiban.TimeUntilSleep(Antiban.Sleeps[0], TIME_SHORT);
+  end;
+
+  winsStr := ToStr(Self.GamesWon);
+  winsHrStr := FormatNumber(winsPerHour, 1);
+  ptsStr := ToStr(Self.PtsEarned);
+  ptsHrStr := FormatNumber(ptsPerHour, 0);
+  xpStr := FormatNumber(XPBar.TotalEarnedXP(), 1);
+  xpHrStr := FormatNumber(xpPerHour, 0);
+
+  if (Self.LastXPTime + Self.XPAttkDelay) > Time then
+    atkDelayStr := FormatFloat('#,##0', Round(Self.XPAttkDelay)) + 'ms'
+  else
+    atkDelayStr := FormatFloat('#,##0', Round(Self.NextAttkDelay)) + 'ms';
+
+  prayerStr := 'N/A';
+  if Self.QuickPrayer then
+    prayerStr := FormatFloat('#,##0', Round(Self.PrayerEnableTime)) + 'ms';
+
+  maxActStr := '';
+  if Self.MaxActions > 0 then
+    maxActStr := ToStr(Self.Actions) + '/' + ToStr(Self.MaxActions);
+
+  maxTimeStr := '';
+  if Self.MaxTime > 0 then
+  begin
+    currentMinutes := GetTimeRunning div 60000;
+    maxTimeStr := ToStr(currentMinutes) + '/' + ToStr(Self.MaxTime div 60000);
+  end;
+
+  actPercent := Self.ReadActivityBar();
+  if actPercent < 0 then
+  begin
+    activityValue := 'N/A';
+    valueColor := HUD_TEXT_MUTED;
+    barColor := HUD_ACTIVITY_WARN;
+  end
+  else
+  begin
+    activityValue := ToStr(actPercent)+'%';
+    if actPercent < 30 then
+    begin
+      valueColor := HUD_ACTIVITY_RED;
+      barColor := HUD_ACTIVITY_RED;
+    end
+    else if actPercent < Self.ActivityThresh then
+    begin
+      valueColor := HUD_ACTIVITY_WARN;
+      barColor := HUD_ACTIVITY_WARN;
+    end
+    else
+    begin
+      valueColor := HUD_ACTIVITY_GREEN;
+      barColor := HUD_ACTIVITY_GREEN;
+    end;
+  end;
+
+  abox := Box(552, 206, 731, 463);
+  aboxBorder := abox.Expand(2);
+  headerBox := Box(abox.X1, abox.Y1, abox.X2, abox.Y1 + 24);
+  footerBox := Box(abox.X1, abox.Y2 - 18, abox.X2, abox.Y2);
+  xLabel := abox.X1 + PAD;
+  xVal := abox.X1 + 55;
+  xRate := abox.X2 - 55;
+
+  with RSClient.Canvas do
+  begin
+    BeginUpdate();
+
+    DrawColor := HUD_BORDER_COLOR;
+    DrawBoxFilled(aboxBorder);
+    DrawColor := HUD_BG_COLOR;
+    DrawBoxFilled(abox);
+    DrawBoxFilled(headerBox);
+    DrawBoxFilled(footerBox);
+
+    FontName := 'Segoe UI';
+    FontAntialiasing := True;
+    FontSize := 16;
+    DrawColor := HUD_HEADER_TEXT;
+    DrawText('Pest Control LITE', Point(headerBox.X1 + PAD, headerBox.Y1 + 4));
+
+    barBox := Box(abox.X1 + PAD, headerBox.Y2, abox.X1 + PAD +
+      TextWidth('Pest Control LITE'), headerBox.Y2 + 8);
+    barBorder := barBox.Expand(2);
+
+    DrawColor := TRACK_COLOR;
+    DrawBoxFilled(barBox);
+    fullWidth := barBox.X2 - barBox.X1;
+    filledWidth := (fullWidth * EnsureRange(actPercent, 0, 100)) div 100;
+    if filledWidth > 0 then
+    begin
+      fillBox := barBox;
+      fillBox.X2 := fillBox.X1 + filledWidth;
+      DrawColor := barColor;
+      DrawBoxFilled(fillBox);
+      DrawBox(barBorder);
+    end;
+    thrX := barBox.X1 + (fullWidth * EnsureRange(Self.ActivityThresh, 0, 100)) div 100;
+    DrawColor := THRESHOLD_COLOR;
+    DrawBoxFilled(Box(thrX, barBox.Y1, thrX + 1, barBox.Y2));
+
+    FontSize := 16;
+    DrawColor := valueColor;
+    DrawText(activityValue, Point(barBox.X2 + 4, barBox.Y1-2));
+
+    y := barBox.Y2 +4;
+    y := DrawSep(y);
+    FontSize := 12;
+    y := DrawRow('Runtime', runtimeStr, y);
+    if stateStr.Contains('DEFEND') then
+      y := DrawRow('State', stateStr, y, FmtTime(Time-Self.GameStart))
+    else
+      y := DrawRow('State', stateStr, y, FmtTime(Time-Self.StateT));
+    y := DrawRow('Break', breakStr, y);
+    y := DrawRow('Sleep', sleepStr, y);
+    y := DrawSep(y);
+    y := DrawRow('Wins', winsStr, y, winsHrStr + '/hr');
+    y := DrawRow('Points', ptsStr, y, ptsHrStr + '/hr');
+    y := DrawRow('XP', xpStr, y, xpHrStr + '/hr');
+    y := DrawSep(y);
+    y := DrawRow('Prayer', prayerStr, y);
+    DrawColor := HUD_TEXT_COLOR;
+    DrawText('Z: ' + ToStr(Options.ZoomLevel), Point(xRate, y - ROW_GAP));
+    y := DrawRow('Attack', atkDelayStr, y);
+    y := DrawSep(y);
+    y := DrawRow('Total Points', '', y, FormatFloat('#,##0', Self.PtsTotal));
+    y := DrawRow('Total ' + ToStr(Self.State).After('EPestState.'), '', y, FmtTime(Self.StateTimer.Times[Self.State]+ (Time - Self.StateT)));
+
+    if maxActStr <> '' then y := DrawRow('Max Actions', '', y, maxActStr);
+    if maxTimeStr <> '' then y := DrawRow('Max Time', '', y, maxTimeStr);
+
+    if Self.InGame() then
+    begin
+      Self.UpdatePortalShields();
+
+      //FontSize := 10;
+
+      // Calculate total width for centering
+      totalWidth := TextWidth('(W) 999|') + TextWidth('(E) 999|') +
+                    TextWidth('(SE)999|') + TextWidth('(SW)999');
+      xPos := (abox.X1 + abox.X2) div 2 - totalWidth div 2;
+
+      // W portal
+      DrawColor := 16711935;
+      if Self.WShielded then DrawText('(W)', Point(xPos, y+1))
+      else DrawText('W:', Point(xPos, y+1));
+      Inc(xPos, TextWidth('(W) '));
+      DrawColor := HUD_TEXT_COLOR;
+      DrawText(PadL(ToStr(Self.wHP), 3), Point(xPos, y+1));
+      Inc(xPos, TextWidth(PadL('999', 3)));
+      DrawColor := 16711935;
+      DrawText('|', Point(xPos, y+1));
+      Inc(xPos, TextWidth('|'));
+
+      // E portal
+      DrawColor := 16737894;
+      if Self.EShielded then DrawText('(E)', Point(xPos, y+1))
+      else DrawText('E:', Point(xPos, y+1));
+      Inc(xPos, TextWidth('(E) '));
+      DrawColor := HUD_TEXT_COLOR;
+      DrawText(PadL(ToStr(Self.eHP), 3), Point(xPos, y+1));
+      Inc(xPos, TextWidth(PadL('999', 3)));
+      DrawColor := 16737894;
+      DrawText('|', Point(xPos, y+1));
+      Inc(xPos, TextWidth('|'));
+
+      // SE portal
+      DrawColor := 65535;
+      if Self.SEShielded then DrawText('(SE)', Point(xPos, y+1))
+      else DrawText('SE:', Point(xPos, y+1));
+      Inc(xPos, TextWidth('(SE)'));
+      DrawColor := HUD_TEXT_COLOR;
+      DrawText(PadL(ToStr(Self.seHP), 3), Point(xPos, y+1));
+      Inc(xPos, TextWidth(PadL('999', 3)));
+      DrawColor := 65535;
+      DrawText('|', Point(xPos, y+1));
+      Inc(xPos, TextWidth('|'));
+
+      // SW portal
+      DrawColor := 3355647;
+      if Self.SWShielded then DrawText('(SW)', Point(xPos, y+1))
+      else DrawText('SW:', Point(xPos, y+1));
+      Inc(xPos, TextWidth('(SW)'));
+      DrawColor := HUD_TEXT_COLOR;
+      DrawText(PadL(ToStr(Self.swHP), 3), Point(xPos, y+1));
+      Inc(xPos, TextWidth(PadL('999', 3)));
+      DrawColor := 3355647;
+      DrawText('|', Point(xPos, y+1));
+
+      FontSize := 12;
+      y += ROW_GAP+2;
+    end;
+
+    DrawColor := HUD_SEP_COLOR;
+    DrawBoxFilled(Box(abox.X1 + 6, footerBox.Y1, abox.X2 - 6, footerBox.Y1 + SEP_HEIGHT - 1));
+    FontSize := 12;
+    DrawColor := HUD_HEADER_TEXT;
+    DrawText('Author: Footballjds', Point(abox.X1 + PAD, footerBox.Y1 + 5));
+
+    EndUpdate();
+  end;
+end;
+
+function TPestControl.InBoat(): Boolean;
+const
+  ptsBox: TBox = [7, 62, 77, 80];
+begin
+  result := (target.CountColor(16777113, 0, ptsBox) = 140);
+end;
+
+procedure TPestControl.ReadPoints();
+var
+  blueNumber: Int32;
+begin
+  if not Self.InBoat() then Exit;
+  blueNumber := OCR.RecognizeNumber(PCData.OCR.PointsBox, RSFonts.PLAIN_12, [16777113], 0);
+  if self.PtsStart < 0 then
+    self.PtsStart := blueNumber;
+  self.PtsTotal := blueNumber;
+  self.PtsEarned := self.PtsTotal-self.PtsStart;
+end;
+
+function TPestControl.PlatformCenter(var tpOut: TPoint): Boolean;
+var
+  platPts: TPointArray;
+begin
+  platPts := Target.FindColor(2782859, 0, Minimap.Bounds);
+  if platPts.Length < 1300 then Exit;
+  Result := true;
+  tpOut := platPts.Mean();
+end;
+
+function TPestControl.AtKnight(): Boolean;
+var
+  platMean: TPoint;
+begin
+  if not Self.PlatformCenter(platMean) then Exit;
+  Result := Distance(Minimap.Center, platMean)
+          < 13 + 3 * bhM;
+end;
+
+function TPestControl.AtBoatPlank(pos: TPoint): Boolean;
+begin
+  Result := Distance(pos, Self.AtPlank) < 10;
+end;
+
+procedure TPestControl.UpdateAttkDelay();
+var
+  candidate: Double;
+begin
+  candidate := ExpoGaussRT(Self.Tempo.LowMean, Self.RT_U1, Self.RT_U2);
+  if Self.NextAttkDelay > 0 then
+  begin
+    if Random() < (0.10 + 0.05 * Self.RTC_U) then
+      Self.NextAttkDelay := candidate
+    else
+      Self.NextAttkDelay := Self.Tempo.LowStick * Self.NextAttkDelay + (1.0 - Self.Tempo.LowStick) * candidate;
+  end else
+    Self.NextAttkDelay := candidate;
+  Logger.Info('UpdateAttkDelay: %.4f', [Self.NextAttkDelay]);
+end;
+
+procedure TPestControl.UpdateXPAttkDelay();
+var
+  candidate: Double;
+begin
+  candidate := ExpoGaussRT(Self.Tempo.XPMean, Self.RT_U1, Self.RT_U2);
+
+  if Self.XPAttkDelay > 0 then
+  begin
+    if Random() < (0.10 + 0.05 * Self.RTC_U) then
+      Self.XPAttkDelay := candidate
+    else
+      Self.XPAttkDelay := Self.Tempo.XPStick * Self.XPAttkDelay + (1.0 - Self.Tempo.XPStick) * candidate;
+  end else
+    Self.XPAttkDelay := candidate;
+  Logger.Info('New XP AttackDelay: %.4f', [Self.XPAttkDelay]);
+end;
+
+procedure TPestControl.UpdateActiveThresh();
+begin
+  Self.ActivityThresh := Self.UserActiveThreshold;
+  Self.ActivityThresh := EnsureRange(Self.ActivityThresh, 50, 100);
+end;
+
+procedure TPestControl.UpdateXP();
+var
+  nXP: UInt64;
+begin
+  nXP := XPBar.Read;
+  if nXP > Self.LastXP then
+  begin
+    if (Time-Self.LastXPTime) > Self.XPAttkDelay then
+      Self.UpdateXPAttkDelay();
+    Self.LastXP := nXP;
+    Self.LastXPTime := Time;
+  end;
+end;
+
+function TPestControl.GetState(): EPestState;
+var
+  tmpP: TPoint;
+begin
+  if Activity.IsFinished then
+    Exit(EPestState.NO_ACTIVITY);
+
+  if (Self.MaxActions > 0) and (Self.Actions >= Self.MaxActions) then
+    Exit(EPestState.MAX_ACTIONS);
+
+  if (Self.MaxTime > 0) and (GetTimeRunning() >= Self.MaxTime) then
+    Exit(EPestState.MAX_TIME);
+
+  if not RSClient.IsLoggedIn() then
+    Exit(EPestState.LOGIN);
+
+  if Self.CombatLevel < 40 then
+    Exit(EPestState.CMBT_LVL);
+  
+  if Self.InBoat() then Exit(EPestState.IN_BOAT);
+
+  if Self.InGame() then
+  begin
+    if Self.ReadActivityBar() < 1 then
+      Exit(EPestState.EXIT_GAME);
+    if Self.AtKnight() then Exit(EPestState.DEFEND);
+    Exit(EPestState.WALK_MID);
+  end;
+  tmpP := Map.Position();
+  if Self.AtBoatPlank(tmpP) then
+    Exit(EPestState.AT_PLANK);
+  try
+    if Map.Walker.WebGraph^.PathBetween(Self.AtPlank, tmpP) <> [] then
+      Exit(EPestState.AT_PLANK);
+  except writeln(GetExceptionLocationStr); writeln(GetExceptionMessage); end;
+  result := EPestState.UNKNOWN;
+end;
+
+function TPestControl.PrayerSample(): Double;
+var
+  shape, scale: Double;
+begin
+  // Shape: How decision probability builds over time
+  shape := Random(1.4, 1.5) + 1 * _P2;
+
+  // Scale: Typical timing
+  scale := 5500 + GaussRand(400,125) + 6000 * _P1;
+
+  // Session variance: This game's randomness
+  scale := scale * (0.8 + (0.4 + _P3/5) * Random());
+
+  // Sample from Weibull
+  Result := WeibullEx(shape, scale);
+
+  Logger.Info('PrayerSample: %.2fs (k=%.2f, λ=%.0fms)',
+    [Result / 1000, shape, scale]);
+end;
+
+procedure TPestControl.UpdateCmbtLvl();
+const
+  cbBox: TBox = [661, 229, 682, 244];
+begin
+  if GameTabs.Open(ERSGameTab.COMBAT) then
+  begin
+    Sleep(120, 300, ERandomDir.RIGHT);
+    Self.CombatLevel := OCR.RecognizeNumber(cbBox, RSFonts.PLAIN_11, [2070783], 0);
+    Logger.Info('Combat Level: %d', [Self.CombatLevel]);
+  end;
+  XPBar.Read;
+  if Self.CombatLevel >= 100 then
+  begin
+    Self.BoatBox := PCData.Vet.BoatBox;
+    Self.AtPlank := PCData.Vet.AtPlank;
+    Self.CrossPlank := PCData.Vet.PlankObj;
+
+    Self.Shifter.Finder.ColorClusters += [[
+      [$33C1E7, 4.010, EColorSpace.HSL, [1.562, 0.510, 0.930]],
+      [$223B53, 0.882, EColorSpace.HSL, [1.421, 1.254, 0.326]],
+      3
+    ]];
+    Self.Shifter.Finder.ColorClusters += [[
+      [$B0BBB7, 1.153, EColorSpace.HSL, [0.506, 1.932, 0.563]],
+      [$8E848A, 0.757, EColorSpace.HSL, [0.911, 1.517, 0.574]],
+      3
+    ]];
+  end
+  else if Self.CombatLevel >= 70 then
+  begin
+    Self.BoatBox := PCData.Inter.BoatBox;
+    Self.AtPlank := PCData.Inter.AtPlank;
+    Self.CrossPlank := PCData.Inter.PlankObj;
+
+    Self.Shifter.Finder.ColorClusters += [[
+      [2177290, 5, EColorSpace.HSL, [0.12, 6.09, 6.09]],
+      [3822370, 4, EColorSpace.HSL, [0.15, 0.81, 0.81]],
+      3
+    ]];
+    Self.Shifter.Finder.ColorClusters += [[
+      [5066333, 5, EColorSpace.HSL, [0.23, 0.33, 0.33]],
+      [5263713, 4, EColorSpace.HSL, [0.30, 0.26, 0.26]],
+      3
+    ]];
+    Self.Shifter.Finder.ColorClusters += [[
+      [2347498, 12, EColorSpace.HSL, [0.02, 1.15, 1.15]],
+      [2177617, 4, EColorSpace.HSL, [0.20, 0.90, 0.90]],
+      3
+    ]];
+  end
+  else if Self.CombatLevel >= 40 then
+  begin
+    Self.BoatBox := PCData.Nov.BoatBox;
+    Self.AtPlank := PCData.Nov.AtPlank;
+    Self.CrossPlank := PCData.Nov.PlankObj;
+
+    Self.Shifter.Finder.ColorClusters += [[
+      [2107241, 5, EColorSpace.HSL, [0.09, 0.60, 0.60]],
+      [2173038, 4, EColorSpace.HSL, [0.11, 0.67, 0.67]],
+      3
+    ]];
+    Self.Shifter.Finder.ColorClusters += [[
+      [2177290, 5, EColorSpace.HSL, [0.12, 6.09, 6.09]],
+      [3822370, 4, EColorSpace.HSL, [0.15, 0.81, 0.81]],
+      3
+    ]];
+  end
+  else
+    TerminateScript('[INIT] Combat level too low: ' + ToStr(Self.CombatLevel));
+
+  Self.Gangplank := TRSObject.Create(@Map.Walker, [1, 1, 1], [Self.CrossPlank], ['Cross Gang']);
+end;
+
+procedure TPestControl.MoveInBoat();
+var
+  anchor, target, current, opposite, center: TPoint;
+  useOpposite: Boolean;
+  boatArea: TBox;
+  bhInt: Int32;
+  variance: Double;
+  mmP, msP, finalP: TPoint;
+begin
+  Sleep(ExGaussInt(Self.bRT * 1.9));
+  if Time < (Self.LastBoatMove + Self.BoatMoveDelay) then Exit;
+  if not Self.InBoat() then Exit;
+
+  boatArea := Self.BoatBox.Expand(-4);
+  bhInt := Trunc(bhM * 1000);
+
+  // Anchor (consistent per account)
+  anchor.X := boatArea.X1 + (bhInt mod boatArea.Width);
+  anchor.Y := boatArea.Y1 + ((bhInt shr 8) mod boatArea.Height);
+
+  // Opposite of current position
+  current := Map.Position();
+  opposite.X := boatArea.X2 - (current.X - boatArea.X1);
+  opposite.Y := boatArea.Y2 - (current.Y - boatArea.Y1);
+
+  // Pick anchor or opposite as center (bhM determines preference)
+  useOpposite := Random(100) < (bhInt mod 40); // 0-39% chance
+  if useOpposite then
+    center := opposite
+  else
+    center := anchor;
+
+  // Gaussian variance (allows full boat coverage)
+  variance := (boatArea.Width + boatArea.Height) / 4 * (0.3 + 0.3 * bhM);
+
+  target.X := Round(GaussRand(center.X, variance));
+  target.Y := Round(GaussRand(center.Y, variance));
+
+  target.X := EnsureRange(target.X, boatArea.X1, boatArea.X2);
+  target.Y := EnsureRange(target.Y, boatArea.Y1, boatArea.Y2);
+  mmP := Map.Walker.Point2MM(current, target, minimap.CompassRadians);
+  msP := Minimap.point2ms(mmP, Minimap.CompassRadians);
+
+  finalP := msP.Offset(Random(-8, 8), Random(-8, 8));
+  finalP.X := EnsureRange(finalP.X, MainScreen.Bounds.X1, MainScreen.Bounds.X2);
+  finalP.Y := EnsureRange(finalP.Y, MainScreen.Bounds.Y1, MainScreen.Bounds.Y2);
+
+  Mouse.Move(finalP);
+  Sleep(ExGaussInt(Self.bRT * 0.8));
+  if MainScreen.UpText.Contains('Walk here', false) then
+    Mouse.Click(EMouseButton.LEFT) else
+      if ChooseOption.Open() then
+        ChooseOption.Select('Walk here', false, true);
+
+  Self.LastBoatMove := Time;
+  Self.BoatMoveDelay := LogNormal(Self.bRT * 100 + Random(75, 100) * bhM, 0.33);
+  Logger.Info('BoatMoveDelay: %.4f', [Self.BoatMoveDelay]);
+end;
+
+procedure TPestControl.WhileInBoat();
+begin
+  Self.MoveInBoat();
+end;
+
+//function from include, I am not author
+function TRSChat.ReadPointsOption(): String;
+var
+  option: TRSChatOption;
+begin
+  for option in Self.GetOptions([$000080]) do
+  begin
+    if Result <> '' then Result += LINE_SEP;
+    Result += option.Text;
+  end;
+  result := ToStr(result.ExtractInteger());
+end;
+
+procedure TPestControl.EnterBoat();
+begin
+  Sleep(ExGaussInt(Self.bRT * 2.9));
+  if Chat.IsTitle('~ Warning ~') then
+    TerminateScript('Too many points '+Chat.ReadPointsOption());
+  try
+    if Self.Gangplank.WalkClick() then
+      if SleepUntil(Self.InBoat, 50, Round(GaussRand(3000, 200))) then
+      begin
+        //once a game stuff here
+        Self.PrayerEnableTime := Self.PrayerSample();
+        Logger.Info('Self.PrayerEnableTime: %.4f', [Self.PrayerEnableTime]);
+        if RandomBoolean(bhM) then
+          Self.LastBoatMove := Time;
+        Self.ReadPoints();
+        Activity.Restart();
+        Self.Actions+=1;
+        Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
+        Sleep(ExGaussInt(Self.bRT * 3.9));
+        Self.CoinCountC := Inventory.Items.CountEx('Coins');
+        if Self.CoinCountS < 1 then Self.CoinCountS := Self.CoinCountC;
+        if not InRange(Options.GetZoomLevel(True), 30, 50) then
+          if Options.SetZoomLevel(RandomMode(35+Round(10*bhm), 30, 50)) then
+            WriteLn GetDebugLn('Options', 'Zoom adjusted level: ' + ToString(Options.ZoomLevel), ELogLevel.SUCCESS);
+        Exit;
+      end;
+  except Logger.Error('Exception in EnterBoat: %s', [GetExceptionMessage]); end;
+  if not Self.InBoat() and not Self.InGame() then
+    try
+      Map.Walker.WebWalk(Self.AtPlank, 0, 0, False);
+    except Logger.Error('Exception walk to plank: %s', [GetExceptionMessage]); end;
+end;
+
+function TPestControl.ShouldEnablePrayer(): Boolean;
+begin
+  Result := False;
+  if (Self.GameStarted) and Self.InGame() and  Self.QuickPrayer then
+    Result := Time > (Self.GameStart + Self.PrayerEnableTime);
+end;
+
+procedure TPestControl.WalkToDefend();
+var
+  uniqueMiddle, midP, msP: TPoint;
+begin
+  Sleep(ExGaussInt(Self.bRT * 1.1));
+  if not Self.InGame() then Exit;
+  if not Self.GameStarted then
+  begin
+    Self.GameStarted := True;
+    Self.GameStart := Time;
+  end;
+  if Self.QuickPrayer and (Self.ShouldEnablePrayer) then
+    Minimap.EnablePrayer();
+  if Self.PlatformCenter(midP) then
+  begin
+    uniqueMiddle := midP;
+    uniqueMiddle.X += Biometrics.RandomModeInteger(9, -9, 9);
+    uniqueMiddle.Y += Biometrics.RandomModeInteger(9, -9, 9);
+    msP := Minimap.Point2MS(uniqueMiddle, Minimap.CompassRadians);
+    if Mainscreen.Bounds.Contains(msP) then
+    begin
+      msP := [EnsureRange(msP.X + Random(-10, 10), MainScreen.Bounds.X1,
+         MainScreen.Bounds.X2), EnsureRange(msP.Y + Random(-10, 10),
+         MainScreen.Bounds.Y1, MainScreen.Bounds.Y2)];
+      if Mainscreen.Bounds.Contains(msP) then
+      begin
+        Mouse.Click(msP, EMouseButton.LEFT);
+        Sleep(LogNormalInt(Self.bRT*12, 0.25));
+        Exit;
+      end;
+    end;
+  end;
+  uniqueMiddle := PCData.Knight;
+  uniqueMiddle.X += Biometrics.RandomModeInteger(5, -5, 5);
+  uniqueMiddle.Y += Biometrics.RandomModeInteger(5, -5, 5);
+  try
+    Logger.Info('Walk to middle: ' + ToStr(Map.Walker.WebWalk(uniqueMiddle, 7+Round(5*bhM), 0.2+0.4*bhM)));
+  except Logger.Error('WalkToDefend exception: %s', [GetExceptionMessage]); end;
+end;
+
+procedure DebugShifterClusters(constref Shifter: TRSEntity);
+var
+  img: TImage;
+  atpa: T2DPointArray;
+  coordinates: TPointArray;
+  i, totalPixels: Integer;
+  avgSize, minSize, maxSize: Integer;
+begin
+  img := Target.GetImage();
+
+  // Try to find shifters
+  if Shifter.Find(coordinates, atpa) then
+  begin
+    WriteLn('=== SHIFTER DETECTION DEBUG ===');
+    WriteLn('Found ', Length(atpa), ' potential shifter(s)');
+    WriteLn();
+
+    minSize := High(Integer);
+    maxSize := 0;
+    totalPixels := 0;
+
+    // Analyze each detected cluster
+    for i := 0 to High(atpa) do
+    begin
+      WriteLn('Cluster #', i + 1, ':');
+      WriteLn('  Coordinate: ', coordinates[i]);
+      WriteLn('  Pixel count: ', Length(atpa[i]));
+      WriteLn('  Bounds: ', atpa[i].Bounds());
+      WriteLn();
+
+      totalPixels += Length(atpa[i]);
+      if Length(atpa[i]) < minSize then minSize := Length(atpa[i]);
+      if Length(atpa[i]) > maxSize then maxSize := Length(atpa[i]);
+
+      // Draw on image
+      img.DrawColor := $00FF00;
+      img.DrawTPA(atpa[i]);
+      img.DrawBox(atpa[i].Bounds());
+      img.DrawText('Cluster ' + ToStr(i+1) + ': ' + ToStr(Length(atpa[i])) + 'px',
+                   atpa[i].Bounds().TopLeft);
+    end;
+
+    if Length(atpa) > 0 then
+    begin
+      avgSize := totalPixels div Length(atpa);
+      WriteLn('=== STATISTICS ===');
+      WriteLn('Average cluster size: ', avgSize, ' pixels');
+      WriteLn('Min cluster size: ', minSize, ' pixels');
+      WriteLn('Max cluster size: ', maxSize, ' pixels');
+      WriteLn();
+      WriteLn('RECOMMENDATION:');
+      if minSize > 50 then
+        WriteLn('  Current ColorCluster "3" parameter might be too low.')
+      else if maxSize < 20 then
+        WriteLn('  Detection might be too sensitive. Consider stricter tolerances.')
+      else
+        WriteLn('  Cluster sizes look reasonable (', minSize, '-', maxSize, ' pixels)');
+    end;
+  end else
+  begin
+    WriteLn('NO SHIFTERS DETECTED');
+    WriteLn('Check:');
+    WriteLn('  1. Are you near shifters?');
+    WriteLn('  2. Are colors correct for this boat tier?');
+    WriteLn('  3. Try uncommenting Transformer settings');
+  end;
+
+  // Draw entity info
+  img.DrawColor := $00FFFF;
+  img.DrawText('ColorClusters: ' + ToStr(Length(Shifter.Finder.ColorClusters)), [10, 30]);
+  img.DrawText('Transformer.Distance: ' + ToStr(Shifter.Finder.Transformer.Distance), [10, 50]);
+  img.DrawText('Transformer.ShortSide.Min: ' + ToStr(Shifter.Finder.Transformer.ShortSide.Min), [10, 70]);
+
+  img.Show();
+end;
+
+function TPestControl.AttackShifter(debug: Boolean = False): Boolean;
+begin
+  if debug then DebugShifterClusters(Self.Shifter);
+  try
+    Result := Self.Shifter.Click(True, 1);
+  except Logger.Error('AttackShifter exception: %s', [GetExceptionMessage]); end;
+end;
+
+procedure TPestControl.DefendKnight();
+begin
+  Sleep(ExGaussInt(Self.bRT));
+  Self.UpdateXP();
+  if (Time - Self.LastXPTime) < Self.XPAttkDelay then Exit;
+  if (Time - Self.LastAttack) < Self.NextAttkDelay then Exit;
+  if not Self.InGame() then Exit;
+  if Self.QuickPrayer and (Self.ShouldEnablePrayer) then
+    if Self.InGame() then
+    begin
+      Minimap.EnablePrayer();
+      Sleep(ExGaussInt(Self.bRT));
+    end;
+
+  if Self.AttackShifter({$IFDEF DEBUGSHIFTERS}True{$ELSE}False{$ENDIF}) then
+  begin
+    Activity.Restart();
+    Self.LastAttack := Time;
+    Self.UpdateAttkDelay();
+    Sleep(ExGaussInt(Self.bRT*2.2));
+  end
+  else
+    Sleep(ExGaussInt(Self.bRT*1.5));
+end;
+
+procedure TPestControl.LeaveTheGame();
+begin
+  if not Self.InGame() then Exit;
+  if Self.ReadPortalHP = 0 then Exit;
+  Sleep(ExGaussInt(Self.bRT * 3.3));
+  if not Self.InGame() then Exit;
+  try
+    Writeln('Distance to Squire: ', Self.Squire.DistanceTo(Map.Position()));
+    Map.Walker.WebWalk(Self.Squire.Coordinates[0].Offset(Random(-5, 5), Random(5, 10)), 5, 0.2+0.5*bhM);
+    if not Self.InGame() then Exit;
+    if Self.Squire.Interact(['Leave Squire', 'eave Squire'], 1) then
+    begin
+      WriteLn('Left game at ', FormatMilliseconds(GetTimeRunning, TIME_SHORT));
+      SleepUntil(not Self.InGame(), Round(200+random(200)), Round(17000+9000*bhM));
+    end else
+      Writeln('Failed to leave game');
+  except Writeln('TPestControl.LeaveTheGame - ', GetExceptionMessage); end;
+end;
+
+procedure TPestControl.OnWalkerEvent(walker: PRSWalker; position, destination: TPoint);
+begin
+  if (Self.State = EPestState.WALK_MID) and (Self.QuickPrayer) and (Self.ShouldEnablePrayer) then
+    Minimap.EnablePrayer();
+  Self.UpdateAndDrawHUD();
+end;
+
+procedure TPestControl.SetAttackTempo();
+var
+  bhInt: Int32;
+begin
+  bhInt := Trunc(bhM * 1000);
+
+  // XP Mean: 2573-3563ms
+  Self.Tempo.XPMean := 2573 + 990 * bhM;
+
+  // XP Stick: 0.20-0.38
+  Self.Tempo.XPStick := 0.20 + 0.18 * ((bhInt shr 5) mod 1000 / 1000.0);
+
+  Self.XPAttkDelay := ExpoGaussRT(Self.Tempo.XPMean, Self.RT_U1, Self.RT_U2);
+
+  // low Mean: 750-1000
+  Self.Tempo.LowMean := 750 + 350 * bhM;
+
+  // low Stick: 0.20-0.38
+  Self.Tempo.LowStick := 0.20 + 0.18 * (((bhInt shr 5) xor 913) mod 1000 / 1000.0);
+
+  Self.NextAttkDelay := ExpoGaussRT(Self.Tempo.LowMean, Self.RT_U1, Self.RT_U2);
+end;
+
+function GetbhM(salt: String = ''): Double;
+var
+  hashStr: String;
+  hashValue: UInt64;
+  r, eps: Double;
+begin
+  hashStr := HashString(EHashAlgo.SHA1, Profiles[ProfileIndex].Name + Profiles[ProfileIndex].Username + Salt);
+
+  // Use first 16 hex chars (8 bytes = 64 bits) for full Double precision
+  hashValue := StrToInt64('$' + Copy(hashStr, 1, 16));
+
+  r := hashValue / High(UInt64); // Normalize to 0.0 - 1.0
+
+  // patch only the impossible-for-math endpoints, keep everything else identical
+  eps := 1.0 / High(UInt64);         // ~5.42e-20
+  if r <= 0.0 then r := eps;         // replaces exact 0 only
+  if r >= 1.0 then r := 1.0 - eps;   // replaces exact 1 only
+
+  Result := r;
+end;
+
+procedure TStateTimer.Add(State: EPestState; Ms: Int64);
+begin
+  Self.Times[State] := Self.Times[State] + Ms;
+end;
+
+procedure TStateTimer.LogAll();
+var
+  State: EPestState;
+begin
+  WriteLn('=== State Time Report ===');
+  for State := Low(EPestState) to High(EPestState) do
+    if Self.Times[State] > 0 then
+      WriteLn(PadR(ToStr(State), 15), ' : ', FmtTime(Self.Times[State]));
+end;
+
+procedure TPestControl.OnBreakingHud(task: PBreakTask; var countdown: TCountdown);
+begin
+  Self.UpdateAndDrawHUD(True, False, countdown.Remaining, True);
+end;
+
+procedure TPestControl.OnSleepingHud(task: PSleepTask; var countdown: TCountdown);
+begin
+  Self.UpdateAndDrawHUD(False, True, countdown.Remaining, True);
+end;
+
+procedure TPestControl._OnPause();
+begin
+  WriteLn ProgressReport.Generate(ProgressReport.ValueProvider());
+  RSClient.EnableRealInput();
+  RSClient.Canvas.Clear();
+end;
+
+procedure TPestControl._OnResume();
+begin
+  RSClient.DisableRealInput();
+end;
+
+
+procedure TPestControl._OnTermination();
+begin
+  WriteLn ProgressReport.Generate(ProgressReport.ValueProvider());
+  Self.StateTimer.LogAll();
+  Writeln('STATE ON TERMINATION: '+ToStr(Self.State));
+  RSClient.Canvas.Clear;
+  RSClient.EnableRealInput();
+end;
+
+procedure _InitPCData();
+begin
+  PCData.GameIsland := [];
+  PCData.OutpostIsland := [];
+
+
+  PCData.Nov.AtPlank := [10628, 39874];
+  PCData.Nov.PlankObj := [10632, 39874];
+  PCData.Nov.BoatBox := [];
+
+  PCData.Inter.AtPlank := [10576, 39854];
+  PCData.Inter.PlankObj := [10572, 39854];
+  PCData.Inter.BoatBox := [];
+
+  PCData.Vet.AtPlank := [10552, 39818];
+  PCData.Vet.PlankObj := [10548, 39818];
+  PCData.Vet.BoatBox := [10524, 39810, 10544, 39838];
+
+  PCData.Portals.W := [];
+  PCData.Portals.SW := [];
+  PCData.Portals.SE := [];
+  PCData.Portals.E := [];
+
+  PCData.Knight := [10624, 40062];
+  PCData.Spawn := [10632, 39994];
+  PCData.LeaveNPC := [10620, 40002];
+
+  PCData.OCR.ActivBox := [365, 121, 511, 131];
+  PCData.OCR.PointsBox := [72, 64, 123, 81];
+  PCData.OCR.ActivGreen := 40704;
+  PCData.OCR.ActivRed := 255;
+
+  PCData.OCR.W := [370, 53, 396, 68];
+  PCData.OCR.E := [406, 53, 434, 68];
+  PCData.OCR.SE := [445, 53, 470, 68];
+  PCData.OCR.SW := [484, 53, 507, 68];
+
+  PCData.OCR.Shield_W := [];
+  PCData.OCR.Shield_E := [];
+  PCData.OCR.Shield_SE := [];
+  PCData.OCR.Shield_SW := [];
+
+  PCData.OCR.KnightHP := [34, 39, 61, 54];
+end;
+
+procedure TPestControl.Init();
+begin
+  WriteLn('[INIT] Pest Control - SIMBA2000');
+  Logger.Setup('Pest Control JDS');
+  Logger.RepeatedMessages := True;
+  ProgressReport.Setup(
+    'Pest Control JDS',
+    [
+      'Total   runtime:', 'Active  runtime:', 'Antiban runtime:',
+      'Next sleep:', 'Games Won:', 'Wins/Hour:', 'Points Earned:',
+      'Points/Hour:', 'Actions:'
+    ],
+    @Self.GetReportValues,
+    Round(ONE_MINUTE*2.5)
+  );
+  Antiban.OnBreaking := @Self.OnBreakingHud;
+  Antiban.OnSleeping := @Self.OnSleepingHud;
+  AddOnTerminate(@Self._OnTermination);
+  AddOnPause(@Self._OnPause);
+  AddOnResume(@Self._OnResume);
+  _InitPCData();
+  bhM := GetbhM();
+  _P1 := GetbhM('U_Prayer1');
+  _P2 := GetbhM('U_Prayer2');
+  _P3 := GetbhM('U_Prayer3');
+  writeln('[INIT] bhM: ', bhM);
+  self.bRT := 180+120*bhM; // 180-300ms, uniform
+  Self.RT_U1 := GetbhM('RT_U1');
+  Self.RT_U2 := GetbhM('RT_U2');
+  Self.RTC_U := GetbhM('RTC_U');//deterministic U for forgetting last attack
+  Self.SetAttackTempo();
+  Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
+  // Map setup
+  Map.Setup([Chunk(Box(40,41,41,41), 0)]); //pc boat area
+  Map.Add([Chunk(Box(41,40,41,40), 0)]); //pc game area
+  Map.Walker.OnWaitMovingEvent := @Self.OnWalkerEvent;
+  Self.Center := PCData.Knight.Offset(2, 0);
+  Self.Squire := TRSEntity.Create(@Map.Walker, [1, 1, 4], 5, [PCData.LeaveNPC], ['to Squire', 'Talk-to'], [ERSMinimapDot.NPC]);
+  Self.Shifter := TRSEntity.Create(
+    @Map.Walker,
+    [1, 1, 1],
+    14 + Round(3*bhM),
+    [PCData.Knight],
+    ['tack Shifter', 'Attack Shifter'],
+    [ERSMinimapDot.NPC]
+  );
+
+  // Initialize stats
+  Self.Start := Time;
+  Self.GameStart := Time;
+  Self.GamesWon := -1;
+  Self.PtsTotal := -1;
+  Self.PtsStart := -1;
+  Self.CombatLevel := -1;
+  
+  // Antiban setup
+  Antiban.Zoom.Min := 30;
+  Antiban.Zoom.Max := 50;
+  Antiban.Skills := [ERSSkill.RANGED, ERSSkill.MAGIC, ERSSkill.PRAYER, ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.TOTAL];
+  
+  Activity.Restart();
+  
+  WriteLn('[INIT] Initialization complete');
+end;
+
+procedure TPestControl.Run();
+var
+  nState: EPestState;
+  tRand: Int32;
+  breakOrSleep: Boolean;
+begin
+  Self.Init();
+  tRand := Random(150);
+  Profiles[ProfileIndex].Worlds := [344];
+
+  Self.State := EPestState.INIT;
+
+  repeat
+    nState := Self.GetState();
+    if nState <> self.State then
+    begin
+      if Self.State <> EPestState.INIT then  // skip initial
+        Self.StateTimer.Add(Self.State, Time - Self.StateT);
+      Self.StateT := Time;
+      Self.State := nState;
+      Self.UpdateAndDrawHUD(False, False, 0, True);
+      Logger.Info('[STATE] ' + ToStr(Self.State));
+    end else
+    begin
+      Self.State := nState;
+      Self.UpdateAndDrawHUD();
+    end;
+    ProgressReport.Print();
+    breakOrSleep := (Self.State in [EPestState.AT_PLANK, EPestState.UNKNOWN]) or
+                ((bhM < 0.3814) and (Self.State = EPestState.IN_BOAT)) or (bhM < 0.0814);
+    Antiban.DoAntiban(True, breakOrSleep, breakOrSleep);
+    case Self.State of
+      EPestState.UNKNOWN:begin
+                          Sleep(LogNormalInt(500, 0.35));
+                          Writeln('[UNKNOWN STATE]', FormatMilliseconds(Logger.TimeRunning.Elapsed, TIME_SHORT));
+                         end;
+      EPestState.LOGIN: Login.DoLogin();
+      EPestState.CMBT_LVL: Self.UpdateCmbtLvl();
+      
+      EPestState.IN_BOAT: Self.WhileInBoat();
+      
+      EPestState.WALK_MID: Self.WalkToDefend();
+      
+      EPestState.DEFEND: Self.DefendKnight();
+      EPestState.EXIT_GAME: Self.LeaveTheGame();
+      EPestState.AT_PLANK: Self.EnterBoat();
+      
+      EPestState.NO_ACTIVITY, EPestState.MAX_ACTIONS,
+      EPestState.MAX_TIME, EPestState.END_SCRIPT: Exit;
+    end;
+  until self.PtsTotal > (3400 + (400*bhM) + tRand);
+
+  Writeln('Total Points: ', Self.PtsTotal);
+  WriteLn('[COMPLETE] Thank you for using Pest Control JDS');
+  Self.StateTimer.LogAll();
+end;
+
+var
+  Form: TScriptForm;
+  PCConfig: TConfigJSON;
+  AutoStartTimer: TLazTimer;
+  CountdownLabel: TLazLabel;
+  TimerStartTime: UInt64;
+  DisplayTimer: TLazTimer;
+
+  // Form controls
+  ChkQuickPrayer: TLazCheckBox;
+  ChkChillIfActive: TLazCheckBox;
+  EditActiveThreshold: TLazEdit;
+  TLTrackActiveThresh: TLazTrackBar;
+  EditPointsPerWin: TLazComboBox;
+
+procedure OnAnyInteraction(sender: TLazObject);
+begin
+  if AutoStartTimer <> nil then
+  begin
+    AutoStartTimer.Enabled := False;
+    AutoStartTimer.Free();
+    AutoStartTimer := nil;
+  end;
+  if DisplayTimer <> nil then  // ADD THIS
+  begin
+    DisplayTimer.Enabled := False;
+    DisplayTimer.Free();
+    DisplayTimer := nil;
+  end;
+  if CountdownLabel <> nil then
+  begin
+    CountdownLabel.Free();
+    CountdownLabel := nil;
+  end;
+end;
+
+procedure OnSliderChanged(sender: TLazObject);
+begin
+  // Copy slider value into your existing LabeledEdit
+  EditActiveThreshold.text := IntToStr(EnsureRange(TLTrackActiveThresh.Position, 50, 100));
+end;
+
+procedure OnTimerTick(sender: TLazObject);
+begin
+  AutoStartTimer.Enabled := False;
+  WriteLn('[AUTO-START] Starting script');
+  Form.Start.Click();
+end;
+
+procedure UpdateCountdown(sender: TLazObject);
+var
+  elapsed, remaining: Int32;
+begin
+  elapsed := (Time - TimerStartTime) div 1000;
+  remaining := GUI_AUTO_START - elapsed;
+
+  if remaining > 0 then
+    CountdownLabel.Caption := 'Auto-start in ' + ToStr(remaining) + 's'
+  else
+    CountdownLabel.Caption := 'Starting...';
+end;
+
+procedure TScriptForm.StartAutoTimer(sender: TLazObject);
+var
+  bottomPanel: TLazPanel;
+begin
+  TimerStartTime := Time;
+
+  AutoStartTimer := TLazTimer.Create(Self.Form);
+  AutoStartTimer.Interval := GUI_AUTO_START*ONE_SECOND;
+  AutoStartTimer.OnTimer := @OnTimerTick;
+  AutoStartTimer.Enabled := True;
+
+  DisplayTimer := TLazTimer.Create(Self.Form);
+  DisplayTimer.Interval := 1000;
+  DisplayTimer.OnTimer := @UpdateCountdown;
+  DisplayTimer.Enabled := True;
+
+  // Find bottom panel (Start button's parent)
+  bottomPanel := TLazPanel(Self.Start.Parent);
+
+  CountdownLabel := TLazLabel.CreateEx(bottomPanel);
+  CountdownLabel.Caption := 'Auto-start in ' + ToStr(GUI_AUTO_START) + 's';
+  CountdownLabel.Font.Size := 9;
+  CountdownLabel.Font.Color := $0000FF;  // Red
+  CountdownLabel.Transparent := True;
+  CountdownLabel.Left := Self.Start.Left - 100;  // Left of Start button
+  CountdownLabel.Top := (bottomPanel.Height - 16) div 2;  // Centered vertically
+  CountdownLabel.Width := 100;
+  CountdownLabel.Height := 16;
+end;
+
+procedure TScriptForm.OnStart(sender: TLazObject); override;
+var
+  GoalT, GoalA: UInt64;
+begin
+  inherited;
+  RSClient.DisableRealInput();
+  GoalA := Self.Goals.Actions.Value;
+  GoalA := GoalA + Round(Random(GoalA*-0.13, GoalA*0.23));
+  PestControl.MaxActions := GoalA;
+  GoalT := Self.Goals.Time.Value * ONE_MINUTE;
+  GoalT := GoalT + Round(Random(GoalT*-0.13, GoalT*0.23));
+  PestControl.MaxTime := GoalT;
+
+  PestControl.QuickPrayer := ChkQuickPrayer.IsChecked();
+  PestControl.ChillIfActive := ChkChillIfActive.IsChecked();
+  PestControl.UserActiveThreshold := EnsureRange(StrToInt(EditActiveThreshold.Text, 50), 50, 100);
+  PestControl.PtsPerGame := StrToInt(EditPointsPerWin.text, 7);
+
+  if PCConfig.Data.Has('goal_actions') then
+    PCConfig.Data.Item['goal_actions'].AsInt := Self.Goals.Actions.Value
+  else
+    PCConfig.Data.AddInt('goal_actions', Self.Goals.Actions.Value);
+
+  if PCConfig.Data.Has('goal_time') then
+    PCConfig.Data.Item['goal_time'].AsInt := Self.Goals.Time.Value
+  else
+    PCConfig.Data.AddInt('goal_time', Self.Goals.Time.Value);
+
+  if PCConfig.Data.Has('quick_prayer') then
+    PCConfig.Data.Item['quick_prayer'].AsBool := PestControl.QuickPrayer
+  else
+    PCConfig.Data.AddBool('quick_prayer', PestControl.QuickPrayer);
+
+  if PCConfig.Data.Has('chill_if_active') then
+    PCConfig.Data.Item['chill_if_active'].AsBool := PestControl.ChillIfActive
+  else
+    PCConfig.Data.AddBool('chill_if_active', PestControl.ChillIfActive);
+
+  if PCConfig.Data.Has('active_threshold') then
+    PCConfig.Data.Item['active_threshold'].AsInt := PestControl.UserActiveThreshold
+  else
+    PCConfig.Data.AddInt('active_threshold', PestControl.UserActiveThreshold);
+
+  if PCConfig.Data.Has('points_per_win') then
+    PCConfig.Data.Item['points_per_win'].AsInt := PestControl.PtsPerGame
+  else
+    PCConfig.Data.AddInt('points_per_win', PestControl.PtsPerGame);
+
+  PCConfig.Save();
+end;
+
+procedure TScriptForm.Init();
+var
+  tab: TLazTabSheet;
+  goalsPanel, settingsPanel: TLazPanel;
+  lblQuickPrayer, lblChillActive, lblActiveThresh, lblPointsPerWin: TLazLabel;
+  y: Int32;
+begin
+  PCConfig.Setup('jds-pestcontrol');
+  Self.Setup('Pest Control JDS', PCConfig.Data);
+
+  if USE_AUTO_START then
+    Self.Form.OnShow := @Self.StartAutoTimer;
+
+  // ===== Settings Tab =====
+  tab := Self.CreateTab('Settings');
+
+  // Container panel for custom settings
+  settingsPanel := TLazPanel.CreateEx(tab);
+  settingsPanel.SetBounds(20, 20, 710, 280);
+  settingsPanel.BorderSpacing.Around := 10;
+
+  y := 20;
+
+  // Quick Prayer checkbox
+  lblQuickPrayer := TLazLabel.CreateEx(settingsPanel, 'Use Quick Prayer:', '', 20, y, 150, 25);
+  lblQuickPrayer.Font.Size := 10;
+  ChkQuickPrayer := TLazCheckBox.CreateEx(settingsPanel);
+  ChkQuickPrayer.SetBounds(180, y, 200, 25);
+  ChkQuickPrayer.Caption := 'Enable quick prayers during combat';
+  ChkQuickPrayer.SetChecked(True); // Default
+  Inc(y, 35);
+
+  // Chill if Active checkbox
+  lblChillActive := TLazLabel.CreateEx(settingsPanel, 'Chill if Active:', '', 20, y, 150, 25);
+  lblChillActive.Font.Size := 10;
+  ChkChillIfActive := TLazCheckBox.CreateEx(settingsPanel);
+  ChkChillIfActive.SetBounds(180, y, 250, 25);
+  ChkChillIfActive.Caption := 'Reduce activity if above threshold';
+  ChkChillIfActive.SetChecked(False); // Default
+  Inc(y, 35);
+
+  // Activity Threshold edit
+  lblActiveThresh := TLazLabel.CreateEx(settingsPanel, 'Activity Threshold (%):', '', 20, y, 150, 25);
+  lblActiveThresh.Font.Size := 10;
+  EditActiveThreshold := TLazEdit.CreateEx(settingsPanel);
+  EditActiveThreshold.SetBounds(180, y, 80, 25);
+  EditActiveThreshold.Text := '75';
+
+  TLTrackActiveThresh := TLazTrackBar.CreateEx(settingsPanel);
+  TLTrackActiveThresh.Frequency := 1;
+  TLTrackActiveThresh.SelStart := 50;
+  TLTrackActiveThresh.SelEnd := 100;
+  TLTrackActiveThresh.Min := 50;
+  TLTrackActiveThresh.Max := 100;
+  TLTrackActiveThresh.TickStyle := ELazStickStyle.None;
+  TLTrackActiveThresh.SetBounds(265, y, 200, 25);
+  TLTrackActiveThresh.ShowSelRange := True;
+  TLTrackActiveThresh.OnChange := @OnSliderChanged;
+
+  Inc(y, 35);
+
+  // Points Per Win edit
+  lblPointsPerWin := TLazLabel.CreateEx(settingsPanel, 'Points Per Win:', '', 20, y, 150, 25);
+  lblPointsPerWin.Font.Size := 10;
+  EditPointsPerWin := TLazComboBox.CreateEx(settingsPanel);
+  EditPointsPerWin.SetBounds(180, y, 80, 25);
+  EditPointsPerWin.Items.AddStrings(['3', '4', '5', '6', '7', '8']);
+  EditPointsPerWin.Text := '7';
+  Inc(y, 35);
+
+  // Load saved config
+  if PCConfig.Data.Has('quick_prayer') then
+    ChkQuickPrayer.SetChecked(PCConfig.Data.Item['quick_prayer'].AsBool);
+
+  if PCConfig.Data.Has('chill_if_active') then
+    ChkChillIfActive.SetChecked(PCConfig.Data.Item['chill_if_active'].AsBool);
+
+  if PCConfig.Data.Has('active_threshold') then
+  begin
+    EditActiveThreshold.Text := ToStr(PCConfig.Data.Item['active_threshold'].AsInt);
+    TLTrackActiveThresh.Position := PCConfig.Data.Item['active_threshold'].AsInt;
+  end;
+
+  if PCConfig.Data.Has('points_per_win') then
+    EditPointsPerWin.Text := ToStr(PCConfig.Data.Item['points_per_win'].AsInt);
+
+  // Goals panel at bottom
+  goalsPanel := Self.CreateGoals(tab, True, True, False, EOrientation.HORIZONTAL);
+  goalsPanel.Align := ELazAlign.Bottom;
+
+  // Load goal config
+  if PCConfig.Data.Has('goal_actions') then
+    Self.Goals.Actions.Value := PCConfig.Data.Item['goal_actions'].AsInt;
+
+  if PCConfig.Data.Has('goal_time') then
+    Self.Goals.Time.Value := PCConfig.Data.Item['goal_time'].AsInt;
+
+  // ===== Antiban Tab =====
+  Self.CreateAntibanTab();
+
+  // Hook interaction to all controls
+  ChkQuickPrayer.OnChange := @OnAnyInteraction;
+  ChkChillIfActive.OnChange := @OnAnyInteraction;
+  EditActiveThreshold.OnChange := @OnAnyInteraction;
+  EditPointsPerWin.OnChange := @OnAnyInteraction;
+  Self.Goals.Actions.OnChange := @OnAnyInteraction;
+  Self.Goals.Time.OnChange := @OnAnyInteraction;
+  Form.Run();
+end;
+
+begin
+  Form.Init();
+  PestControl.Run();
+end.
