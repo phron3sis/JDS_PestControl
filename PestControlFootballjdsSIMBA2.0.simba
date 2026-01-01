@@ -3,7 +3,7 @@
 {$DEFINE SCRIPT_GUI}
 {$I WaspLib/osrs.simba}
 const
-  USE_AUTO_START = True;//auto-start
+  USE_AUTO_START = TRUE;//auto-start
   GUI_AUTO_START = 30;  //delay(in seconds) before auto-starting
   USE_GAME_HUD   = TRUE;//draw HUD overlay with metrics
 type
@@ -120,7 +120,7 @@ type
 
 var
   PestControl: TPestControl;
-  bhM, _P1, _P2, _P3: Double;
+  bhM, _bhM, _P1, _P2, _P3: Double;
 
 // =============================================================================
 // HELPER FUNCTIONS - Distribution Math
@@ -890,61 +890,70 @@ begin
 end;
 
 procedure TPestControl.MoveInBoat();
+const
+  BOAT_BEHAV_SOUTH     = 0.53;
+  BOAT_BEHAV_OPPOSITE  = 0.70;
+  BOAT_BEHAV_AWAYPLANK = 0.85;
 var
-  anchor, target, current, opposite, center: TPoint;
-  useOpposite: Boolean;
   boatArea: TBox;
-  bhInt: Int32;
-  variance: Double;
-  mmP, msP, finalP: TPoint;
+  current, target, mean: TPoint;
+  destMS: TQuad;
+  weight, bias: Single;
+  primary, behavior: Int32;
 begin
-  Sleep(ExGaussInt(Self.bRT * 1.9));
   if Time < (Self.LastBoatMove + Self.BoatMoveDelay) then Exit;
   if not Self.InBoat() then Exit;
 
-  boatArea := Self.BoatBox.Expand(-4);
-  bhInt := Trunc(bhM * 1000);
-
-  // Anchor (consistent per account)
-  anchor.X := boatArea.X1 + (bhInt mod boatArea.Width);
-  anchor.Y := boatArea.Y1 + ((bhInt shr 8) mod boatArea.Height);
-
-  // Opposite of current position
+  boatArea := Self.BoatBox.Expand(Random(-4, 6 - Round(4 * bhM)));
   current := Map.Position();
-  opposite.X := boatArea.X2 - (current.X - boatArea.X1);
-  opposite.Y := boatArea.Y2 - (current.Y - boatArea.Y1);
 
-  // Pick anchor or opposite as center (bhM determines preference)
-  useOpposite := Random(100) < (bhInt mod 40); // 0-39% chance
-  if useOpposite then
-    center := opposite
+  if bhM < BOAT_BEHAV_SOUTH then primary := 0
+  else if bhM < BOAT_BEHAV_OPPOSITE then primary := 1
+  else if bhM < BOAT_BEHAV_AWAYPLANK then primary := 2
+  else primary := 3;
+
+  if Random() < 0.60 + 0.35 * bhM then
+    behavior := primary
   else
-    center := anchor;
+    behavior := Biometrics.RandomModeInteger(primary, 0, 3);
 
-  // Gaussian variance (allows full boat coverage)
-  variance := (boatArea.Width + boatArea.Height) / 4 * (0.3 + 0.3 * bhM);
+  case behavior of
+    0: mean := [boatArea.Center.X, boatArea.Y2 - boatArea.Height div 4];
+    1: mean := [boatArea.X2 - (current.X - boatArea.X1), boatArea.Y2 - (current.Y - boatArea.Y1)];
+    2: begin
+         mean.X := EnsureRange(boatArea.X2 - (Self.AtPlank.X - boatArea.X1), boatArea.X1, boatArea.X2);
+         mean.Y := EnsureRange(boatArea.Y2 - (Self.AtPlank.Y - boatArea.Y1), boatArea.Y1, boatArea.Y2);
+       end;
+    else mean := boatArea.RandomPoint();
+  end;
 
-  target.X := Round(GaussRand(center.X, variance));
-  target.Y := Round(GaussRand(center.Y, variance));
+  weight := 2 + 8 * bhM;      // 2-10
+  bias := 0.5 + 1.0 * _bhM;   // 0.5-1.5
 
-  target.X := EnsureRange(target.X, boatArea.X1, boatArea.X2);
-  target.Y := EnsureRange(target.Y, boatArea.Y1, boatArea.Y2);
-  mmP := Map.Walker.Point2MM(current, target, minimap.CompassRadians);
-  msP := Minimap.point2ms(mmP, Minimap.CompassRadians);
+  target := boatArea.RandomWeightedPoint(mean, weight, bias);
+  if current.DistanceTo(target) < 4 + 3 * bhM then
+    target := boatArea.RandomWeightedPoint(
+      [boatArea.X1 + boatArea.X2 - mean.X, boatArea.Y1 + boatArea.Y2 - mean.Y],
+      weight * 0.5, bias * 1.5);
 
-  finalP := msP.Offset(Random(-8, 8), Random(-8, 8));
-  finalP.X := EnsureRange(finalP.X, MainScreen.Bounds.X1, MainScreen.Bounds.X2);
-  finalP.Y := EnsureRange(finalP.Y, MainScreen.Bounds.Y1, MainScreen.Bounds.Y2);
+  destMS := Map.Walker.GetQuadMS(current, target, [1], Minimap.CompassRadians);
+  if not Mainscreen.Bounds.ContainsQuad(destMS) then
+    Exit;
+  if randomBoolean(0.1+0.8*bhm) and RandomBoolean(0.03348) then
+    Mouse.Move(Mainscreen.Bounds, True, EMouseDistribution.GAUSS)
+  else
+    Mouse.Move(destMS, True, EMouseDistribution.GAUSS);
 
-  Mouse.Move(finalP);
   Sleep(ExGaussInt(Self.bRT * 0.8));
-  if MainScreen.UpText.Contains('Walk here', false) then
-    Mouse.Click(EMouseButton.LEFT) else
-      if ChooseOption.Open() then
-        ChooseOption.Select('Walk here', false, true);
+  if not Self.InBoat() then Exit;
+
+  if MainScreen.IsUpText('Walk here') then
+    Mouse.Click(EMouseButton.LEFT)
+  else if ChooseOption.Open() then
+    ChooseOption.Select('Walk here');
 
   Self.LastBoatMove := Time;
-  Self.BoatMoveDelay := LogNormal(Self.bRT * 100 + Random(75, 100) * bhM, 0.33);
+  Self.BoatMoveDelay := LogNormal(Self.bRT * 100 + Random(75, 100) * bhM, 0.27 + 0.1 * bhM);
   Logger.Info('BoatMoveDelay: %.4f', [Self.BoatMoveDelay]);
 end;
 
@@ -1343,6 +1352,7 @@ begin
   AddOnResume(@Self._OnResume);
   _InitPCData();
   bhM := GetbhM();
+  _bhM := GetbhM('_bhM');
   _P1 := GetbhM('U_Prayer1');
   _P2 := GetbhM('U_Prayer2');
   _P3 := GetbhM('U_Prayer3');
@@ -1353,6 +1363,7 @@ begin
   Self.RTC_U := GetbhM('RTC_U');//deterministic U for forgetting last attack
   Self.SetAttackTempo();
   Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
+  Self.PrayerEnableTime := Self.PrayerSample();
   // Map setup
   Map.Setup([Chunk(Box(40,41,41,41), 0)]); //pc boat area
   Map.Add([Chunk(Box(41,40,41,40), 0)]); //pc game area
