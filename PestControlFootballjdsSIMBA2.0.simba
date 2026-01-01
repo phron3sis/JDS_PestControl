@@ -4,7 +4,7 @@
 {$I WaspLib/osrs.simba}
 const
   USE_AUTO_START = True;//auto-start
-  GUI_AUTO_START = 30;  //delay (in seconds) before auto-starting
+  GUI_AUTO_START = 30;  //delay(in seconds) before auto-starting
   USE_GAME_HUD   = TRUE;//draw HUD overlay with metrics
 type
   TPCTier = record
@@ -809,8 +809,10 @@ end;
 
 procedure TPestControl.UpdateCmbtLvl();
 const
+  CMBT_OVERRIDE: Int32 = 70;
   cbBox: TBox = [661, 229, 682, 244];
 begin
+  //Self.CombatLevel := CMBT_OVERRIDE;
   if GameTabs.Open(ERSGameTab.COMBAT) then
   begin
     Sleep(120, 300, ERandomDir.RIGHT);
@@ -841,19 +843,24 @@ begin
     Self.AtPlank := PCData.Inter.AtPlank;
     Self.CrossPlank := PCData.Inter.PlankObj;
 
+    //gold and brown shifter
     Self.Shifter.Finder.ColorClusters += [[
-      [2177290, 5, EColorSpace.HSL, [0.12, 6.09, 6.09]],
-      [3822370, 4, EColorSpace.HSL, [0.15, 0.81, 0.81]],
+      [$243E56, 1.203, EColorSpace.HSL, [1.022, 1.336, 0.644]],
+      [$23BEE5, 4.008, EColorSpace.HSL, [1.359, 0.417, 1.226]],
       3
     ]];
+
+    //red and black shifter
     Self.Shifter.Finder.ColorClusters += [[
-      [5066333, 5, EColorSpace.HSL, [0.23, 0.33, 0.33]],
-      [5263713, 4, EColorSpace.HSL, [0.30, 0.26, 0.26]],
+      [$505061, 1.477, EColorSpace.HSV, [0.737, 1.700, 0.564]],
+      [$2133BF, 0.717, EColorSpace.HSL, [1.267, 1.196, 0.539]],
       3
     ]];
+
+    //green shifter
     Self.Shifter.Finder.ColorClusters += [[
-      [2347498, 12, EColorSpace.HSL, [0.02, 1.15, 1.15]],
-      [2177617, 4, EColorSpace.HSL, [0.20, 0.90, 0.90]],
+      [$137C71, 1.936, EColorSpace.RGB, [0.534, 0.511, 1.957]],
+      [$3C5624, 0.965, EColorSpace.HSL, [1.251, 1.181, 0.570]],
       3
     ]];
   end
@@ -863,14 +870,16 @@ begin
     Self.AtPlank := PCData.Nov.AtPlank;
     Self.CrossPlank := PCData.Nov.PlankObj;
 
+    //red shifter
     Self.Shifter.Finder.ColorClusters += [[
-      [2107241, 5, EColorSpace.HSL, [0.09, 0.60, 0.60]],
-      [2173038, 4, EColorSpace.HSL, [0.11, 0.67, 0.67]],
+      [$2234C2, 0.738, EColorSpace.HSL, [1.289, 1.289, 0.424]],
+      [$242B76, 0.689, EColorSpace.HSL, [1.510, 0.899, 0.593]],
       3
     ]];
+    //green shifter
     Self.Shifter.Finder.ColorClusters += [[
-      [2177290, 5, EColorSpace.HSL, [0.12, 6.09, 6.09]],
-      [3822370, 4, EColorSpace.HSL, [0.15, 0.81, 0.81]],
+      [$137C71, 1.936, EColorSpace.RGB, [0.534, 0.511, 1.957]],
+      [$3C5624, 0.965, EColorSpace.HSL, [1.251, 1.181, 0.570]],
       3
     ]];
   end
@@ -963,7 +972,7 @@ begin
   if Chat.IsTitle('~ Warning ~') then
     TerminateScript('Too many points '+Chat.ReadPointsOption());
   try
-    if Self.Gangplank.WalkClick() then
+    if Self.Gangplank.Click(True, 1 + Round(3*bhM)) then
       if SleepUntil(Self.InBoat, 50, Round(GaussRand(3000, 200))) then
       begin
         //once a game stuff here
@@ -1149,14 +1158,18 @@ end;
 procedure TPestControl.LeaveTheGame();
 begin
   if not Self.InGame() then Exit;
-  if Self.ReadPortalHP = 0 then Exit;
+  if Self.ReadPortalHP <= 0 then Exit;
   Sleep(ExGaussInt(Self.bRT * 3.3));
   if not Self.InGame() then Exit;
   try
     Writeln('Distance to Squire: ', Self.Squire.DistanceTo(Map.Position()));
-    Map.Walker.WebWalk(Self.Squire.Coordinates[0].Offset(Random(-5, 5), Random(5, 10)), 5, 0.2+0.5*bhM);
     if not Self.InGame() then Exit;
-    if Self.Squire.Interact(['Leave Squire', 'eave Squire'], 1) then
+    if Self.Squire.DistanceTo(Map.Position()) > (8+Random(4)+Round(5*bhm)) then
+      if Map.Walker.WebWalk(Self.Squire.Coordinates[0].Offset(Random(-5, 5),
+        Random(5, 10)), 3+Round(3*(bhM)), 0.2+0.5*bhM) then
+          Writeln('Walked towards Squire');
+    if not Self.InGame() then Exit;
+    if Self.Squire.Interact(['Leave Squire', 'eave Squire'], 1+Round(5*bhM)) then
     begin
       WriteLn('Left game at ', FormatMilliseconds(GetTimeRunning, TIME_SHORT));
       SleepUntil(not Self.InGame(), Round(200+random(200)), Round(17000+9000*bhM));
@@ -1271,11 +1284,11 @@ begin
 
   PCData.Nov.AtPlank := [10628, 39874];
   PCData.Nov.PlankObj := [10632, 39874];
-  PCData.Nov.BoatBox := [];
+  PCData.Nov.BoatBox := [10640, 39858, 10652, 39878];
 
   PCData.Inter.AtPlank := [10576, 39854];
   PCData.Inter.PlankObj := [10572, 39854];
-  PCData.Inter.BoatBox := [];
+  PCData.Inter.BoatBox := [10552, 39842, 10564, 39862];
 
   PCData.Vet.AtPlank := [10552, 39818];
   PCData.Vet.PlankObj := [10548, 39818];
