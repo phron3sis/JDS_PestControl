@@ -1374,6 +1374,7 @@ begin
   Map.Setup([Chunk(Box(40,41,41,41), 0)]); //pc boat area
   Map.Add([Chunk(Box(41,40,41,40), 0)]); //pc game area
   Map.Walker.OnWaitMovingEvent := @Self.OnWalkerEvent;
+  Map.Walker.OnWalkEvent := @Self.OnWalkerEvent;
   Self.Center := PCData.Knight.Offset(2, 0);
   Self.Squire := TRSEntity.Create(@Map.Walker, [1, 1, 4], 5, [PCData.LeaveNPC], ['to Squire', 'Talk-to'], [ERSMinimapDot.NPC]);
   Self.Shifter := TRSEntity.Create(
