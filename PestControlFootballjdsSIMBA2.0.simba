@@ -7,27 +7,25 @@ const
   GUI_AUTO_START = 30;  //delay(in seconds) before auto-starting
   USE_GAME_HUD   = TRUE;//draw HUD overlay with metrics
 type
-  TPCTier = record
-    AtPlank, PlankObj: TPoint;
-    BoatBox: TBox;
-  end;
-
-  TPCPortals = record
-    W, SW, SE, E: TPoint;
-  end;
-
-  TPCOCR = record
-    KnightHP: TBox;
-    ActivBox, PointsBox, W, E, SE, SW: TBox;
-    Shield_W, Shield_E, Shield_SE, Shield_SW: TBox;
-    ActivGreen, ActivRed: Int32;
-  end;
-
   TPestControlGameData = record
-    Nov, Inter, Vet: TPCTier;
-    Portals: TPCPortals;
+    Nov, Inter, Vet: record
+      AtPlank, PlankObj: TPoint;
+      BoatBox: TBox;
+    end;
+
+    Portals: record
+      W, SW, SE, E: TPoint;
+    end;
+
     Knight, Spawn, LeaveNPC: TPoint;
-    OCR: TPCOCR;
+
+    OCR: record
+      KnightHP: TBox;
+      ActivBox, PointsBox, W, E, SE, SW: TBox;
+      Shield_W, Shield_E, Shield_SE, Shield_SW: TBox;
+      ActivGreen, ActivRed: Int32;
+    end;
+
     GameIsland, OutpostIsland: TBox;
   end;
 
@@ -58,18 +56,20 @@ type
 // =============================================================================
 type
   TAttackTempo = record
-    XPMean: Double;         // see SetAttackTempo
-    XPStick: Double;        // 0.20-0.38
-    LowMean: Double;        // see SetAttackTempo
-    LowStick: Double;       // 0.20-0.38
+    XPMean, XPStick, LowMean, LowStick: Double;
   end;
-type
   TStateTimer = record
     Times: array[EPestState] of Int64;  // milliseconds per state
   end;
 
 type
   TPestControl = record
+
+    // Account unique decisions
+    Flag: record
+      NoPray, NoLeave: Boolean;
+    end;
+
     State: EPestState;
     StateT: UInt64;//track state time
     StateTimer: TStateTimer;
@@ -81,7 +81,7 @@ type
     // Objects & Entities  
     Gangplank: TRSObject;
     Squire, Shifter: TRSEntity;
-    
+
     // Timing
     bRT, RT_U1, RT_U2, RTC_U: Double;
     Tempo: TAttackTempo;
@@ -371,7 +371,7 @@ end;
 
 procedure TPestControl.UpdateAndDrawHUD(onBreak: Boolean = False; onSleep: Boolean = False; remaining: UInt64 = 0; Force: Boolean = False);
 const
-  REFRESH_RATE = 250;//milliseconds
+  REFRESH_RATE = 500;//milliseconds
   HUD_BG_COLOR = $181818;
   HUD_BORDER_COLOR = $404040;
   HUD_HEADER_TEXT = $3B9FFF;
@@ -394,6 +394,7 @@ var
   xLabel, xVal, xRate, y, fullWidth, filledWidth, thrX, totalWidth: Int32;
   activityValue, runtimeStr, stateStr, winsStr, winsHrStr, ptsStr, ptsHrStr, portalStr: String;
   xpStr, xpHrStr, prayerStr, atkDelayStr, breakStr, sleepStr, maxActStr, maxTimeStr: String;
+  breakRemain, sleepRemain: String;
   barColor, valueColor, actPercent, currentMinutes, xPos: Int32;
 
   function DrawSep(cy: Int32): Int32;
@@ -428,13 +429,16 @@ begin
   ptsPerHour := (Self.PtsEarned / Max(1, elapsed)) * ONE_HOUR;
   xpPerHour := (XPBar.TotalEarnedXP() / Max(1, elapsed)) * ONE_HOUR;
 
-  runtimeStr := FormatMilliseconds(elapsed, TIME_SHORT);
+  runtimeStr := FormatMilliseconds(GetTimeRunning, TIME_SHORT);
   stateStr := ToStr(Self.State).After('EPestState.');
 
+  breakRemain := '';
+  sleepRemain := '';
   if onBreak then
   begin
     breakStr := FormatMilliseconds(remaining, TIME_SHORT);
     stateStr := 'ON_BREAK';
+    breakRemain := 'remaining';
   end else
   begin
     breakStr := 'None';
@@ -445,6 +449,7 @@ begin
   begin
     sleepStr := FormatMilliseconds(remaining, TIME_SHORT);
     stateStr := 'ON_SLEEP';
+    sleepRemain := 'remaining';
   end else
   begin
     sleepStr := 'None';
@@ -563,8 +568,8 @@ begin
       y := DrawRow('State', stateStr, y, FmtTime(Time-Self.GameStart))
     else
       y := DrawRow('State', stateStr, y, FmtTime(Time-Self.StateT));
-    y := DrawRow('Break', breakStr, y);
-    y := DrawRow('Sleep', sleepStr, y);
+    y := DrawRow('Break', breakStr, y, breakRemain);
+    y := DrawRow('Sleep', sleepStr, y, sleepRemain);
     y := DrawSep(y);
     y := DrawRow('Wins', winsStr, y, winsHrStr + '/hr');
     y := DrawRow('Points', ptsStr, y, ptsHrStr + '/hr');
@@ -772,18 +777,16 @@ begin
 
   if Self.InGame() then
   begin
-    if Self.ReadActivityBar() < 1 then
-      Exit(EPestState.EXIT_GAME);
+    if not Self.Flag.NoLeave and (Self.ReadPortalHP >= 50+199*bhM)
+      and (Self.ReadActivityBar() < 1) then
+        Exit(EPestState.EXIT_GAME);
     if Self.AtKnight() then Exit(EPestState.DEFEND);
     Exit(EPestState.WALK_MID);
   end;
   tmpP := Map.Position();
   if Self.AtBoatPlank(tmpP) then
     Exit(EPestState.AT_PLANK);
-  try
-    if Map.Walker.WebGraph^.PathBetween(Self.AtPlank, tmpP) <> [] then
-      Exit(EPestState.AT_PLANK);
-  except writeln(GetExceptionLocationStr); writeln(GetExceptionMessage); end;
+
   result := EPestState.UNKNOWN;
 end;
 
@@ -809,14 +812,12 @@ end;
 
 procedure TPestControl.UpdateCmbtLvl();
 const
-  CMBT_OVERRIDE: Int32 = 70;
   cbBox: TBox = [661, 229, 682, 244];
 begin
-  //Self.CombatLevel := CMBT_OVERRIDE;
   if GameTabs.Open(ERSGameTab.COMBAT) then
   begin
-    Sleep(120, 300, ERandomDir.RIGHT);
-    Self.CombatLevel := OCR.RecognizeNumber(cbBox, RSFonts.PLAIN_11, [2070783], 0);
+    Sleep(ExGaussInt(Self.bRT));
+    Self.CombatLevel := OCR.RecognizeNumber(cbBox.Expand(3), RSFonts.PLAIN_11, [2070783], 0);
     Logger.Info('Combat Level: %d', [Self.CombatLevel]);
   end;
   XPBar.Read;
@@ -975,6 +976,20 @@ begin
   result := ToStr(result.ExtractInteger());
 end;
 
+procedure TPestControl.SetPerGame();
+begin
+  Self.Flag.NoPray := RandomBoolean(0.001347 + 0.026438 * bhM);
+  Self.Flag.NoLeave := RandomBoolean(0.00173 + 0.09573 * _bhM);
+  Self.PrayerEnableTime := Self.PrayerSample();
+  Logger.Info('Self.PrayerEnableTime: %.4f', [Self.PrayerEnableTime]);
+  if RandomBoolean(bhM) then
+    Self.LastBoatMove := Time;
+  Self.ReadPoints();
+  Activity.Restart();
+  Self.Actions+=1;
+  Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
+end;
+
 procedure TPestControl.EnterBoat();
 begin
   Sleep(ExGaussInt(Self.bRT * 2.9));
@@ -984,50 +999,42 @@ begin
     if Self.Gangplank.Click(True, 1 + Round(3*bhM)) then
       if SleepUntil(Self.InBoat, 50, Round(GaussRand(3000, 200))) then
       begin
-        //once a game stuff here
-        Self.PrayerEnableTime := Self.PrayerSample();
-        Logger.Info('Self.PrayerEnableTime: %.4f', [Self.PrayerEnableTime]);
-        if RandomBoolean(bhM) then
-          Self.LastBoatMove := Time;
-        Self.ReadPoints();
-        Activity.Restart();
-        Self.Actions+=1;
-        Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
+        Self.SetPerGame();
         Sleep(ExGaussInt(Self.bRT * 3.9));
-        Self.CoinCountC := Inventory.Items.CountEx('Coins');
-        if Self.CoinCountS < 1 then Self.CoinCountS := Self.CoinCountC;
         if not InRange(Options.GetZoomLevel(True), 30, 50) then
           if Options.SetZoomLevel(RandomMode(35+Round(10*bhm), 30, 50)) then
             WriteLn GetDebugLn('Options', 'Zoom adjusted level: ' + ToString(Options.ZoomLevel), ELogLevel.SUCCESS);
         Exit;
       end;
   except Logger.Error('Exception in EnterBoat: %s', [GetExceptionMessage]); end;
-  if not Self.InBoat() and not Self.InGame() then
-    try
-      Map.Walker.WebWalk(Self.AtPlank, 0, 0, False);
-    except Logger.Error('Exception walk to plank: %s', [GetExceptionMessage]); end;
 end;
 
-function TPestControl.ShouldEnablePrayer(): Boolean;
+procedure TPestControl.EnablePrayerCheck();
 begin
-  Result := False;
-  if (Self.GameStarted) and Self.InGame() and  Self.QuickPrayer then
-    Result := Time > (Self.GameStart + Self.PrayerEnableTime);
+  if not (Self.Flag.NoPray) and Self.QuickPrayer and Self.GameStarted
+    and Self.InGame() and (Time > (Self.GameStart + Self.PrayerEnableTime)) then
+    if not Minimap.PrayerEnabled then
+      if Minimap.EnablePrayer() then
+      begin
+        if Biometrics.RandomBoolean() then
+          Sleep(ExGaussInt(Self.bRT*(1.1+random(0.0, 2.1))));
+        if Biometrics.RandomBoolean(0.23) then
+          Mouse.Move(Mainscreen.Bounds, True);
+      end;
 end;
 
 procedure TPestControl.WalkToDefend();
 var
   uniqueMiddle, midP, msP: TPoint;
 begin
-  Sleep(ExGaussInt(Self.bRT * 1.1));
+  Sleep(ExGaussInt(Self.bRT * 1.7));
   if not Self.InGame() then Exit;
   if not Self.GameStarted then
   begin
     Self.GameStarted := True;
     Self.GameStart := Time;
   end;
-  if Self.QuickPrayer and (Self.ShouldEnablePrayer) then
-    Minimap.EnablePrayer();
+  Self.EnablePrayerCheck();
   if Self.PlatformCenter(midP) then
   begin
     uniqueMiddle := midP;
@@ -1141,17 +1148,12 @@ end;
 
 procedure TPestControl.DefendKnight();
 begin
-  Sleep(ExGaussInt(Self.bRT));
+  Sleep(ExGaussInt(Self.bRT*0.8));
   Self.UpdateXP();
   if (Time - Self.LastXPTime) < Self.XPAttkDelay then Exit;
   if (Time - Self.LastAttack) < Self.NextAttkDelay then Exit;
   if not Self.InGame() then Exit;
-  if Self.QuickPrayer and (Self.ShouldEnablePrayer) then
-    if Self.InGame() then
-    begin
-      Minimap.EnablePrayer();
-      Sleep(ExGaussInt(Self.bRT));
-    end;
+  Self.EnablePrayerCheck();
 
   if Self.AttackShifter({$IFDEF DEBUGSHIFTERS}True{$ELSE}False{$ENDIF}) then
   begin
@@ -1159,15 +1161,12 @@ begin
     Self.LastAttack := Time;
     Self.UpdateAttkDelay();
     Sleep(ExGaussInt(Self.bRT*2.2));
-  end
-  else
-    Sleep(ExGaussInt(Self.bRT*1.5));
+  end;
 end;
 
 procedure TPestControl.LeaveTheGame();
 begin
   if not Self.InGame() then Exit;
-  if Self.ReadPortalHP <= 0 then Exit;
   Sleep(ExGaussInt(Self.bRT * 3.3));
   if not Self.InGame() then Exit;
   try
@@ -1189,8 +1188,13 @@ end;
 
 procedure TPestControl.OnWalkerEvent(walker: PRSWalker; position, destination: TPoint);
 begin
-  if (Self.State = EPestState.WALK_MID) and (Self.QuickPrayer) and (Self.ShouldEnablePrayer) then
-    Minimap.EnablePrayer();
+  if not Self.InGame() then
+  begin
+    walker^.Walking := False;
+    Exit;
+  end;
+  if (Self.State = EPestState.WALK_MID) then
+    Self.EnablePrayerCheck();
   Self.UpdateAndDrawHUD();
 end;
 
@@ -1287,8 +1291,10 @@ end;
 
 procedure _InitPCData();
 begin
-  PCData.GameIsland := [];
-  PCData.OutpostIsland := [];
+  PCData.GameIsland := RSTranslator.Chunk2Coordinate(Box(41,40,41,40));
+  writeln(PCData.GameIsland);
+  PCData.OutpostIsland :=RSTranslator.Chunk2Coordinate(Box(40,41,41,41));
+  writeln(PCData.OutpostIsland);
 
 
   PCData.Nov.AtPlank := [10628, 39874];
