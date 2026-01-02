@@ -652,7 +652,7 @@ begin
     DrawBoxFilled(Box(abox.X1 + 6, footerBox.Y1, abox.X2 - 6, footerBox.Y1 + SEP_HEIGHT - 1));
     FontSize := 12;
     DrawColor := HUD_HEADER_TEXT;
-    DrawText('Author: Footballjds', Point(abox.X1 + PAD, footerBox.Y1 + 5));
+    DrawText('Author: footballjds', Point(abox.X1 + PAD, footerBox.Y1 + 5));
 
     EndUpdate();
   end;
@@ -1715,6 +1715,7 @@ begin
 end;
 
 begin
+  ClearSimbaOutput();
   Form.Init();
   PestControl.Run();
 end.
