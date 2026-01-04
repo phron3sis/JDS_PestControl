@@ -3,9 +3,9 @@
 {$DEFINE SCRIPT_GUI}
 {$I WaspLib/osrs.simba}
 const
-  USE_AUTO_START = TRUE;//auto-start
-  GUI_AUTO_START = 30;  //delay(in seconds) before auto-starting
-  USE_GAME_HUD   = TRUE;//draw HUD overlay with metrics
+  USE_AUTO_START    = TRUE;//auto-start
+  AUTO_START_DELAY  = 15;  //delay(in seconds) before auto-starting
+  USE_GAME_HUD      = TRUE;//draw HUD overlay with metrics
 type
   TPestControlGameData = record
     Nov, Inter, Vet: record
@@ -126,9 +126,10 @@ type
     
     // Config
     CombatLevel: Int32;
+    UserDisableHUD, UserDisableMoveInBoat, UserDisablePace, UserDisableLeaveGame: Boolean;
     Actions, MaxActions, MaxTime: UInt64;
-    UserActiveThreshold: Int32;
-    QuickPrayer, ChillIfActive: Boolean;
+    UserActiveThreshold, UserCombatLevel: Int32;
+    UserQuickPrayer, UserChillIfActive: Boolean;
   end;
 
 var
@@ -266,42 +267,6 @@ begin
       Exit(Self[i].U);
   Writeln GetDebugLn('Salt not found: ' + salt, ELogLevel.ERROR, True);
 end;
-
-function GetbhMs(salts: TStringArray): TDoubleArray;
-var
-  hashStr, output: String;
-  hashValue: UInt64;
-  eps: double = 5.42101086242752E-20;
-  r: Double;
-  i: Int32;
-begin
-  for i := 0 to salts.High do
-  begin
-    hashStr := HashString(EHashAlgo.SHA1, Profiles[ProfileIndex].Name + Profiles[ProfileIndex].Username + salts[i]);
-
-    // Use first 16 hex chars (8 bytes = 64 bits) for full Double precision
-    hashValue := StrToInt64('$' + Copy(hashStr, 1, 16));
-
-    r := hashValue / High(UInt64); // Normalize to 0.0 - 1.0
-
-    // patch only the impossible-for-math endpoints
-    if r <= 0.0 then r := eps;         // replaces exact 0 only
-    if r >= 1.0 then r := 1.0 - eps;   // replaces exact 1 only
-
-    Result += r;
-    if salts[i].Length < 1 then
-      output+='Default';
-    output+=PadR(salts[i]+':', 19, ' ');
-  end;
-  Writeln(output);
-  Writeln(ToStr(Result).trim(['[', ',', ']']));
-end;
-
-function GetbhM(salt: String = ''): Double;
-begin
-  Result := GetbhMs([salt])[0];
-end;
-
 
 //override include to set zoom if it is wrong
 function TRSOptions.GetZoomLevel(useCache: Boolean = True): Integer; override;
@@ -509,7 +474,7 @@ var
   end;
 
 begin
-  if not USE_GAME_HUD then Exit;
+  if Self.UserDisableHUD or not USE_GAME_HUD then Exit;
   if ((Time - Self.HUDLastUpdate) < REFRESH_RATE) and
     not Force then Exit;
   Self.HUDLastUpdate := Time;
@@ -562,7 +527,7 @@ begin
     atkDelayStr := FormatFloat('#,##0', Round(Self.NextAttkDelay)) + 'ms';
 
   prayerStr := 'N/A';
-  if Self.QuickPrayer then
+  if Self.UserQuickPrayer then
     prayerStr := FormatFloat('#,##0', Round(Self.PrayerEnableTime)) + 'ms';
 
   maxActStr := '';
@@ -871,7 +836,7 @@ begin
 
   if Self.InGame() then
   begin
-    if not Self.Flag.NoLeave and (Self.ReadPortalHP >= 50+199*bhM.U)
+    if not Self.UserDisableLeaveGame and not Self.Flag.NoLeave and (Self.ReadPortalHP >= 50+199*bhM.U)
       and (Self.ReadActivityBar() < 1) then
         Exit(EPestState.EXIT_GAME);
     if Self.AtKnight() then Exit(EPestState.DEFEND);
@@ -908,12 +873,15 @@ procedure TPestControl.UpdateCmbtLvl();
 const
   cbBox: TBox = [661, 229, 682, 244];
 begin
-  if GameTabs.Open(ERSGameTab.COMBAT) then
-  begin
-    Sleep(ExGaussInt(Self.bRT));
-    Self.CombatLevel := OCR.RecognizeNumber(cbBox.Expand(3), RSFonts.PLAIN_11, [2070783], 0);
-    Logger.Info('Combat Level: %d', [Self.CombatLevel]);
-  end;
+  if InRange(Self.UserCombatLevel, 40, 126) then
+    Self.CombatLevel := Self.UserCombatLevel
+  else
+    if GameTabs.Open(ERSGameTab.COMBAT) then
+    begin
+      Sleep(ExGaussInt(Self.bRT));
+      Self.CombatLevel := OCR.RecognizeNumber(cbBox.Expand(3), RSFonts.PLAIN_11, [2070783], 0);
+    end;
+  Logger.Info('Combat Level: %d', [Self.CombatLevel]);
   XPBar.Read;
   if Self.CombatLevel >= 100 then
   begin
@@ -1055,7 +1023,7 @@ end;
 
 procedure TPestControl.WhileInBoat();
 begin
-  Self.MoveInBoat();
+  if not Self.UserDisableMoveInBoat then Self.MoveInBoat();
 end;
 
 //function from include, I am not author
@@ -1097,6 +1065,11 @@ begin
   Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
 end;
 
+procedure TPestContorl.EnterBoatFailsafe();
+begin
+
+end;
+
 procedure TPestControl.EnterBoat();
 begin
   Sleep(ExGaussInt(Self.bRT * 2.9));
@@ -1118,7 +1091,7 @@ end;
 
 procedure TPestControl.EnablePrayerCheck();
 begin
-  if not (Self.Flag.NoPray) and Self.QuickPrayer and Self.GameStarted
+  if not (Self.Flag.NoPray) and Self.UserQuickPrayer and Self.GameStarted
     and Self.InGame() and (Time > (Self.GameStart + Self.PrayerEnableTime)) then
     if not Minimap.PrayerEnabled then
       if Minimap.EnablePrayer() then
@@ -1720,10 +1693,10 @@ var
   CountdownLabel: TLazLabel;
   TimerStartTime: UInt64;
   DisplayTimer: TLazTimer;
-
   // Form controls
-  ChkQuickPrayer: TLazCheckBox;
-  ChkChillIfActive: TLazCheckBox;
+  ChkQuickPrayer, ChkChillIfActive: TLazCheckBox;
+  ChkDisableHUD, ChkDisableMoveInBoat, ChkDisablePace, ChkDisableLeaveGame: TLazCheckBox;
+  EditCombatLevel: TLazEdit;
   EditActiveThreshold: TLazEdit;
   TLTrackActiveThresh: TLazTrackBar;
   EditPointsPerWin: TLazComboBox;
@@ -1767,7 +1740,7 @@ var
   elapsed, remaining: Int32;
 begin
   elapsed := (Time - TimerStartTime) div 1000;
-  remaining := GUI_AUTO_START - elapsed;
+  remaining := AUTO_START_DELAY - elapsed;
 
   if remaining > 0 then
     CountdownLabel.Caption := 'Auto-start in ' + ToStr(remaining) + 's'
@@ -1782,7 +1755,7 @@ begin
   TimerStartTime := Time;
 
   AutoStartTimer := TLazTimer.Create(Self.Form);
-  AutoStartTimer.Interval := GUI_AUTO_START*ONE_SECOND;
+  AutoStartTimer.Interval := AUTO_START_DELAY*ONE_SECOND;
   AutoStartTimer.OnTimer := @OnTimerTick;
   AutoStartTimer.Enabled := True;
 
@@ -1795,7 +1768,7 @@ begin
   bottomPanel := TLazPanel(Self.Start.Parent);
 
   CountdownLabel := TLazLabel.CreateEx(bottomPanel);
-  CountdownLabel.Caption := 'Auto-start in ' + ToStr(GUI_AUTO_START) + 's';
+  CountdownLabel.Caption := 'Auto-start in ' + ToStr(AUTO_START_DELAY) + 's';
   CountdownLabel.Font.Size := 9;
   CountdownLabel.Font.Color := $0000FF;  // Red
   CountdownLabel.Transparent := True;
@@ -1818,10 +1791,15 @@ begin
   GoalT := GoalT + Round(Random(GoalT*-0.13, GoalT*0.23));
   PestControl.MaxTime := GoalT;
 
-  PestControl.QuickPrayer := ChkQuickPrayer.IsChecked();
-  PestControl.ChillIfActive := ChkChillIfActive.IsChecked();
+  PestControl.UserQuickPrayer := ChkQuickPrayer.IsChecked();
+  PestControl.UserChillIfActive := ChkChillIfActive.IsChecked();
   PestControl.UserActiveThreshold := EnsureRange(StrToInt(EditActiveThreshold.Text, 50), 50, 100);
   PestControl.PtsPerGame := StrToInt(EditPointsPerWin.text, 7);
+  PestControl.UserDisableHUD := ChkDisableHUD.IsChecked();
+  PestControl.UserDisableMoveInBoat := ChkDisableMoveInBoat.IsChecked();
+  PestControl.UserDisablePace := ChkDisablePace.IsChecked();
+  PestControl.UserDisableLeaveGame := ChkDisableLeaveGame.IsChecked();
+  PestControl.UserCombatLevel := StrToInt(EditCombatLevel.Text, 100);
 
   if PCConfig.Data.Has('goal_actions') then
     PCConfig.Data.Item['goal_actions'].AsInt := Self.Goals.Actions.Value
@@ -1834,14 +1812,14 @@ begin
     PCConfig.Data.AddInt('goal_time', Self.Goals.Time.Value);
 
   if PCConfig.Data.Has('quick_prayer') then
-    PCConfig.Data.Item['quick_prayer'].AsBool := PestControl.QuickPrayer
+    PCConfig.Data.Item['quick_prayer'].AsBool := PestControl.UserQuickPrayer
   else
-    PCConfig.Data.AddBool('quick_prayer', PestControl.QuickPrayer);
+    PCConfig.Data.AddBool('quick_prayer', PestControl.UserQuickPrayer);
 
   if PCConfig.Data.Has('chill_if_active') then
-    PCConfig.Data.Item['chill_if_active'].AsBool := PestControl.ChillIfActive
+    PCConfig.Data.Item['chill_if_active'].AsBool := PestControl.UserChillIfActive
   else
-    PCConfig.Data.AddBool('chill_if_active', PestControl.ChillIfActive);
+    PCConfig.Data.AddBool('chill_if_active', PestControl.UserChillIfActive);
 
   if PCConfig.Data.Has('active_threshold') then
     PCConfig.Data.Item['active_threshold'].AsInt := PestControl.UserActiveThreshold
@@ -1853,116 +1831,277 @@ begin
   else
     PCConfig.Data.AddInt('points_per_win', PestControl.PtsPerGame);
 
+  if PCConfig.Data.Has('disable_hud') then
+    PCConfig.Data.Item['disable_hud'].AsBool := PestControl.UserDisableHUD
+  else
+    PCConfig.Data.AddBool('disable_hud', PestControl.UserDisableHUD);
+
+  if PCConfig.Data.Has('disable_move_in_boat') then
+    PCConfig.Data.Item['disable_move_in_boat'].AsBool := PestControl.UserDisableMoveInBoat
+  else
+    PCConfig.Data.AddBool('disable_move_in_boat', PestControl.UserDisableMoveInBoat);
+
+  if PCConfig.Data.Has('disable_pace') then
+    PCConfig.Data.Item['disable_pace'].AsBool := PestControl.UserDisablePace
+  else
+    PCConfig.Data.AddBool('disable_pace', PestControl.UserDisablePace);
+
+  if PCConfig.Data.Has('disable_leave_game') then
+    PCConfig.Data.Item['disable_leave_game'].AsBool := PestControl.UserDisableLeaveGame
+  else
+    PCConfig.Data.AddBool('disable_leave_game', PestControl.UserDisableLeaveGame);
   PCConfig.Save();
+  if PCConfig.Data.Has('combat_level') then
+  PCConfig.Data.Item['combat_level'].AsInt := PestControl.UserCombatLevel
+  else
+    PCConfig.Data.AddInt('combat_level', PestControl.UserCombatLevel);
 end;
 
 procedure TScriptForm.Init();
 var
   tab: TLazTabSheet;
-  goalsPanel, settingsPanel: TLazPanel;
-  lblQuickPrayer, lblChillActive, lblActiveThresh, lblPointsPerWin: TLazLabel;
+  goalsPanel: TLazPanel;
+  lblQuickPrayer, lblCombatLevel, lblChillActive, lblActiveThresh, lblPointsPerWin, titleLabel, authorLabel: TLazLabel;
+  bgImage: TLazImage;
   y: Int32;
 begin
   PCConfig.Setup('jds-pestcontrol');
-  Self.Setup('Pest Control JDS', PCConfig.Data);
+  Self.Setup('Pest Control LITE', PCConfig.Data);
 
   if USE_AUTO_START then
     Self.Form.OnShow := @Self.StartAutoTimer;
 
   // ===== Settings Tab =====
   tab := Self.CreateTab('Settings');
+  tab.Color := $1A1A1A;
 
-  // Container panel for custom settings
-  settingsPanel := TLazPanel.CreateEx(tab);
-  settingsPanel.SetBounds(20, 20, 710, 280);
-  settingsPanel.BorderSpacing.Around := 10;
+  if not FileExists(SimbaEnv.DataPath+'jdsBackground.png') then
+    URLFetchToFile('https://i.imgur.com/xN2rmA4.png', SimbaEnv.DataPath+'jdsBackground.png');
+
+  // Background image
+  bgImage := TLazImage.CreateEx(tab);
+  bgImage.Align := ELazAlign.Client;
+  bgImage.Picture.LoadFromFile(SimbaEnv.DataPath + 'jdsBackground.png');
+  bgImage.Stretch := True;
+  bgImage.Proportional := False;
+  bgImage.SendToBack();
 
   y := 20;
 
-  // Quick Prayer checkbox
-  lblQuickPrayer := TLazLabel.CreateEx(settingsPanel, 'Use Quick Prayer:', '', 20, y, 150, 25);
-  lblQuickPrayer.Font.Size := 10;
-  ChkQuickPrayer := TLazCheckBox.CreateEx(settingsPanel);
-  ChkQuickPrayer.SetBounds(180, y, 200, 25);
+  // Quick Prayer
+  lblQuickPrayer := TLazLabel.CreateEx(tab, 'Quick Prayer:', '', 20, y, 140, 30);
+  lblQuickPrayer.Font.Size := 14;
+  lblQuickPrayer.Font.Color := $F0F0F0;
+  lblQuickPrayer.Color := $2A2A2A;
+  lblQuickPrayer.Transparent := False;
+  lblQuickPrayer.Alignment := ELazAlignment.Center;
+  lblQuickPrayer.Layout := ELazTextLayout.Center;
+
+  ChkQuickPrayer := TLazCheckBox.CreateEx(tab);
+  ChkQuickPrayer.SetBounds(170, y, 560, 30);
   ChkQuickPrayer.Caption := 'Enable quick prayers during combat';
-  ChkQuickPrayer.SetChecked(True); // Default
-  Inc(y, 35);
+  ChkQuickPrayer.Font.Size := 14;
+  ChkQuickPrayer.Font.Color := $F0F0F0;
+  ChkQuickPrayer.SetChecked(True);
+  Inc(y, 40);
 
-  // Chill if Active checkbox
-  lblChillActive := TLazLabel.CreateEx(settingsPanel, 'Chill if Active:', '', 20, y, 150, 25);
-  lblChillActive.Font.Size := 10;
-  ChkChillIfActive := TLazCheckBox.CreateEx(settingsPanel);
-  ChkChillIfActive.SetBounds(180, y, 250, 25);
+  // Chill if Active
+  lblChillActive := TLazLabel.CreateEx(tab, 'Chill Mode:', '', 20, y, 140, 30);
+  lblChillActive.Font.Size := 14;
+  lblChillActive.Font.Color := $F0F0F0;
+  lblChillActive.Color := $2A2A2A;
+  lblChillActive.Transparent := False;
+  lblChillActive.Alignment := ELazAlignment.Center;
+  lblChillActive.Layout := ELazTextLayout.Center;
+
+  ChkChillIfActive := TLazCheckBox.CreateEx(tab);
+  ChkChillIfActive.SetBounds(170, y, 560, 30);
   ChkChillIfActive.Caption := 'Reduce activity if above threshold';
-  ChkChillIfActive.SetChecked(False); // Default
-  Inc(y, 35);
+  ChkChillIfActive.Font.Size := 14;
+  ChkChillIfActive.Font.Color := $F0F0F0;
+  ChkChillIfActive.SetChecked(False);
+  Inc(y, 40);
 
-  // Activity Threshold edit
-  lblActiveThresh := TLazLabel.CreateEx(settingsPanel, 'Activity Threshold (%):', '', 20, y, 150, 25);
-  lblActiveThresh.Font.Size := 10;
-  EditActiveThreshold := TLazEdit.CreateEx(settingsPanel);
-  EditActiveThreshold.SetBounds(180, y, 80, 25);
+  // Activity Threshold
+  lblActiveThresh := TLazLabel.CreateEx(tab, 'Activity Threshold:', '', 20, y, 180, 30);
+  lblActiveThresh.Font.Size := 14;
+  lblActiveThresh.Font.Color := $F0F0F0;
+  lblActiveThresh.Color := $2A2A2A;
+  lblActiveThresh.Transparent := False;
+  lblActiveThresh.Alignment := ELazAlignment.Center;
+  lblActiveThresh.Layout := ELazTextLayout.Center;
+
+  EditActiveThreshold := TLazEdit.CreateEx(tab);
+  EditActiveThreshold.SetBounds(210, y, 60, 30);
   EditActiveThreshold.Text := '75';
+  EditActiveThreshold.Font.Size := 14;
+  EditActiveThreshold.Font.Color := $F0F0F0;
+  EditActiveThreshold.Color := $2A2A2A;
 
-  TLTrackActiveThresh := TLazTrackBar.CreateEx(settingsPanel);
+  TLTrackActiveThresh := TLazTrackBar.CreateEx(tab);
   TLTrackActiveThresh.Frequency := 1;
   TLTrackActiveThresh.SelStart := 50;
   TLTrackActiveThresh.SelEnd := 100;
   TLTrackActiveThresh.Min := 50;
   TLTrackActiveThresh.Max := 100;
   TLTrackActiveThresh.TickStyle := ELazStickStyle.None;
-  TLTrackActiveThresh.SetBounds(265, y, 200, 25);
+  TLTrackActiveThresh.SetBounds(280, y, 300, 30);
   TLTrackActiveThresh.ShowSelRange := True;
   TLTrackActiveThresh.OnChange := @OnSliderChanged;
+  Inc(y, 45);
 
-  Inc(y, 35);
+  // Points Per Win
+  lblPointsPerWin := TLazLabel.CreateEx(tab, 'Points/Win:', '', 20, y, 140, 30);
+  lblPointsPerWin.Font.Size := 14;
+  lblPointsPerWin.Font.Color := $F0F0F0;
+  lblPointsPerWin.Color := $2A2A2A;
+  lblPointsPerWin.Transparent := False;
+  lblPointsPerWin.Alignment := ELazAlignment.Center;
+  lblPointsPerWin.Layout := ELazTextLayout.Center;
 
-  // Points Per Win edit
-  lblPointsPerWin := TLazLabel.CreateEx(settingsPanel, 'Points Per Win:', '', 20, y, 150, 25);
-  lblPointsPerWin.Font.Size := 10;
-  EditPointsPerWin := TLazComboBox.CreateEx(settingsPanel);
-  EditPointsPerWin.SetBounds(180, y, 80, 25);
+  EditPointsPerWin := TLazComboBox.CreateEx(tab);
+  EditPointsPerWin.SetBounds(170, y, 100, 30);
   EditPointsPerWin.Items.AddStrings(['3', '4', '5', '6', '7', '8']);
   EditPointsPerWin.Text := '7';
+  EditPointsPerWin.Font.Size := 14;
+  EditPointsPerWin.Font.Color := $F0F0F0;
+  EditPointsPerWin.Color := $2A2A2A;
+  Inc(y, 50);
+
+  // Combat Level
+  lblCombatLevel := TLazLabel.CreateEx(tab, 'Combat Level:', '', 20, y, 140, 30);
+  lblCombatLevel.Font.Size := 14;
+  lblCombatLevel.Font.Color := $F0F0F0;
+  lblCombatLevel.Color := $2A2A2A;
+  lblCombatLevel.Transparent := False;
+  lblCombatLevel.Alignment := ELazAlignment.Center;
+  lblCombatLevel.Layout := ELazTextLayout.Center;
+
+  EditCombatLevel := TLazEdit.CreateEx(tab);
+  EditCombatLevel.SetBounds(170, y, 100, 30);
+  EditCombatLevel.Text := '-1';
+  EditCombatLevel.Font.Size := 14;
+  EditCombatLevel.Font.Color := $F0F0F0;
+  EditCombatLevel.Color := $2A2A2A;
+  Inc(y, 50);
+
+  // === Advanced Options Header ===
+  lblQuickPrayer := TLazLabel.CreateEx(tab, 'Advanced Options', '', 20, y, 220, 30);
+  lblQuickPrayer.Font.Size := 14;
+  lblQuickPrayer.Font.Color := $3B9FFF;
+  lblQuickPrayer.Font.Style := [ELazFontStyles.Bold];
+  lblQuickPrayer.Color := $2A2A2A;
+  lblQuickPrayer.Transparent := False;
+  lblQuickPrayer.Alignment := ELazAlignment.Center;
+  lblQuickPrayer.Layout := ELazTextLayout.Center;
+  Inc(y, 40);
+
+  // Disable HUD
+  ChkDisableHUD := TLazCheckBox.CreateEx(tab);
+  ChkDisableHUD.SetBounds(40, y, 300, 30);
+  ChkDisableHUD.Caption := 'Disable HUD';
+  ChkDisableHUD.Hint := 'Turn off in-game overlay';
+  ChkDisableHUD.ShowHint := True;
+  ChkDisableHUD.Font.Size := 14;
+  ChkDisableHUD.Font.Color := $F0F0F0;
+  ChkDisableHUD.SetChecked(False);
+
+  // Disable Boat Movement
+  ChkDisableMoveInBoat := TLazCheckBox.CreateEx(tab);
+  ChkDisableMoveInBoat.SetBounds(390, y, 330, 30);
+  ChkDisableMoveInBoat.Caption := 'Disable Boat Move';
+  ChkDisableMoveInBoat.Hint := 'Disable boat movement entirely';
+  ChkDisableMoveInBoat.ShowHint := True;
+  ChkDisableMoveInBoat.Font.Size := 14;
+  ChkDisableMoveInBoat.Font.Color := $F0F0F0;
+  ChkDisableMoveInBoat.SetChecked(False);
   Inc(y, 35);
+
+  // Disable Pacing
+  ChkDisablePace := TLazCheckBox.CreateEx(tab);
+  ChkDisablePace.SetBounds(40, y, 300, 30);
+  ChkDisablePace.Caption := 'Disable Pacing';
+  ChkDisablePace.Hint := 'Disable game movement entirely';
+  ChkDisablePace.ShowHint := True;
+  ChkDisablePace.Font.Size := 14;
+  ChkDisablePace.Font.Color := $F0F0F0;
+  ChkDisablePace.SetChecked(False);
+
+  // Disable Leave Game
+  ChkDisableLeaveGame := TLazCheckBox.CreateEx(tab);
+  ChkDisableLeaveGame.SetBounds(390, y, 330, 30);
+  ChkDisableLeaveGame.Caption := 'Disable Auto-Leave';
+  ChkDisableLeaveGame.Hint := 'Never leave a game, even if activity drops';
+  ChkDisableLeaveGame.ShowHint := True;
+  ChkDisableLeaveGame.Font.Size := 14;
+  ChkDisableLeaveGame.Font.Color := $F0F0F0;
+  ChkDisableLeaveGame.SetChecked(False);
+
+  // Title and Author in bottom right
+  titleLabel := TLazLabel.CreateEx(tab, 'Pest Control LITE', '', 520, 420, 250, 35);
+  titleLabel.Font.Size := 24;
+  titleLabel.Font.Color := $3B9FFF;
+  titleLabel.Font.Style := [ELazFontStyles.Bold];
+  titleLabel.Transparent := True;
+  titleLabel.Alignment := ELazAlignment.RightJustify;
+
+  authorLabel := TLazLabel.CreateEx(tab, 'by footballjds', '', 580, 455, 190, 20);
+  authorLabel.Font.Size := 12;
+  authorLabel.Font.Color := $3B9FFF;
+  authorLabel.Transparent := True;
+  authorLabel.Alignment := ELazAlignment.RightJustify;
 
   // Load saved config
   if PCConfig.Data.Has('quick_prayer') then
     ChkQuickPrayer.SetChecked(PCConfig.Data.Item['quick_prayer'].AsBool);
-
   if PCConfig.Data.Has('chill_if_active') then
     ChkChillIfActive.SetChecked(PCConfig.Data.Item['chill_if_active'].AsBool);
-
   if PCConfig.Data.Has('active_threshold') then
   begin
     EditActiveThreshold.Text := ToStr(PCConfig.Data.Item['active_threshold'].AsInt);
     TLTrackActiveThresh.Position := PCConfig.Data.Item['active_threshold'].AsInt;
   end;
-
   if PCConfig.Data.Has('points_per_win') then
     EditPointsPerWin.Text := ToStr(PCConfig.Data.Item['points_per_win'].AsInt);
 
+  if PCConfig.Data.Has('disable_hud') then
+    ChkDisableHUD.SetChecked(PCConfig.Data.Item['disable_hud'].AsBool);
+  if PCConfig.Data.Has('disable_move_in_boat') then
+    ChkDisableMoveInBoat.SetChecked(PCConfig.Data.Item['disable_move_in_boat'].AsBool);
+  if PCConfig.Data.Has('disable_pace') then
+    ChkDisablePace.SetChecked(PCConfig.Data.Item['disable_pace'].AsBool);
+  if PCConfig.Data.Has('disable_leave_game') then
+    ChkDisableLeaveGame.SetChecked(PCConfig.Data.Item['disable_leave_game'].AsBool);
+  if PCConfig.Data.Has('combat_level') then
+  EditCombatLevel.Text := ToStr(PCConfig.Data.Item['combat_level'].AsInt);
   // Goals panel at bottom
   goalsPanel := Self.CreateGoals(tab, True, True, False, EOrientation.HORIZONTAL);
   goalsPanel.Align := ELazAlign.Bottom;
+  goalsPanel.Color := $3B9FFF;
+  goalsPanel.Font.Style := [ELazFontStyles.Bold];
+  goalsPanel.Font.Color := $000000;
 
-  // Load goal config
   if PCConfig.Data.Has('goal_actions') then
     Self.Goals.Actions.Value := PCConfig.Data.Item['goal_actions'].AsInt;
-
   if PCConfig.Data.Has('goal_time') then
     Self.Goals.Time.Value := PCConfig.Data.Item['goal_time'].AsInt;
 
   // ===== Antiban Tab =====
   Self.CreateAntibanTab();
 
-  // Hook interaction to all controls
+  // Hook interactions
   ChkQuickPrayer.OnChange := @OnAnyInteraction;
   ChkChillIfActive.OnChange := @OnAnyInteraction;
   EditActiveThreshold.OnChange := @OnAnyInteraction;
   EditPointsPerWin.OnChange := @OnAnyInteraction;
+  ChkDisableHUD.OnChange := @OnAnyInteraction;
+  ChkDisableMoveInBoat.OnChange := @OnAnyInteraction;
+  ChkDisablePace.OnChange := @OnAnyInteraction;
+  ChkDisableLeaveGame.OnChange := @OnAnyInteraction;
+  EditCombatLevel.OnChange := @OnAnyInteraction;
   Self.Goals.Actions.OnChange := @OnAnyInteraction;
   Self.Goals.Time.OnChange := @OnAnyInteraction;
+
   Form.Run();
 end;
 
