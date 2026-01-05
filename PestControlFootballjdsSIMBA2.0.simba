@@ -1915,28 +1915,49 @@ end;
 
 procedure TPestControl.Run();
 var
-  nState: EPestState;
+  nState, sBeforeAntiban: EPestState;
   tRand: Int32;
-  breakOrSleep: Boolean;
+  JustDidAntiban: Boolean;
 begin
   Self.Init();
   tRand := Round(Random(0, 80+100*bhM.U));
   Profiles[ProfileIndex].Worlds := [344];
 
   Self.State := EPestState.INIT;
+  sBeforeAntiban := EPestState.INIT;
+  JustDidAntiban := False;
 
   repeat
     nState := Self.GetState();
 
-    if nState <> self.State then
+    if nState <> Self.State then
     begin
-      if Self.State <> EPestState.INIT then  // skip initial
+      if Self.State <> EPestState.INIT then
         Self.StateTimer.Add(Self.State, Time - Self.StateT);
+
+      if nState = EPestState.ANTIBAN then
+      begin
+        // Only save if interrupted state is gameplay state
+        if Self.State in [EPestState.IN_BOAT, EPestState.WALK_MID,
+                          EPestState.DEFEND, EPestState.AT_PLANK,
+                          EPestState.EXIT_GAME] then
+          sBeforeAntiban := Self.State
+        else
+          sBeforeAntiban := EPestState.UNKNOWN;
+      end
+      else if JustDidAntiban then
+      begin
+        if sBeforeAntiban <> EPestState.UNKNOWN then
+          Self.StateTimer.Add(sBeforeAntiban, Time - Self.StateT);
+        JustDidAntiban := False;
+      end;
+
       Self.StateT := Time;
       Self.State := nState;
       Self.UpdateAndDrawHUD(False, False, 0, True);
       Logger.Info('[STATE] ' + ToStr(Self.State));
-    end else
+    end
+    else
     begin
       Self.State := nState;
       Self.UpdateAndDrawHUD();
@@ -1945,33 +1966,34 @@ begin
     ProgressReport.Print();
 
     case Self.State of
-      EPestState.UNKNOWN:begin
-                          Sleep(LogNormalInt(500, 0.35));
-                          Writeln('[UNKNOWN STATE]', FormatMilliseconds(Logger.TimeRunning.Elapsed, TIME_SHORT));
-                         end;
+      EPestState.UNKNOWN:
+        begin
+          Sleep(LogNormalInt(500, 0.35));
+          Writeln('[UNKNOWN STATE]', FormatMilliseconds(Logger.TimeRunning.Elapsed, TIME_SHORT));
+        end;
 
       EPestState.LOGIN: Login.DoLogin();
-
       EPestState.CMBT_LVL: Self.UpdateCmbtLvl();
 
-      EPestState.ANTIBAN: Antiban.DoTask();
+      EPestState.ANTIBAN:
+        begin
+          Antiban.DoTask();
+          JustDidAntiban := True;
+        end;
+
       EPestState.BREAK: Antiban.DoBreak();
       EPestState.SLEEP: Antiban.DoSleep();
 
       EPestState.IN_BOAT: Self.WhileInBoat();
-      
       EPestState.WALK_MID: Self.WalkToDefend();
-      
       EPestState.DEFEND: Self.DefendKnight();
-
       EPestState.EXIT_GAME: Self.LeaveTheGame();
-
       EPestState.AT_PLANK: Self.EnterBoat();
-      
+
       EPestState.NO_ACTIVITY, EPestState.MAX_ACTIONS,
       EPestState.MAX_TIME, EPestState.END_SCRIPT: Exit;
     end;
-  until self.PtsTotal > (3800 + tRand);
+  until Self.PtsTotal > (3800 + tRand);
 
   Writeln('Total Points: ', Self.PtsTotal, ' is more than: ', 3800 + tRand);
   WriteLn('[COMPLETE] Thank you for using Pest Control JDS');
