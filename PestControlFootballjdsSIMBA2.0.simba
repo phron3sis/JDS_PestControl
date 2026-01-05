@@ -1065,7 +1065,7 @@ begin
   Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
 end;
 
-procedure TPestContorl.EnterBoatFailsafe();
+procedure TPestControl.EnterBoatFailsafe();
 begin
 
 end;
@@ -1673,7 +1673,9 @@ begin
       EPestState.WALK_MID: Self.WalkToDefend();
       
       EPestState.DEFEND: Self.DefendKnight();
+
       EPestState.EXIT_GAME: Self.LeaveTheGame();
+
       EPestState.AT_PLANK: Self.EnterBoat();
       
       EPestState.NO_ACTIVITY, EPestState.MAX_ACTIONS,
@@ -1693,7 +1695,7 @@ var
   CountdownLabel: TLazLabel;
   TimerStartTime: UInt64;
   DisplayTimer: TLazTimer;
-  // Form controls
+
   ChkQuickPrayer, ChkChillIfActive: TLazCheckBox;
   ChkDisableHUD, ChkDisableMoveInBoat, ChkDisablePace, ChkDisableLeaveGame: TLazCheckBox;
   EditCombatLevel: TLazEdit;
@@ -1709,7 +1711,7 @@ begin
     AutoStartTimer.Free();
     AutoStartTimer := nil;
   end;
-  if DisplayTimer <> nil then  // ADD THIS
+  if DisplayTimer <> nil then
   begin
     DisplayTimer.Enabled := False;
     DisplayTimer.Free();
@@ -1724,7 +1726,6 @@ end;
 
 procedure OnSliderChanged(sender: TLazObject);
 begin
-  // Copy slider value into your existing LabeledEdit
   EditActiveThreshold.text := IntToStr(EnsureRange(TLTrackActiveThresh.Position, 50, 100));
 end;
 
@@ -1850,11 +1851,14 @@ begin
     PCConfig.Data.Item['disable_leave_game'].AsBool := PestControl.UserDisableLeaveGame
   else
     PCConfig.Data.AddBool('disable_leave_game', PestControl.UserDisableLeaveGame);
-  PCConfig.Save();
+
   if PCConfig.Data.Has('combat_level') then
-  PCConfig.Data.Item['combat_level'].AsInt := PestControl.UserCombatLevel
+    PCConfig.Data.Item['combat_level'].AsInt := PestControl.UserCombatLevel
   else
     PCConfig.Data.AddInt('combat_level', PestControl.UserCombatLevel);
+
+  //SAVE!!!!
+  PCConfig.Save();
 end;
 
 procedure TScriptForm.Init();
