@@ -67,7 +67,6 @@ type
   TUV = record
     Hash, Salt: String;   // Hash string + Salt
     U: Double;// U (0..1)
-    G: Double;// G (0..2)
   end;
   TUVArray = array of TUV;
 type
@@ -309,8 +308,7 @@ begin
   if r >= 1.0 then r := 1.0 - eps;   // replaces exact 1 only
 
   Self.U := r;
-  Self.G := TruncGauss(0.95 + 0.1 * r, 0.2, 0.5, 1.5);
-  WriteLn(PadR(Self.Salt, 16), Self.U, '| G:', Self.G);
+  WriteLn(PadR(Self.Salt, 16), Self.U);
 end;
 
 procedure TUVArray.Create(salts: TStringArray);
@@ -1631,6 +1629,7 @@ end;
 procedure TPestControl.OnBreakEnd(task: PBreakTask);
 var before: Double;
 begin
+  Activity.Restart();
   before := Self.F.Lvl;
   Self.F.Recover(Self.F.BrkRecov, Round(task^.Length));
   Logger.Info('Break ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
@@ -1640,6 +1639,7 @@ end;
 procedure TPestControl.OnSleepEnd(task: PSleepTask);
 var before: Double;
 begin
+  Activity.Restart();
   before := Self.F.Lvl;
   Self.F.Recover(Self.F.SlpRecov, Round(task^.Length));
   Logger.Info('Sleep ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
@@ -1851,6 +1851,7 @@ begin
     @Self.GetReportValues,
     Round(ONE_MINUTE*2.5)
   );
+
   Antiban.OnBreaking := @Self.OnBreakingHud;
   Antiban.OnSleeping := @Self.OnSleepingHud;
   Antiban.OnStartBreak := @Self.OnBreakStart;
