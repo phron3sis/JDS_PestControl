@@ -4,8 +4,7 @@
 {$I WaspLib/osrs.simba}
 const
   USE_AUTO_START    = TRUE;//auto-start
-  AUTO_START_DELAY  = 15;  //delay(in seconds) before auto-starting
-  USE_GAME_HUD      = TRUE;//draw HUD overlay with metrics
+  AUTO_START_DELAY  = 30;  //delay(in seconds) before auto-starting
 type
   TPestControlGameData = record
     Nov, Inter, Vet: record
@@ -147,7 +146,7 @@ type
     Start, LastWin: UInt64;
     KnightHP, wHP, eHP, seHP, swHP, portalsHP: Int32;
     WShielded, EShielded, SEShielded, SWShielded: Boolean;
-    GamesWon, PtsPerGame, GamesLeft: UInt32;
+    GamesWon, PtsPerGame, LeaveGameCount: UInt32;
     PtsStart, PtsEarned, PtsTotal: Int32;
     
     // Config
@@ -526,7 +525,7 @@ var
   end;
 
 begin
-  if Self.UserDisableHUD or not USE_GAME_HUD then Exit;
+  if Self.UserDisableHUD then Exit;
   if ((Time - Self.HUDLastUpdate) < REFRESH_RATE) and
     not Force then Exit;
   Self.HUDLastUpdate := Time;
@@ -686,14 +685,16 @@ begin
     y := DrawSep(y);
     y := DrawRow('Prayer', prayerStr, y);
     DrawColor := HUD_TEXT_COLOR;
-    DrawText('Z: ' + ToStr(Options.ZoomLevel), Point(xRate, y - ROW_GAP));
+    if not onSleep and not onBreak then
+      DrawText('Z: ' + ToStr(Options.ZoomLevel), Point(xRate, y - ROW_GAP));
     y := DrawRow('Attack', atkDelayStr, y);
-    if Self.GamesLeft > 0 then
-      DrawText('L''s: ' + ToStr(Self.GamesLeft), Point(xRate, y - ROW_GAP));
+    if Self.LeaveGameCount > 0 then
+      DrawText('L''s: ' + ToStr(Self.LeaveGameCount), Point(xRate, y - ROW_GAP));
     y := DrawSep(y);
     y := DrawRow('Total', 'Points', y, FormatFloat('#,##0', Self.PtsTotal));
     y := DrawRow('Total', ToStr(Self.State).After('.'), y, FmtTime(Self.StateTimer.Times[Self.State]+ (Time - Self.StateT)));
-    y := DrawRow('Choice', ToStr(Self.AttackChoice).After('.'), y, IntToStr(Self.AttackIndex));
+    if Self.InGame() then
+      y := DrawRow('Choice', ToStr(Self.AttackChoice).After('.'), y, IntToStr(Self.AttackIndex));
     if maxActStr <> '' then y := DrawRow('Max', 'Actions', y, maxActStr);
     if maxTimeStr <> '' then y := DrawRow('Max', 'Time', y, maxTimeStr);
 
@@ -1546,7 +1547,7 @@ begin
     if not Self.InGame() then Exit;
     if Self.Squire.Interact(['Leave Squire', 'eave Squire'], 1+Round(3*bhM.U)) then
     begin
-      Self.GamesLeft+=1;
+      Self.LeaveGameCount+=1;
       WriteLn('Left game at ', FormatMilliseconds(GetTimeRunning, TIME_SHORT));
       SleepUntil(not Self.InGame(), Round(200+random(200)), Round(17000+9000*bhM.U));
     end else
