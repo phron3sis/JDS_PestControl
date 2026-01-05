@@ -67,6 +67,7 @@ type
   TUV = record
     Hash, Salt: String;   // Hash string + Salt
     U: Double;// U (0..1)
+    G: Double;// G (0..2)
   end;
   TUVArray = array of TUV;
 type
@@ -84,10 +85,8 @@ type
     OnsetTime: Double;     // 15-35 min: Midpoint of sigmoid ramp
     OnsetSteep: Double;    // Sigmoid steepness
 
-    RTMult: Double;        // 1.15-1.60
-    ErrRate: Double;       // 0.02-0.12
-    BrkRecov: Double;      // 0.20-0.40/min
-    SlpRecov: Double;      // 0.70-1.00/min
+    RTMult, ErrRate: Double;
+    BrkRecov, SlpRecov: Double;
   end;
 type
   TPestControl = record
@@ -171,22 +170,34 @@ begin
   Self.Last := Time;
 end;
 
-property TFatigue.RT: Double;
+property TFatigue.GetRTMulti: Double;
 begin
   Self.Update();
-  Result := 1.0 + (Self.RTMult - 1.0) * Self.Lvl;  // Interpolate: fresh=1.0, exhausted=RTMult
+  Result := 1.0 + (Self.RTMult - 1.0) * Self.Lvl;  // fresh=1.0, exhausted=RTMult
 end;
 
-property TFatigue.Err: Boolean;
+property TFatigue.GetErrRate: Boolean;
 begin
   Self.Update();
-  Result := Random() < Self.ErrRate * Self.Lvl;  // Scale: fresh=0%, exhausted=ErrRate
+  Result := Random() < Self.ErrRate * Self.Lvl;  // fresh=0%, exhausted=ErrRate
 end;
 
 property TFatigue.GetLvl: Double;
 begin
   Self.Update();
   Result := Self.Lvl;
+end;
+
+property TFatigue.GetBaseRT: Double;
+begin
+  Result := PestControl.bRT*Self.GetRTMulti;
+end;
+// Truncated Gaussian with re-sample instead of EnsureRange
+function TruncGauss(mu, sigma, lo, hi: Double): Double;
+begin
+  repeat
+    Result := GaussRand(mu, sigma);
+  until (Result >= lo) and (Result <= hi);
 end;
 
 // 0 < Random < 1
@@ -241,7 +252,8 @@ begin
   if variance < 0 then variance := 0;
   if tail < 0 then tail := 0;
 
-  mean := Mean * PestControl.F.RT;
+  //pass PestControl.F.GetBaseRT as mean
+  //mean := Mean * PestControl.F.GetRTMulti;
 
   mu := mean;
   sigma := mean * (0.21 + 0.13 * variance);
@@ -297,7 +309,8 @@ begin
   if r >= 1.0 then r := 1.0 - eps;   // replaces exact 1 only
 
   Self.U := r;
-  WriteLn(PadR(Self.Salt, 16), Self.U);
+  Self.G := TruncGauss(0.95 + 0.1 * r, 0.2, 0.5, 1.5);
+  WriteLn(PadR(Self.Salt, 16), Self.U, '| G:', Self.G);
 end;
 
 procedure TUVArray.Create(salts: TStringArray);
@@ -691,10 +704,10 @@ begin
     if Self.LeaveGameCount > 0 then
       DrawText('L''s: ' + ToStr(Self.LeaveGameCount), Point(xRate, y - ROW_GAP));
     y := DrawSep(y);
-    y := DrawRow('Total', 'Points', y, FormatFloat('#,##0', Self.PtsTotal));
     y := DrawRow('Total', ToStr(Self.State).After('.'), y, FmtTime(Self.StateTimer.Times[Self.State]+ (Time - Self.StateT)));
+    y := DrawRow('Total', 'Points', y, FormatFloat('#,##0', Self.PtsTotal));
     if Self.InGame() then
-      y := DrawRow('Choice', ToStr(Self.AttackChoice).After('.'), y, IntToStr(Self.AttackIndex));
+      y := DrawRow('Sort/idx', ToStr(Self.AttackChoice).After('.'), y, IntToStr(Self.AttackIndex));
     if maxActStr <> '' then y := DrawRow('Max', 'Actions', y, maxActStr);
     if maxTimeStr <> '' then y := DrawRow('Max', 'Time', y, maxTimeStr);
 
@@ -817,7 +830,7 @@ procedure TPestControl.UpdateAttkDelay();
 var
   candidate: Double;
 begin
-  candidate := ExpoGaussRT(Self.Tempo.LowMean, Self.RT[0].U, Self.RT[1].U);
+  candidate := ExpoGaussRT(Self.Tempo.LowMean * Self.F.GetRTMulti, Self.RT[0].U, Self.RT[1].U);
   if Self.NextAttkDelay > 0 then
   begin
     if Random() < (0.10 + 0.05 * Self.RT[2].U) then
@@ -833,7 +846,7 @@ procedure TPestControl.UpdateXPAttkDelay();
 var
   candidate: Double;
 begin
-  candidate := ExpoGaussRT(Self.Tempo.XPMean, Self.RT[0].U, Self.RT[1].U);
+  candidate := ExpoGaussRT(Self.Tempo.XPMean * Self.F.GetRTMulti, Self.RT[0].U, Self.RT[1].U);
 
   if Self.XPAttkDelay > 0 then
   begin
@@ -1027,7 +1040,7 @@ begin
   else
     if GameTabs.Open(ERSGameTab.COMBAT) then
     begin
-      Sleep(ExGaussInt(Self.bRT));
+      Sleep(ExGaussInt(Self.F.GetBaseRT));
       Self.CombatLevel := OCR.RecognizeNumber(cbBox.Expand(3), RSFonts.PLAIN_11, [2070783], 0);
     end;
   Logger.Info('Combat Level: %d', [Self.CombatLevel]);
@@ -1157,7 +1170,7 @@ begin
   else
     Mouse.Move(destMS, True, EMouseDistribution.GAUSS);
 
-  Sleep(ExGaussInt(Self.bRT * 0.8));
+  Sleep(ExGaussInt(Self.F.GetBaseRT * 0.8));
   if not Self.InBoat() then Exit;
 
   if MainScreen.IsUpText('Walk here') then
@@ -1166,14 +1179,14 @@ begin
     ChooseOption.Select('Walk here');
 
   Self.LastBoatMove := Time;
-  Self.BoatMoveDelay := LogNormal(Self.bRT * 100 + Random(75, 100) * bhM.U, 0.27 + 0.1 * bhM.U);
+  Self.BoatMoveDelay := LogNormal(Self.F.GetBaseRT * 100 + Random(75, 100) * bhM.U, 0.27 + 0.1 * bhM.U);
   Logger.Info('BoatMoveDelay: %.4f', [Self.BoatMoveDelay]);
 end;
 
 procedure TPestControl.WhileInBoat();
 begin
   if not Self.UserDisableMoveInBoat then Self.MoveInBoat();
-  Sleep(ExGaussInt(Self.bRT));
+  Sleep(ExGaussInt(Self.F.GetBaseRT));
 end;
 
 //function from include, I am not author
@@ -1206,7 +1219,7 @@ begin
   if Self.Flag.DelayBoatMove then
   begin
     Self.LastBoatMove := Time;
-    Self.BoatMoveDelay := ExGaussInt(Self.bRT*Random(0.537, 5+5*bhM.U));
+    Self.BoatMoveDelay := ExGaussInt(Self.F.GetBaseRT*Random(0.537, 5+5*bhM.U));
     Logger.Info('BoatMoveDelay: %.4f', [Self.BoatMoveDelay]);
   end;
   Self.ReadPoints();
@@ -1222,7 +1235,7 @@ end;
 
 procedure TPestControl.EnterBoat();
 begin
-  Sleep(ExGaussInt(Self.bRT * 2.9));
+  Sleep(ExGaussInt(Self.F.GetBaseRT * 2.9));
   if Chat.IsTitle('~ Warning ~') then
     TerminateScript('Too many points '+Chat.ReadPointsOption());
   try
@@ -1230,7 +1243,7 @@ begin
       if SleepUntil(Self.InBoat, 50, Round(GaussRand(3000, 200))) then
       begin
         Self.SetPerGame();
-        Sleep(ExGaussInt(Self.bRT * 3.9));
+        Sleep(ExGaussInt(Self.F.GetBaseRT * 3.9));
         if not InRange(Options.GetZoomLevel(True), 30, 50) then
           if Options.SetZoomLevel(RandomMode(35+Round(10*bhM.U), 30, 50)) then
             WriteLn GetDebugLn('Options', 'Zoom adjusted level: ' + ToString(Options.ZoomLevel), ELogLevel.SUCCESS);
@@ -1247,7 +1260,7 @@ begin
       if Minimap.EnablePrayer() then
       begin
         if Biometrics.RandomBoolean() then
-          Sleep(ExGaussInt(Self.bRT*(1.1+random(0.0, 2.1))));
+          Sleep(ExGaussInt(Self.F.GetBaseRT*(0.3+random(0.01, 2.1))));
         if Biometrics.RandomBoolean(0.23) then
           Mouse.Move(Mainscreen.Bounds, True);
       end;
@@ -1257,7 +1270,7 @@ procedure TPestControl.WalkToDefend();
 var
   uniqueMiddle, midP, msP: TPoint;
 begin
-  Sleep(ExGaussInt(Self.bRT * 1.7));
+  Sleep(ExGaussInt(Self.F.GetBaseRT * 1.7));
   if not Self.InGame() then Exit;
   if not Self.GameStarted then
   begin
@@ -1281,10 +1294,10 @@ begin
         Mouse.Click(msP, EMouseButton.LEFT);
         if RandomBoolean(0.63+30*bhM.U) and (_bhM.U < 0.933) then
         begin
-          Minimap.WaitMoving(Round(Self.bRT*Random(50, 100)));
-          Sleep(ExGaussInt(Self.bRT*RandomLeft(0.7, 3.1)));
+          Minimap.WaitMoving(Round(Self.F.GetBaseRT*Random(50, 100)));
+          Sleep(ExGaussInt(Self.F.GetBaseRT*RandomLeft(0.7, 3.1)));
         end else
-          Sleep(ExGaussInt(Self.bRT*GaussRand(10, 2.5)));
+          Sleep(ExGaussInt(Self.F.GetBaseRT*GaussRand(10, 2.5)));
         Exit;
       end;
     end;
@@ -1516,7 +1529,7 @@ end;
 
 procedure TPestControl.DefendKnight();
 begin
-  Sleep(ExGaussInt(Self.bRT*0.8));
+  Sleep(ExGaussInt(Self.F.GetBaseRT*0.8));
   Self.UpdateXP();
   if (Time - Self.LastXPTime) < Self.XPAttkDelay then Exit;
   if (Time - Self.LastAttack) < Self.NextAttkDelay then Exit;
@@ -1528,14 +1541,14 @@ begin
     Activity.Restart();
     Self.LastAttack := Time;
     Self.UpdateAttkDelay();
-    Sleep(ExGaussInt(Self.bRT*2.2));
+    Sleep(ExGaussInt(Self.F.GetBaseRT*2.2));
   end;
 end;
 
 procedure TPestControl.LeaveTheGame();
 begin
   if not Self.InGame() then Exit;
-  Sleep(ExGaussInt(Self.bRT * 3.3));
+  Sleep(ExGaussInt(Self.F.GetBaseRT * 3.3));
   if not Self.InGame() then Exit;
   try
     Writeln('Distance to Squire: ', Self.Squire.DistanceTo(Map.Position()));
@@ -1659,6 +1672,7 @@ end;
 procedure TPestControl._OnTermination();
 begin
   WriteLn ProgressReport.Generate(ProgressReport.ValueProvider());
+  Self.StateTimer.Add(Self.State, Time - Self.StateT);
   Self.StateTimer.LogAll();
   Writeln('STATE ON TERMINATION: '+ToStr(Self.State));
   RSClient.Canvas.Clear;
@@ -1856,8 +1870,8 @@ begin
   Self.P.Create(['U_Prayer1', 'U_Prayer2', 'U_Prayer3']);
   Self.RT.Create(['RT_U1', 'RT_U2', 'RTC_U']);
 
-  // Result: 153-345ms with Gaussian distribution around personality baseline
-  self.bRT := (180 + 120*bhM.U) * EnsureRange(GaussRand(1.0, 0.05), 0.85, 1.15);
+  // Result: 160-336ms with Gaussian distribution around personality baseline
+  self.bRT := TruncGauss(200, 30, 173, 227) + 123 * bhM.U * TruncGauss(1.0, 0.05, 0.85, 1.15);
 
   Self.F.Init();
   Self.InitAttackProfile();
