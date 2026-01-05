@@ -47,7 +47,10 @@ type
     DEFEND,
     AT_PLANK,
     EXIT_GAME,
-    
+    ANTIBAN,
+    BREAK,
+    SLEEP,
+
     NO_ACTIVITY, UNKNOWN, MAX_ACTIONS, MAX_TIME, END_SCRIPT
   );
   EAttackChoice = (Self, Knight, Rand);
@@ -68,6 +71,26 @@ type
   end;
   TUVArray = array of TUV;
 type
+  TFatigue = record
+    Lvl: Double;
+    Start: UInt64;
+    Last: UInt64;
+
+    U: TUVArray;
+
+    Rate: Double;          // 0.015-0.045/min: Exponential rise rate (tau = 22-67 min)
+    Drift: Double;         // 0.05-0.15: Random walk volatility (per sqrt(min))
+    DriftCur: Double;      // Current drift offset
+    Revert: Double;        // 0.03-0.10/min: Mean reversion speed
+    OnsetTime: Double;     // 15-35 min: Midpoint of sigmoid ramp
+    OnsetSteep: Double;    // Sigmoid steepness
+
+    RTMult: Double;        // 1.15-1.60
+    ErrRate: Double;       // 0.02-0.12
+    BrkRecov: Double;      // 0.20-0.40/min
+    SlpRecov: Double;      // 0.70-1.00/min
+  end;
+type
   TPestControl = record
 
     // Account unique decisions
@@ -85,9 +108,11 @@ type
     BoatBox: TBox;
 
     // U's and Choices
-    P: TUVArray;
-    attkC: TUVArray;
+    P: TUVArray; // Prayer
+    M: TUVArray; // Mouse
+    attkC: TUVArray; // Attack choices
     AttackChoice: EAttackChoice;
+    AttackIndex: Int32;
     AttackWeights: array[0..2] of Double;
     AttackStick: Double;
 
@@ -96,6 +121,7 @@ type
     Squire, Shifter: TRSEntity;
 
     // Timing
+    F: TFatigue;//Fatigue
     bRT: Double;
     RT: TUVArray;//0..2 RT_U1, RT_U2, RTC_U
     Tempo: TAttackTempo;
@@ -129,7 +155,7 @@ type
     UserDisableHUD, UserDisableMoveInBoat, UserDisablePace, UserDisableLeaveGame: Boolean;
     Actions, MaxActions, MaxTime: UInt64;
     UserActiveThreshold, UserCombatLevel: Int32;
-    UserQuickPrayer, UserChillIfActive: Boolean;
+    UserQuickPrayer, UserChillIfActive, UserDisableFatigue: Boolean;
   end;
 
 var
@@ -139,6 +165,30 @@ var
 // =============================================================================
 // HELPER FUNCTIONS - Distribution Math
 // =============================================================================
+
+procedure TFatigue.Recover(rate: Double; dt: UInt64);
+begin
+  Self.Lvl := Self.Lvl * Exp(-rate * dt / 60000.0);
+  Self.Last := Time;
+end;
+
+property TFatigue.RT: Double;
+begin
+  Self.Update();
+  Result := 1.0 + (Self.RTMult - 1.0) * Self.Lvl;  // Interpolate: fresh=1.0, exhausted=RTMult
+end;
+
+property TFatigue.Err: Boolean;
+begin
+  Self.Update();
+  Result := Random() < Self.ErrRate * Self.Lvl;  // Scale: fresh=0%, exhausted=ErrRate
+end;
+
+property TFatigue.GetLvl: Double;
+begin
+  Self.Update();
+  Result := Self.Lvl;
+end;
 
 // 0 < Random < 1
 function NZRandom: Double;
@@ -192,9 +242,11 @@ begin
   if variance < 0 then variance := 0;
   if tail < 0 then tail := 0;
 
+  mean := Mean * PestControl.F.RT;
+
   mu := mean;
-  sigma := mean * (0.23 + 0.09 * variance);
-  tau := mean * (0.20 + 0.15*tail);
+  sigma := mean * (0.21 + 0.13 * variance);
+  tau := mean * (0.18 + 0.15*tail);
 
   Result := ExpoGaussEx(mu, sigma, tau);
 end;
@@ -620,7 +672,7 @@ begin
     y := barBox.Y2 +4;
     y := DrawSep(y);
     FontSize := 12;
-    y := DrawRow('Runtime', runtimeStr, y);
+    y := DrawRow('Runtime', runtimeStr, y, 'F '+ FormatFloat('##0.0', Self.F.Lvl*100)+'%');
     if stateStr.Contains('DEFEND') then
       y := DrawRow('State', stateStr, y, FmtTime(Time-Self.GameStart))
     else
@@ -639,11 +691,11 @@ begin
     if Self.GamesLeft > 0 then
       DrawText('L''s: ' + ToStr(Self.GamesLeft), Point(xRate, y - ROW_GAP));
     y := DrawSep(y);
-    y := DrawRow('Total Points', '', y, FormatFloat('#,##0', Self.PtsTotal));
-    y := DrawRow('Total ' + ToStr(Self.State).After('EPestState.'), '', y, FmtTime(Self.StateTimer.Times[Self.State]+ (Time - Self.StateT)));
-
-    if maxActStr <> '' then y := DrawRow('Max Actions', '', y, maxActStr);
-    if maxTimeStr <> '' then y := DrawRow('Max Time', '', y, maxTimeStr);
+    y := DrawRow('Total', 'Points', y, FormatFloat('#,##0', Self.PtsTotal));
+    y := DrawRow('Total', ToStr(Self.State).After('.'), y, FmtTime(Self.StateTimer.Times[Self.State]+ (Time - Self.StateT)));
+    y := DrawRow('Choice', ToStr(Self.AttackChoice).After('.'), y, IntToStr(Self.AttackIndex));
+    if maxActStr <> '' then y := DrawRow('Max', 'Actions', y, maxActStr);
+    if maxTimeStr <> '' then y := DrawRow('Max', 'Time', y, maxTimeStr);
 
     if Self.InGame() then
     begin
@@ -752,7 +804,7 @@ var
 begin
   if not Self.PlatformCenter(platMean) then Exit;
   Result := Distance(Minimap.Center, platMean)
-          < 13 + 3 * bhM.U;
+          < 13 + 3 * bhM.U + Random(-1, 1);
 end;
 
 function TPestControl.AtBoatPlank(pos: TPoint): Boolean;
@@ -813,6 +865,91 @@ begin
   end;
 end;
 
+procedure TFatigue.Update();
+var
+  dt, dtMin, sessionMin: Double;
+  noise, driftFactor, effectiveRate, onsetFactor: Double;
+  exp2theta, ouStdDev: Double;
+begin
+  if PestControl.UserDisableFatigue then Exit;
+  if PestControl.State in [EPestState.BREAK, EPestState.SLEEP] then Exit;
+
+  dt := Time - Self.Last;
+  dtMin := dt / 60000.0;
+  sessionMin := (Time - Self.Start) / 60000.0;
+
+  // Sigmoid ramp with per-session steepness
+  onsetFactor := 1.0 / (1.0 + Exp(-Self.OnsetSteep * (sessionMin - Self.OnsetTime)));
+
+  // Exact discrete OU process
+  exp2theta := Exp(-2.0 * Self.Revert * dtMin);
+  ouStdDev := Self.Drift * Sqrt((1.0 - exp2theta) / (2.0 * Self.Revert));
+  noise := GaussRand(0, ouStdDev);
+  Self.DriftCur := Self.DriftCur * Exp(-Self.Revert * dtMin) + noise;
+
+  // Prevent drift from making rate negative
+  driftFactor := Min(Max(0.3, 1.0 + Self.DriftCur), 1.7);
+
+  // Apply onset ramp to effective rate
+  effectiveRate := Self.Rate * driftFactor * onsetFactor;
+
+  // Exact exponential approach to saturation
+  Self.Lvl := 1.0 - (1.0 - Self.Lvl) * Exp(-effectiveRate * dtMin);
+
+  Self.Last := Time;
+end;
+
+function TAntiban.TaskDue(): Boolean;
+var
+  i: Int32;
+  activeTasks: PAntibanTaskArray;
+begin
+  if Self.DoingAntiban then
+    Exit(False);
+
+  activeTasks := Self.GetActiveTasks();
+  for i := 0 to High(activeTasks) do
+    if activeTasks[i]^.Countdown.Remaining = 0 then
+      Exit(True);
+
+  Result := False;
+end;
+
+
+function TAntiban.BreakDue(): Boolean;
+var
+  i: Int32;
+  t: UInt64;
+begin
+  if Self.DoingAntiban then
+    Exit(False);
+
+  t := GetTimeRunning();
+  for i := 0 to High(Self.Breaks) do
+    if t > Self.Breaks[i].Next then
+      Exit(True);
+
+  Result := False;
+end;
+
+
+function TAntiban.SleepDue(): Boolean;
+var
+  i: Int32;
+  t: UInt64;
+begin
+  if Self.DoingAntiban then
+    Exit(False);
+
+  t := GetTimeRunning();
+  for i := 0 to High(Self.Sleeps) do
+    if t > Self.Sleeps[i].Next then
+      Exit(True);
+
+  Result := False;
+end;
+
+
 function TPestControl.GetState(): EPestState;
 var
   tmpP: TPoint;
@@ -831,7 +968,18 @@ begin
 
   if Self.CombatLevel < 40 then
     Exit(EPestState.CMBT_LVL);
-  
+
+  if Antiban.TaskDue() then
+    Exit(EPestState.ANTIBAN);
+
+  if Antiban.BreakDue() then
+    if not Self.InGame() then
+      Exit(EPestState.BREAK);
+
+  if Antiban.SleepDue() then
+    if not Self.InGame() then
+      Exit(EPestState.SLEEP);
+
   if Self.InBoat() then Exit(EPestState.IN_BOAT);
 
   if Self.InGame() then
@@ -1024,6 +1172,7 @@ end;
 procedure TPestControl.WhileInBoat();
 begin
   if not Self.UserDisableMoveInBoat then Self.MoveInBoat();
+  Sleep(ExGaussInt(Self.bRT));
 end;
 
 //function from include, I am not author
@@ -1062,7 +1211,7 @@ begin
   Self.ReadPoints();
   Activity.Restart();
   Self.Actions+=1;
-  Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
+  Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold + Round(GaussRand(0, 2.5)), 50, 100);
 end;
 
 procedure TPestControl.EnterBoatFailsafe();
@@ -1346,7 +1495,10 @@ begin
       Result := Biometrics.RedClick(EMouseButton.LEFT);
 
     if Result then
+    begin
       Self.AttackChoice := strategy;
+      Self.AttackIndex := idx;
+    end;
 
   except
     Logger.Error('AttackShifter exception: %s', [GetExceptionMessage]);
@@ -1417,24 +1569,24 @@ end;
 procedure TPestControl.SetAttackTempo();
 var
   bhInt: Int32;
+  xpVar, lowVar: Double;
 begin
   bhInt := Trunc(bhM.U * 1000);
 
-  // XP Mean: 2573-3563ms
-  Self.Tempo.XPMean := 2573 + 990 * bhM.U;
+  // Session variance (±8%)
+  xpVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
+  lowVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
 
-  // XP Stick: 0.20-0.38
+  Self.Tempo.XPMean := (2573 + 990 * bhM.U) * xpVar;
   Self.Tempo.XPStick := 0.20 + 0.18 * ((bhInt shr 5) mod 1000 / 1000.0);
-
   Self.XPAttkDelay := ExpoGaussRT(Self.Tempo.XPMean, Self.RT[0].U, Self.RT[1].U);
 
-  // low Mean: 750-1000
-  Self.Tempo.LowMean := 750 + 350 * _bhM.U;
-
-  // low Stick: 0.20-0.38
+  Self.Tempo.LowMean := (750 + 350 * _bhM.U) * lowVar;
   Self.Tempo.LowStick := 0.20 + 0.18 * (((bhInt shr 5) xor 913) mod 1000 / 1000.0);
-
   Self.NextAttkDelay := ExpoGaussRT(Self.Tempo.LowMean, Self.RT[0].U, Self.RT[1].U);
+
+  Logger.Info('Tempo - XP:%.0fms(x%.2f) Low:%.0fms(x%.2f)',
+    [Self.Tempo.XPMean, xpVar, Self.Tempo.LowMean, lowVar]);
 end;
 
 procedure TStateTimer.Add(State: EPestState; Ms: Int64);
@@ -1450,6 +1602,34 @@ begin
   for State := Low(EPestState) to High(EPestState) do
     if Self.Times[State] > 0 then
       WriteLn(PadR(ToStr(State), 15), ' : ', FmtTime(Self.Times[State]));
+end;
+
+procedure TPestControl.OnBreakStart(task: PBreakTask);
+begin
+  Logger.Info('Break starting - Fatigue: %.1f%%', [Self.F.GetLvl * 100]);
+end;
+
+procedure TPestControl.OnSleepStart(task: PSleepTask);
+begin
+  Logger.Info('Sleep starting - Fatigue: %.1f%%', [Self.F.GetLvl * 100]);
+end;
+
+procedure TPestControl.OnBreakEnd(task: PBreakTask);
+var before: Double;
+begin
+  before := Self.F.Lvl;
+  Self.F.Recover(Self.F.BrkRecov, Round(task^.Length));
+  Logger.Info('Break ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
+    [before * 100, Self.F.Lvl * 100, (before - Self.F.Lvl) * 100]);
+end;
+
+procedure TPestControl.OnSleepEnd(task: PSleepTask);
+var before: Double;
+begin
+  before := Self.F.Lvl;
+  Self.F.Recover(Self.F.SlpRecov, Round(task^.Length));
+  Logger.Info('Sleep ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
+    [before * 100, Self.F.Lvl * 100, (before - Self.F.Lvl) * 100]);
 end;
 
 procedure TPestControl.OnBreakingHud(task: PBreakTask; var countdown: TCountdown);
@@ -1547,6 +1727,7 @@ begin
   for i := 0 to 2 do
   begin
     Self.AttackWeights[i] := baseWeights[i] * (0.67 + 0.66 * Self.attkC[i+1].U);
+    Self.AttackWeights[i] *= EnsureRange(GaussRand(1.0, 0.04), 0.84, 1.16);
     total += Self.AttackWeights[i];
   end;
 
@@ -1554,6 +1735,8 @@ begin
     Self.AttackWeights[i] := Self.AttackWeights[i] / total;
 
   Self.AttackStick := 0.15 + 0.25 * Self.attkC[4].U;
+  Self.AttackStick *= EnsureRange(GaussRand(1.0, 0.025), 0.925, 1.075);
+
   if Self.AttackWeights[0] > Self.AttackWeights[1] then
     Self.AttackChoice := EAttackChoice.Self
   else
@@ -1561,6 +1744,81 @@ begin
 
   Logger.Info('Attack Profile - Self:%.1f%% Knight:%.1f%% Rand:%.1f%% Stick:%.1f%%',
     [Self.AttackWeights[0]*100, Self.AttackWeights[1]*100, Self.AttackWeights[2]*100, Self.AttackStick*100]);
+end;
+
+procedure TFatigue.Init();
+var
+  rateVar, onsetVar, brkVar, slpVar: Double;
+  rtVar, errVar, driftVar, revertVar, steepVar: Double;
+begin
+  Self.U.Create(['rate', 'drift', 'revert', 'rtMult', 'errRate', 'brkRecov', 'slpRecov', 'onsetTime']);
+
+  // Major session variance (±20%, ±15%, ±10%)
+  rateVar := EnsureRange(GaussRand(1.0, 0.10), 0.7, 1.3);
+  onsetVar := EnsureRange(GaussRand(1.0, 0.10), 0.7, 1.3);
+  brkVar := EnsureRange(GaussRand(1.0, 0.075), 0.775, 1.225);
+  slpVar := EnsureRange(GaussRand(1.0, 0.05), 0.85, 1.15);
+
+  // Minor personality variance (±5-10%)
+  rtVar := EnsureRange(GaussRand(1.0, 0.025), 0.925, 1.075);
+  errVar := EnsureRange(GaussRand(1.0, 0.05), 0.85, 1.15);
+  driftVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
+  revertVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
+  steepVar := EnsureRange(GaussRand(1.0, 0.10), 0.7, 1.3);  // ±20% for steepness
+
+  // Apply all variance
+  Self.Rate := (0.015 + 0.030 * Self.U[0].U) * rateVar;
+  Self.OnsetTime := (15.0 + 20.0 * Self.U[7].U) * onsetVar;
+  Self.OnsetSteep := (0.30) * steepVar;  // Base 0.3, vary to 0.21-0.39
+  Self.BrkRecov := (0.20 + 0.20 * Self.U[5].U) * brkVar;
+  Self.SlpRecov := (0.70 + 0.30 * Self.U[6].U) * slpVar;
+
+  Self.Drift := (0.05 + 0.10 * Self.U[1].U) * driftVar;
+  Self.Revert := (0.03 + 0.07 * Self.U[2].U) * revertVar;
+  Self.RTMult := (1.15 + 0.45 * Self.U[3].U) * rtVar;
+  Self.ErrRate := (0.02 + 0.10 * Self.U[4].U) * errVar;
+
+  Self.Lvl := 0.0;
+  Self.DriftCur := 0.0;
+  Self.Start := Time;
+  Self.Last := Time;
+
+  Logger.Info('Fatigue - Rate:%.3f Onset:%.1fmin(k=%.2f) RT:%.2fx Err:%.1f%%',
+    [Self.Rate, Self.OnsetTime, Self.OnsetSteep, Self.RTMult, Self.ErrRate*100]);
+end;
+
+procedure TPestControl.SetupMouse();
+var
+  speedBase, gravBase, windBase: Double;
+  clickMinBase, clickMaxBase: Int32;
+  speedVar, gravVar, windVar, clickVar: Double;
+begin
+  Self.M.Create(['speed', 'gravity', 'wind', 'click min', 'click max', 'miss chance']);
+
+  // Base values
+  speedBase := 10.0 + 4.0 * Self.M[0].U;
+  gravBase := 7.0 + 4.0 * Self.M[1].U;
+  windBase := 3.0 + 4.0 * Self.M[2].U;
+  clickMinBase := 50 + Round(30.0 * Self.M[3].U);
+  clickMaxBase := 120 + Round(80.0 * Self.M[4].U);
+
+  // Session variance (±8%)
+  speedVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
+  gravVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
+  windVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
+  clickVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
+
+  // Apply variance
+  Mouse.Speed := speedBase * speedVar;
+  Mouse.Gravity := gravBase * gravVar;
+  Mouse.Wind := windBase * windVar;
+  Mouse.PressMin := Round(clickMinBase * clickVar);
+  Mouse.PressMax := Round(clickMaxBase * clickVar);
+
+  Mouse.MissChance := 0.01 + 0.03 * Self.M[5].U;
+
+  Logger.Info('Mouse - Speed:%.1f Grav:%.1f Wind:%.1f Click:%d-%dms Miss:%.1f%%',
+    [Mouse.Speed, Mouse.Gravity, Mouse.Wind, Mouse.PressMin, Mouse.PressMax, Mouse.MissChance*100]);
 end;
 
 procedure TPestControl.Init();
@@ -1580,16 +1838,27 @@ begin
   );
   Antiban.OnBreaking := @Self.OnBreakingHud;
   Antiban.OnSleeping := @Self.OnSleepingHud;
+  Antiban.OnStartBreak := @Self.OnBreakStart;
+  Antiban.OnStartSleep := @Self.OnSleepStart;
+  Antiban.OnFinishBreak := @Self.OnBreakEnd;
+  Antiban.OnFinishSleep := @Self.OnSleepEnd;
   AddOnTerminate(@Self._OnTermination);
   AddOnPause(@Self._OnPause);
   AddOnResume(@Self._OnResume);
   _InitPCData();
+
+  Self.SetupMouse();
+
   bhM.Create('bhM');
   Self.Flag.Choices.Create(['NoPray', 'NoLeave', 'NoBoatMove1', 'NoBoatMove2', 'DelayBoatMove']);
   _bhM.Create('_bhM');
   Self.P.Create(['U_Prayer1', 'U_Prayer2', 'U_Prayer3']);
-  self.bRT := 180+120*bhM.U+Random(-10,10); // 180-300ms, uniform
   Self.RT.Create(['RT_U1', 'RT_U2', 'RTC_U']);
+
+  // Result: 153-345ms with Gaussian distribution around personality baseline
+  self.bRT := (180 + 120*bhM.U) * EnsureRange(GaussRand(1.0, 0.05), 0.85, 1.15);
+
+  Self.F.Init();
   Self.InitAttackProfile();
   Self.SetAttackTempo();
   Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
@@ -1643,6 +1912,7 @@ begin
 
   repeat
     nState := Self.GetState();
+
     if nState <> self.State then
     begin
       if Self.State <> EPestState.INIT then  // skip initial
@@ -1656,18 +1926,23 @@ begin
       Self.State := nState;
       Self.UpdateAndDrawHUD();
     end;
+
     ProgressReport.Print();
-    breakOrSleep := (Self.State in [EPestState.AT_PLANK, EPestState.UNKNOWN]) or
-                ((bhM.U < 0.3814) and (Self.State = EPestState.IN_BOAT)) or (bhM.U < 0.0814);
-    Antiban.DoAntiban(True, breakOrSleep, breakOrSleep);
+
     case Self.State of
       EPestState.UNKNOWN:begin
                           Sleep(LogNormalInt(500, 0.35));
                           Writeln('[UNKNOWN STATE]', FormatMilliseconds(Logger.TimeRunning.Elapsed, TIME_SHORT));
                          end;
+
       EPestState.LOGIN: Login.DoLogin();
+
       EPestState.CMBT_LVL: Self.UpdateCmbtLvl();
-      
+
+      EPestState.ANTIBAN: Antiban.DoTask();
+      EPestState.BREAK: Antiban.DoBreak();
+      EPestState.SLEEP: Antiban.DoSleep();
+
       EPestState.IN_BOAT: Self.WhileInBoat();
       
       EPestState.WALK_MID: Self.WalkToDefend();
@@ -1696,7 +1971,7 @@ var
   TimerStartTime: UInt64;
   DisplayTimer: TLazTimer;
 
-  ChkQuickPrayer, ChkChillIfActive: TLazCheckBox;
+  ChkQuickPrayer, ChkChillIfActive, ChkDisableFatigue: TLazCheckBox;
   ChkDisableHUD, ChkDisableMoveInBoat, ChkDisablePace, ChkDisableLeaveGame: TLazCheckBox;
   EditCombatLevel: TLazEdit;
   EditActiveThreshold: TLazEdit;
@@ -1801,6 +2076,7 @@ begin
   PestControl.UserDisablePace := ChkDisablePace.IsChecked();
   PestControl.UserDisableLeaveGame := ChkDisableLeaveGame.IsChecked();
   PestControl.UserCombatLevel := StrToInt(EditCombatLevel.Text, 100);
+  PestControl.UserDisableFatigue := ChkDisableFatigue.IsChecked();
 
   if PCConfig.Data.Has('goal_actions') then
     PCConfig.Data.Item['goal_actions'].AsInt := Self.Goals.Actions.Value
@@ -1851,6 +2127,11 @@ begin
     PCConfig.Data.Item['disable_leave_game'].AsBool := PestControl.UserDisableLeaveGame
   else
     PCConfig.Data.AddBool('disable_leave_game', PestControl.UserDisableLeaveGame);
+
+  if PCConfig.Data.Has('disable_fatigue') then
+    PCConfig.Data.Item['disable_fatigue'].AsBool := PestControl.UserDisableFatigue
+  else
+    PCConfig.Data.AddBool('disable_fatigue', PestControl.UserDisableFatigue);
 
   if PCConfig.Data.Has('combat_level') then
     PCConfig.Data.Item['combat_level'].AsInt := PestControl.UserCombatLevel
@@ -2002,7 +2283,7 @@ begin
 
   // Disable HUD
   ChkDisableHUD := TLazCheckBox.CreateEx(tab);
-  ChkDisableHUD.SetBounds(40, y, 300, 30);
+  ChkDisableHUD.SetBounds(20, y, 300, 30);
   ChkDisableHUD.Caption := 'Disable HUD';
   ChkDisableHUD.Hint := 'Turn off in-game overlay';
   ChkDisableHUD.ShowHint := True;
@@ -2023,7 +2304,7 @@ begin
 
   // Disable Pacing
   ChkDisablePace := TLazCheckBox.CreateEx(tab);
-  ChkDisablePace.SetBounds(40, y, 300, 30);
+  ChkDisablePace.SetBounds(20, y, 300, 30);
   ChkDisablePace.Caption := 'Disable Pacing';
   ChkDisablePace.Hint := 'Disable game movement entirely';
   ChkDisablePace.ShowHint := True;
@@ -2040,6 +2321,17 @@ begin
   ChkDisableLeaveGame.Font.Size := 14;
   ChkDisableLeaveGame.Font.Color := $F0F0F0;
   ChkDisableLeaveGame.SetChecked(False);
+  Inc(y, 35);
+
+  // Disable Fatigue
+  ChkDisableFatigue := TLazCheckBox.CreateEx(tab);
+  ChkDisableFatigue.SetBounds(20, y, 300, 30);
+  ChkDisableFatigue.Caption := 'Disable Fatigue';
+  ChkDisableFatigue.Hint := 'Disable fatigue system';
+  ChkDisableFatigue.ShowHint := True;
+  ChkDisableFatigue.Font.Size := 14;
+  ChkDisableFatigue.Font.Color := $F0F0F0;
+  ChkDisableFatigue.SetChecked(False);
 
   // Title and Author in bottom right
   titleLabel := TLazLabel.CreateEx(tab, 'Pest Control LITE', '', 520, 420, 250, 35);
@@ -2076,6 +2368,8 @@ begin
     ChkDisablePace.SetChecked(PCConfig.Data.Item['disable_pace'].AsBool);
   if PCConfig.Data.Has('disable_leave_game') then
     ChkDisableLeaveGame.SetChecked(PCConfig.Data.Item['disable_leave_game'].AsBool);
+  if PCConfig.Data.Has('disable_fatigue') then
+    ChkDisableFatigue.SetChecked(PCConfig.Data.Item['disable_fatigue'].AsBool);
   if PCConfig.Data.Has('combat_level') then
   EditCombatLevel.Text := ToStr(PCConfig.Data.Item['combat_level'].AsInt);
   // Goals panel at bottom
