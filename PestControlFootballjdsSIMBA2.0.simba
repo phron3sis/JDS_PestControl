@@ -30,7 +30,6 @@ type
 
 var
   PCData: TPestControlGameData;
-
 // =============================================================================
 // ENUMS
 // =============================================================================
@@ -54,8 +53,93 @@ type
   );
   EAttackChoice = (Self, Knight, Rand);
 // =============================================================================
+// FATIGUE SYSTEM - Complete Implementation
+// =============================================================================
+
+const
+  // Global homeostat constants
+  S_TAU_WAKE_MS  = 65520000.0;   // 18.2 hours in ms
+  S_TAU_SLEEP_MS = 15120000.0;   // 4.2 hours in ms
+
+  // Inertia thresholds
+  NAP_THRESHOLD_MIN = 20.0;  // Minutes
+
+type
+  TFatigue = record
+    // =========================================================================
+    // TIMING (Timestamps in milliseconds)
+    // =========================================================================
+    Start, Last, LastWakeTime, LastSleepTime, LastSave: UInt64;
+
+    // Store data JSON
+    Config: TConfigJSON;
+
+    // =========================================================================
+    // STATE VARIABLES (Updated each frame)
+    // =========================================================================
+    R_resource, R_driftCur: Double;   // Time-on-task resource + OU drift
+    S_homeostat: Double;               // Homeostatic sleep pressure [S_MIN..S_MAX]
+    I_current: Double;                 // Current inertia level [0..1]
+    D_debt: Double;                    // Sleep debt (hours owed)
+
+    // Computed (not persisted, calculated on demand)
+    C_current: Double;                 // Current circadian value (scaled)
+    F_raw: Double;                     // Raw fatigue before circadian modulation
+    F_total: Double;                   // Final combined fatigue signal [0..1.2]
+
+
+    // =========================================================================
+    // PROFILE PARAMETERS (Stable traits, stored in config)
+    // =========================================================================
+    C_phaseHours: Double;              // Chronotype offset [-4.5..+4.5]
+    D_required: Double;                // Daily sleep need [6..10 hours]
+    C_amplitude: Double;               // Circadian strength [0.05..0.35]
+    I_magnitude: Double;               // Base inertia severity [0.05..0.60]
+    I_tau: Double;                     // Inertia decay time constant (ms) [1.2e6..7.2e6]
+    D_lambda: Double;                  // Debt memory factor [0.60..0.92]
+
+    // =========================================================================
+    // SESSION PARAMETERS (Generated per-run from hash)
+    // =========================================================================
+    R_deplete: Double;                 // ToT depletion rate (1/min)
+    R_recover: Double;                 // Break recovery rate (1/min)
+    R_drift: Double;                   // OU noise scale (per sqrt(min))
+    R_revert: Double;                  // OU mean reversion (1/min)
+    R_onsetTime: Double;               // Sigmoid onset midpoint (minutes)
+    R_onsetSteep: Double;              // Sigmoid steepness
+    BreakQuality: Double;              // Current break quality [0..1]
+    D_kpay: Double;                    // Sleep debt recovery [0.4 .. 1.0]
+
+    // =========================================================================
+    // OUTPUT CAPS (Rendering constraints)
+    // =========================================================================
+    RTMult: Double;                    // Max RT multiplier [1.1..2.2]
+    ErrRate: Double;                   // Max error probability [0.0..0.20]
+    F_cap: Double;                     // Max combined fatigue [1.0..1.4]
+
+    // Modulation bounds (per-account variability)
+    K_circadian: Double;     // Circadian strength [0.15..0.35]
+    CircMult_min: Double;    // Circadian min [0.50..0.70]
+    CircMult_max: Double;    // Circadian max [1.30..1.50]
+    S_min: Double;           // Homeostat min [0.08..0.12]
+    S_max: Double;           // Homeostat max [0.90..0.98]
+    D_max: Double;           // Debt cap [60..90 hours]
+    Drift_range: Double;     // Drift bounds [0.3..0.5]
+  end;
+
+// =============================================================================
 // TYPES
 // =============================================================================
+type
+  TStateGroup = record
+    S: array of EPestState;     // group of states to emote in
+    E: array of ERSEmote;       // group of emotes for specific states
+    Min, Max: Integer;          // number of emotes to do in a row
+    DelayMin, DelayMax: UInt64; // ms delay between bursts of emotes
+  end;
+
+  TUserEmotes = array of TStateGroup;
+
 type
   TAttackTempo = record
     XPMean, XPStick, LowMean, LowStick: Double;
@@ -70,29 +154,11 @@ type
   end;
   TUVArray = array of TUV;
 type
-  TFatigue = record
-    Lvl: Double;
-    Start: UInt64;
-    Last: UInt64;
-
-    U: TUVArray;
-
-    Rate: Double;          // 0.015-0.045/min: Exponential rise rate (tau = 22-67 min)
-    Drift: Double;         // 0.05-0.15: Random walk volatility (per sqrt(min))
-    DriftCur: Double;      // Current drift offset
-    Revert: Double;        // 0.03-0.10/min: Mean reversion speed
-    OnsetTime: Double;     // 15-35 min: Midpoint of sigmoid ramp
-    OnsetSteep: Double;    // Sigmoid steepness
-
-    RTMult, ErrRate: Double;
-    BrkRecov, SlpRecov: Double;
-  end;
-type
   TPestControl = record
 
     // Account unique decisions
     Flag: record
-      NoPray, NoLeave, NoBoatMove, DelayBoatMove: Boolean;
+      NoPray, NoLeave, NoPace, NoBoatMove, DelayBoatMove: Boolean;
       Choices: TUVArray;
     end;
 
@@ -115,7 +181,7 @@ type
 
     // Objects & Entities  
     Gangplank: TRSObject;
-    Squire, Shifter: TRSEntity;
+    Squire, Shifter, VoidKnight: TRSEntity;
 
     // Timing
     F: TFatigue;//Fatigue
@@ -141,18 +207,20 @@ type
     ActivityThresh: Int32;
     
     // Stats
-    Start, LastWin: UInt64;
+    Start, LastWin, CombatLevel: UInt64;
     KnightHP, wHP, eHP, seHP, swHP, portalsHP: Int32;
     WShielded, EShielded, SEShielded, SWShielded: Boolean;
     GamesWon, PtsPerGame, LeaveGameCount: UInt32;
     PtsStart, PtsEarned, PtsTotal: Int32;
     
-    // Config
-    CombatLevel: Int32;
+
     UserDisableHUD, UserDisableMoveInBoat, UserDisablePace, UserDisableLeaveGame: Boolean;
+    UserDisableFatigue: Boolean;
     Actions, MaxActions, MaxTime: UInt64;
-    UserActiveThreshold, UserCombatLevel: Int32;
-    UserQuickPrayer, UserChillIfActive, UserDisableFatigue: Boolean;
+    UserActiveThreshold, UserCombatLevel, UserSpendPointsAt: Int32;
+    UserRewards: TStringArray;
+    UserRwardAmmount: TIntegerArray;
+    UserQuickPrayer, UserChillIfActive, UserSpendPoints, UserRestAfterGame: Boolean;
   end;
 
 var
@@ -163,34 +231,6 @@ var
 // HELPER FUNCTIONS - Distribution Math
 // =============================================================================
 
-procedure TFatigue.Recover(rate: Double; dt: UInt64);
-begin
-  Self.Lvl := Self.Lvl * Exp(-rate * dt / 60000.0);
-  Self.Last := Time;
-end;
-
-property TFatigue.GetRTMulti: Double;
-begin
-  Self.Update();
-  Result := 1.0 + (Self.RTMult - 1.0) * Self.Lvl;  // fresh=1.0, exhausted=RTMult
-end;
-
-property TFatigue.GetErrRate: Boolean;
-begin
-  Self.Update();
-  Result := Random() < Self.ErrRate * Self.Lvl;  // fresh=0%, exhausted=ErrRate
-end;
-
-property TFatigue.GetLvl: Double;
-begin
-  Self.Update();
-  Result := Self.Lvl;
-end;
-
-property TFatigue.GetBaseRT: Double;
-begin
-  Result := PestControl.bRT*Self.GetRTMulti;
-end;
 // Truncated Gaussian with re-sample instead of EnsureRange
 function TruncGauss(mu, sigma, lo, hi: Double): Double;
 begin
@@ -218,8 +258,7 @@ begin
 end;
 
 // LOGNORMAL (human form):
-//   mean          = typical delay (mean-ish RT)
-//   variation_pct = 0..1 (0.2–0.6 typical humans)
+//                 mean = typical delay (mean-ish RT)
 function LogNormal(mean, sigma: Double): Double;
 begin
   Result := LogNormalEx(Ln(mean) - 0.5 * sigma * sigma, sigma);
@@ -237,52 +276,6 @@ function ExpoGaussEx(mu, sigma, tau: Double): Double;
 begin
   // Gaussian core + Exponential tail (rate = 1/tau)
   Result := GaussRand(mu, sigma) + (-tau * Ln(NZRandom));
-
-  if Result < 0 then
-    Result := 0;
-end;
-
-//use expogauss for RT and automatically adjust values per account
-function ExpoGaussRT(mean, variance, tail: Double): Double;
-var
-  mu, sigma, tau: Double;
-begin
-  if mean < 1 then mean := 1;
-  if variance < 0 then variance := 0;
-  if tail < 0 then tail := 0;
-
-  //pass PestControl.F.GetBaseRT as mean
-  //mean := Mean * PestControl.F.GetRTMulti;
-
-  mu := mean;
-  sigma := mean * (0.21 + 0.13 * variance);
-  tau := mean * (0.18 + 0.15*tail);
-
-  Result := ExpoGaussEx(mu, sigma, tau);
-end;
-
-function ExGaussInt(mean: Double): UInt64;
-begin
-  Result := Round(ExpoGaussRT(mean, PestControl.RT[0].U, PestControl.RT[1].U));
-end;
-
-// WEIBULL (math form):
-//   CDF: 1 - exp(-(x/scale)^shape)
-//   shape_k > 0, scale_lambda > 0
-//   Useful for fatigue / hazard-rate modeling.
-function WeibullEx(shape_k, scale_lambda: Double): Double;
-var
-  u: Double;
-begin
-  if shape_k <= 0 then
-    shape_k := 0.000001;
-  if scale_lambda <= 0 then
-    scale_lambda := 0.000001;
-
-  u := NZRandom; // uniform [0,1)
-
-  // Inverse CDF
-  Result := scale_lambda * Power(-Ln(u), 1.0 / shape_k);
 
   if Result < 0 then
     Result := 0;
@@ -328,6 +321,630 @@ begin
     if Self[i].Salt = salt then
       Exit(Self[i].U);
   Writeln GetDebugLn('Salt not found: ' + salt, ELogLevel.ERROR, True);
+end;
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+// Ramp function for regime transitions
+function Ramp(x, x0, x1: Double): Double;
+begin
+  Result := EnsureRange((x - x0) / (x1 - x0), 0.0, 1.0);
+end;
+
+// Gamma sampler (Marsaglia-Tsang method)
+function SampleGamma(shape: Double): Double;
+var
+  d, c, x, v, u: Double;
+begin
+  if shape < 1.0 then
+  begin
+    Result := SampleGamma(shape + 1.0) * Power(Random(), 1.0 / shape);
+    Exit;
+  end;
+
+  d := shape - 1.0/3.0;
+  c := 1.0 / Sqrt(9.0 * d);
+
+  repeat
+    repeat
+      x := GaussRand(0.0, 1.0);
+      v := 1.0 + c * x;
+    until v > 0;
+
+    v := v * v * v;
+    u := Random();
+  until (u < 1.0 - 0.0331*x*x*x*x) or (Ln(u) < 0.5*x*x + d*(1.0 - v + Ln(v)));
+
+  Result := d * v;
+end;
+
+// Beta distribution via Gamma ratio
+function SampleBeta(alpha, beta: Double): Double;
+var
+  x, y: Double;
+begin
+  x := SampleGamma(alpha);
+  y := SampleGamma(beta);
+  Result := x / (x + y);
+end;
+
+// Safe hash to normalized [0..1]
+function HashToNormalized(str: String): Double;
+var
+  hashStr: String;
+  hashValue: UInt64;
+begin
+  hashStr := HashString(EHashAlgo.SHA1, str);
+  hashValue := StrToUInt64('$' + Copy(hashStr, 1, 16));
+  Result := hashValue / High(UInt64);
+  Result := EnsureRange(Result, 0.0001, 0.9999);
+end;
+
+// =============================================================================
+// TFATIGUE METHODS
+// =============================================================================
+
+procedure TFatigue.InitProfileTraits(profileName: String);
+var
+  tau_days: Double;
+begin
+  // Set RandSeed sequence
+  RandSeed := Round(HashToNormalized(profileName + 'profile_traits') * High(UInt32));
+
+  // C_phaseHours: Normal(mean=0, sd=1.3), clamp [-4.5, +4.5]
+  Self.C_phaseHours := TruncGauss(0.0, 1.3, -4.5, 4.5);
+
+  // D_required: Normal(mean=8.0, sd=0.7), clamp [6, 10]
+  Self.D_required := TruncGauss(8.3, 0.7, 7.0, 10.0);
+
+  // C_amplitude: Lognormal(mean=0.15, log_sigma=0.45), clamp [0.05, 0.35]
+  Self.C_amplitude := EnsureRange(LogNormal(0.15, 0.45), 0.05, 0.35);
+
+  // I_magnitude: Beta(2,5), clamp [0.05, 0.60]
+  Self.I_magnitude := EnsureRange(SampleBeta(2.0, 5.0), 0.05, 0.60);
+
+  // I_tau: Lognormal(mean=40min, log_sigma=0.5), clamp [20, 120] min → ms
+  Self.I_tau := EnsureRange(LogNormal(40.0, 0.5), 20.0, 120.0) * ONE_MINUTE;
+
+  // Sleep date repayment rate
+  Self.D_kpay := EnsureRange(0.4 + SampleBeta(3.0, 2.0) * 0.6, 0.4, 1.0);
+
+  // D_lambda: from tau_days Lognormal(mean=5, log_sigma=0.45), clamp [2, 10]
+  tau_days := EnsureRange(LogNormal(5.0, 0.45), 2.0, 10.0);
+  Self.D_lambda := Exp(-1.0 / tau_days);
+
+  // Per-account modulation bounds
+  Self.K_circadian := TruncGauss(0.25, 0.03, 0.18, 0.32);
+  Self.CircMult_min := TruncGauss(0.70, 0.05, 0.60, 0.80);
+  Self.CircMult_max := TruncGauss(1.30, 0.05, 1.20, 1.40);
+  Self.S_min := TruncGauss(0.12, 0.01, 0.10, 0.14);
+  Self.S_max := TruncGauss(0.90, 0.02, 0.88, 0.95);
+  Self.D_max := TruncGauss(55, 5.0, 36.0, 60.0);
+  Self.Drift_range := TruncGauss(0.35, 0.05, 0.25, 0.45);
+
+  // Done setting profile, randomize seed
+  Randomize();
+
+  Logger.Info('Fatigue Profile - Chronotype:%.1fh Sleep:%.1fh Rhythm:%.2f Inertia:%.0fmin/%.2f Debt:%.2f',
+    [Self.C_phaseHours, Self.D_required, Self.C_amplitude,
+    Self.I_tau/ONE_MINUTE, Self.I_magnitude, Self.D_lambda]);
+  Logger.Info('Modulation Bounds - K_circ:%.2f Circ:[%.2f,%.2f] S:[%.2f,%.2f] D_max:%.0fh Drift:±%.2f',
+    [Self.K_circadian, Self.CircMult_min, Self.CircMult_max,
+    Self.S_min, Self.S_max, Self.D_max, Self.Drift_range]);
+end;
+
+procedure TFatigue.InitSessionTraits(profileName: String);
+var
+  dayNumber: UInt64;
+  HL_work, HL_break, HL_revert: Double;
+begin
+  // Generate deterministic seed for this day
+  dayNumber := Time() div ONE_DAY;
+  RandSeed := Round(HashToNormalized(profileName + 'day' + ToStr(dayNumber)) * High(UInt32));
+
+  // R_deplete: via half-life Lognormal(median=30, log_sigma=0.6), clamp [8, 90]
+  HL_work := EnsureRange(LogNormal(30.0, 0.6), 8.0, 90.0);
+  Self.R_deplete := Ln(2.0) / HL_work;
+
+  // R_recover: via half-life Lognormal(median=5, log_sigma=0.5), clamp [2, 20]
+  HL_break := EnsureRange(LogNormal(5.0, 0.5), 2.0, 20.0);
+  Self.R_recover := Ln(2.0) / HL_break;
+
+  // R_drift: Lognormal(median=0.03, log_sigma=0.6), clamp [0.005, 0.12]
+  Self.R_drift := EnsureRange(LogNormal(0.03, 0.6), 0.005, 0.12);
+
+  // R_revert: via half-life Lognormal(median=10, log_sigma=0.6), clamp [3, 45]
+  HL_revert := EnsureRange(LogNormal(10.0, 0.6), 3.0, 45.0);
+  Self.R_revert := Ln(2.0) / HL_revert;
+
+  // R_onsetTime: SampleBeta(2.5, 2.5), clamp [8, 50]
+  Self.R_onsetTime := EnsureRange(8.0 + SampleBeta(2.5, 2.5) * 42.0, 8.0, 50.0);
+
+  // R_onsetSteep: SampleBeta(3.0, 2.0), clamp [0.15, 0.70]
+  Self.R_onsetSteep := EnsureRange(0.15 + SampleBeta(3.0, 2.0) * 0.55, 0.15, 0.70);
+
+  // RTMult: Normal(mean=1.4, sd=0.15), clamp [1.1, 2.2]
+  Self.RTMult := EnsureRange(1.1 + SampleBeta(2.0, 3.0) * 1.0, 1.1, 2.1);
+
+  // ErrRate: Beta [0.02, 0.10]
+  Self.ErrRate := EnsureRange(0.02 + SampleBeta(2.0, 8.0) * 0.08, 0.02, 0.10);
+
+  //
+  Self.F_cap := TruncGauss(1.1, 0.08, 0.9, 1.2);
+
+  // New random seed
+  Randomize();
+
+  Logger.Info('Session Traits - Deplete:%.3f/min Recover:%.3f/min Drift:%.3f Revert:%.3f/min Onset:%.0fmin/%.2f',
+    [Self.R_deplete, Self.R_recover, Self.R_drift, Self.R_revert,
+     Self.R_onsetTime, Self.R_onsetSteep]);
+end;
+
+procedure TFatigue.Update(forceSave: Boolean = False);
+const
+  SAVE_INTERVAL = 5 * ONE_MINUTE;
+var
+  dt_ms, dt_min, dt_hours, sessionMin, awakeHours: Double;
+  onsetFactor, noise, driftFactor, exp2theta, ouStdDev: Double;
+  w_ToT, w_S, w_I, w_D, wSum: Double;
+  rS, rD: Double;
+  circMult, C_norm: Double;
+  dt: TDateTime;
+  hourOfDay: Double;
+begin
+  if PestControl.UserDisableFatigue then Exit;
+
+  // Guard against multiple calls per tick
+  if Time() <= Self.Last then Exit;
+
+  dt_ms := Time() - Self.Last;
+  if dt_ms < 1.0 then Exit;
+
+  dt_min := dt_ms / ONE_MINUTE;
+  dt_hours := dt_ms / ONE_HOUR;
+  sessionMin := (Time() - Self.Start) / ONE_MINUTE;
+  awakeHours := (Time() - Self.LastWakeTime) / ONE_HOUR;
+
+  // ========================================================================
+  // LAYER 1: Time-on-Task Resource (only during active play)
+  // ========================================================================
+
+  if not (PestControl.State in [EPestState.BREAK, EPestState.SLEEP]) then
+  begin
+    onsetFactor := 1.0 / (1.0 + Exp(-Self.R_onsetSteep * (sessionMin - Self.R_onsetTime)));
+
+    Self.R_revert := Max(Self.R_revert, 1.0e-6);
+    exp2theta := Exp(-2.0 * Self.R_revert * dt_min);
+    ouStdDev := Self.R_drift * Sqrt((1.0 - exp2theta) / (2.0 * Self.R_revert));
+    noise := GaussRand(0.0, ouStdDev);
+    Self.R_driftCur := Self.R_driftCur * Exp(-Self.R_revert * dt_min) + noise;
+    Self.R_driftCur := EnsureRange(Self.R_driftCur, -Self.Drift_range, Self.Drift_range);
+
+    driftFactor := EnsureRange(1.0 + Self.R_driftCur, 0.3, 1.7);
+
+    // old: R_resource := R_resource - (R_deplete * driftFactor * onsetFactor * dt_min)
+    Self.R_resource := Self.R_resource * Exp(-Self.R_deplete * driftFactor * onsetFactor * dt_min);
+    Self.R_resource := EnsureRange(Self.R_resource, 0.0, 1.0);
+  end;
+
+  // ========================================================================
+  // LAYER 2: Homeostatic Sleep Pressure (always during wake)
+  // ========================================================================
+
+  if not (PestControl.State in [EPestState.SLEEP]) then
+  begin
+    Self.S_homeostat := Self.S_max - (Self.S_max - Self.S_homeostat) * Exp(-dt_ms / S_TAU_WAKE_MS);
+    Self.S_homeostat := EnsureRange(Self.S_homeostat, Self.S_min, Self.S_max);
+  end;
+
+  // ========================================================================
+  // LAYER 3: Circadian Rhythm (always updates)
+  // ========================================================================
+
+  dt := TDateTime.CreateFromSystem();
+  hourOfDay := dt.Hour + dt.Minute / 60.0;
+
+  C_norm := Cos((2.0 * PI / 24.0) * (hourOfDay - Self.C_phaseHours));
+  C_norm := EnsureRange(C_norm, -1.0, 1.0);
+
+  Self.C_current := Self.C_amplitude * C_norm;
+
+  // ========================================================================
+  // LAYER 4: Sleep Inertia (always decays)
+  // ========================================================================
+
+  if Self.I_current > 0.001 then
+    Self.I_current := Self.I_current * Exp(-dt_ms / Self.I_tau)
+  else
+    Self.I_current := 0.0;
+
+  // ========================================================================
+  // COMBINE: Dynamic Weight Regime Transitions
+  // ========================================================================
+
+  rS := Ramp(awakeHours, 2.0, 10.0);
+  rD := Ramp(awakeHours, 12.0, 24.0);
+
+  w_ToT := 0.45 - 0.15 * rS;
+  w_S := 0.20 + 0.20 * rS;
+  w_I := 0.15;
+  w_D := 0.05 + 0.15 * rD;
+
+  wSum := w_ToT + w_S + w_I + w_D;
+  if wSum > 0 then
+  begin
+    w_ToT := w_ToT / wSum;
+    w_S   := w_S   / wSum;
+    w_I   := w_I   / wSum;
+    w_D   := w_D   / wSum;
+  end;
+
+  Self.F_raw := w_ToT * (1.0 - Self.R_resource)
+              + w_S * ((Self.S_homeostat - Self.S_min) / (Self.S_max - Self.S_min))
+              + w_I * Self.I_current
+              + w_D * EnsureRange(Self.D_debt / Self.D_max, 0.0, Self.D_max);
+
+  circMult := EnsureRange(1.0 - Self.K_circadian * Self.C_current, Self.CircMult_min, Self.CircMult_max);
+
+  Self.F_total := EnsureRange(Self.F_raw * circMult, 0.0, Self.F_cap);
+
+  Self.Last := Time();
+
+  if forceSave or ((Time() - Self.LastSave) >= SAVE_INTERVAL) then
+  begin
+    Self.SaveToConfig();
+    Self.Config.Save();
+    Self.LastSave := Time();
+    Logger.Success('-Saved Fatigue Profile Data-', [Self.Config.Data.Format]);
+  end;
+end;
+
+procedure TFatigue.RecoverFromBreak(breakDuration_ms: UInt64);
+var
+  breakMin: Double;
+  napFactor, contextFactor: Double;
+  isCircadianLow, isCircadianHigh, highDebt: Boolean;
+  C_norm, hourOfDay: Double;
+  dt: TDateTime;
+  beforeR: Double;
+begin
+  breakMin := breakDuration_ms / 60000.0;
+  beforeR := Self.R_resource;
+
+  // Resource recovery - exponential approach
+  Self.R_resource := 1.0 - (1.0 - Self.R_resource) * Exp(-Self.R_recover * Self.BreakQuality * breakMin);
+  Self.R_resource := EnsureRange(Self.R_resource, 0.0, 1.0);
+
+  // Inertia trigger if break >= nap threshold
+  if breakMin >= NAP_THRESHOLD_MIN then
+  begin
+    napFactor := EnsureRange((breakMin - 15.0) / 30.0, 0.0, 1.0);
+
+    dt := TDateTime.CreateFromSystem();
+    hourOfDay := dt.Hour + dt.Minute / 60.0;
+    C_norm := Cos((2.0 * PI / 24.0) * (hourOfDay - Self.C_phaseHours));
+
+    isCircadianLow := C_norm <= -0.6;
+    isCircadianHigh := C_norm >= 0.6;
+    highDebt := Self.D_debt >= 6.0;
+
+    contextFactor := 1.0;
+    if isCircadianLow then contextFactor := contextFactor + 0.4;
+    if isCircadianHigh then contextFactor := contextFactor - 0.3;
+    if highDebt then contextFactor := contextFactor + 0.3;
+    contextFactor := EnsureRange(contextFactor, 0.5, 1.5);
+
+    Self.I_current := Self.I_magnitude * napFactor * contextFactor;
+    Self.LastWakeTime := Time();
+
+    Logger.Info('Nap inertia - Duration:%.0fmin NapFactor:%.2f Context:%.2f Inertia:%.2f',
+      [breakMin, napFactor, contextFactor, Self.I_current]);
+  end;
+
+  Self.Last := Time();
+  Logger.Info('Break recovery - Resource: %.1f%% → %.1f%%', [beforeR * 100, Self.R_resource * 100]);
+  Self.Update(True);
+end;
+
+procedure TFatigue.RecoverFromSleep(sleepDuration_ms: UInt64);
+var
+  sleepHours: Double;
+  deficit, surplus: Double;
+  beforeS, beforeD: Double;
+  contextFactor: Double;
+  isCircadianLow, highDebt: Boolean;
+  C_norm, hourOfDay: Double;
+  dt: TDateTime;
+begin
+  sleepHours := sleepDuration_ms / ONE_HOUR;
+  beforeS := Self.S_homeostat;
+  beforeD := Self.D_debt;
+
+  // Homeostat recovery
+  Self.S_homeostat := Self.S_min + (Self.S_homeostat - Self.S_min) * Exp(-sleepDuration_ms / S_TAU_SLEEP_MS);
+  Self.S_homeostat := EnsureRange(Self.S_homeostat, Self.S_min, Self.S_max);
+
+  // Debt repayment
+  // RESEARCH MODEL: D(t+1) = λ*D(t) + Max(0, Required - Actual)
+  deficit := Max(0.0, Self.D_required - sleepHours);
+  surplus := Max(0, sleepHours - Self.D_required);
+  Self.D_debt := Self.D_lambda * Self.D_debt + deficit - (Self.D_kpay * surplus);
+  Self.D_debt := EnsureRange(Self.D_debt, 0.0, Self.D_max);
+
+  // Full resource restoration
+  Self.R_resource := 1.0;
+
+  // Trigger inertia with context
+  dt := TDateTime.CreateFromSystem();
+  hourOfDay := dt.Hour + dt.Minute / 60.0;
+  C_norm := Cos((2.0 * PI / 24.0) * (hourOfDay - Self.C_phaseHours));
+
+  isCircadianLow := C_norm <= -0.6;
+  highDebt := Self.D_debt >= 6.0;
+
+  contextFactor := 1.0;
+  if isCircadianLow then contextFactor := contextFactor + 0.4;
+  if highDebt then contextFactor := contextFactor + 0.3;
+  contextFactor := EnsureRange(contextFactor, 0.5, 1.5);
+
+  Self.I_current := Self.I_magnitude * contextFactor;
+  Self.LastWakeTime := Time();
+  Self.LastSleepTime := Time() - sleepDuration_ms;
+
+  Self.Last := Time();
+
+  Logger.Info('Sleep recovery - %.1fh S:%.1f%%→%.1f%% Debt:%.1fh→%.1fh Inertia:%.2f',
+    [sleepHours, beforeS * 100, Self.S_homeostat * 100, beforeD, Self.D_debt, Self.I_current]);
+  Self.Update(True);
+end;
+
+property TFatigue.GetRTMulti: Double;
+begin
+  if PestControl.UserDisableFatigue then
+    Exit(1.0);
+  Self.Update();
+  Result := 1.0 + (Self.RTMult - 1.0) * Self.F_total;
+end;
+
+property TFatigue.ShouldError: Boolean;
+begin
+  if PestControl.UserDisableFatigue then
+    Exit(False);
+  Self.Update();
+  Result := Random() < (Self.ErrRate * Self.F_total);
+end;
+
+property TFatigue.GetErrRate: Double;
+begin
+  if PestControl.UserDisableFatigue then
+    Exit(0.0);
+  Self.Update();
+  Result := Self.ErrRate * Self.F_total;
+end;
+
+property TFatigue.GetLvl: Double;
+begin
+  if PestControl.UserDisableFatigue then
+    Exit(0.0);
+  Self.Update();
+  Result := Self.F_total;
+end;
+
+property TFatigue.GetBaseRT: Double;
+begin
+  if PestControl.UserDisableFatigue then
+    Exit(PestControl.bRT);
+  Result := PestControl.bRT * Self.GetRTMulti;
+end;
+
+procedure TConfigJSON.SetConfig(const key: String; value: Double); overload;
+begin
+  if not Self.Data.Has(key) then
+    Self.Data.AddFloat(key, value)
+  else
+    Self.Data.Item[key].AsFloat := value;
+end;
+
+procedure TConfigJSON.SetConfig(const key: String; value: UInt64); overload;
+begin
+  if not Self.Data.Has(key) then
+    Self.Data.AddInt(key, value)
+  else
+    Self.Data.Item[key].AsInt := value;
+end;
+
+procedure TConfigJSON.SetConfig(const key: String; value: Boolean); overload;
+begin
+  if not Self.Data.Has(key) then
+    Self.Data.AddBool(key, value)
+  else
+    Self.Data.Item[key].AsBool := value;
+end;
+
+procedure TConfigJSON.SetConfig(const key: String; value: String); overload;
+begin
+  if not Self.Data.Has(key) then
+    Self.Data.AddString(key, value)
+  else
+    Self.Data.Item[key].AsString := value;
+end;
+
+procedure TFatigue.SaveToConfig();
+var
+  testFloat: Double = 0.0;
+begin
+  if PestControl.UserDisableFatigue then
+  begin
+    Logger.Warn('TFatigue.SaveToConfig() - Self.UserDisableFatigue=true');
+    Exit();
+  end;
+  WriteLn('[DEBUG SaveToConfig] LastWakeTime=', Self.LastWakeTime, ' D_debt=', Self.D_debt);
+
+  if Self.Config.Data = nil then
+  begin
+    WriteLn('[ERROR] Self.Config.Data is nil!');
+    Exit;
+  end else
+    Writeln(Self.Config.Data);
+
+  Self.Config.SetConfig('fatigue_C_phaseHours', Self.C_phaseHours);
+  Self.Config.SetConfig('fatigue_D_required', Self.D_required);
+  Self.Config.SetConfig('fatigue_C_amplitude', Self.C_amplitude);
+  Self.Config.SetConfig('fatigue_I_magnitude', Self.I_magnitude);
+  Self.Config.SetConfig('fatigue_I_tau_ms', Self.I_tau);
+  Self.Config.SetConfig('fatigue_D_lambda', Self.D_lambda);
+
+  Self.Config.SetConfig('fatigue_K_circadian', Self.K_circadian);
+  Self.Config.SetConfig('fatigue_CircMult_min', Self.CircMult_min);
+  Self.Config.SetConfig('fatigue_CircMult_max', Self.CircMult_max);
+  Self.Config.SetConfig('fatigue_S_min', Self.S_min);
+  Self.Config.SetConfig('fatigue_S_max', Self.S_max);
+  Self.Config.SetConfig('fatigue_D_max', Self.D_max);
+  Self.Config.SetConfig('fatigue_Drift_range', Self.Drift_range);
+
+  Self.Config.SetConfig('fatigue_last_wake_ms', Self.LastWakeTime);
+  Self.Config.SetConfig('fatigue_sleep_debt', Self.D_debt);
+  Self.Config.SetConfig('fatigue_sleep_repay', Self.D_kpay);
+
+  WriteLn('[DEBUG After SetConfig] last_wake in data=', Self.Config.Data.Item['fatigue_last_wake_ms'].AsFloat);
+end;
+
+function TFatigue.LoadFromConfig(): Boolean;
+begin
+  if PestControl.UserDisableFatigue then
+  begin
+    Logger.Warn('TFatigue.LoadFromConfig() - Self.UserDisableFatigue=true');
+    Exit();
+  end;
+  writeln('TFatigue.LoadFromConfig(): Boolean;');
+  if not Self.Config.Data.Has('fatigue_sleep_repay') then Exit(False);
+
+  Self.C_phaseHours := Self.Config.Data.Item['fatigue_C_phaseHours'].AsFloat;
+  Self.D_required := Self.Config.Data.Item['fatigue_D_required'].AsFloat;
+  Self.C_amplitude := Self.Config.Data.Item['fatigue_C_amplitude'].AsFloat;
+  Self.I_magnitude := Self.Config.Data.Item['fatigue_I_magnitude'].AsFloat;
+  Self.I_tau := Self.Config.Data.Item['fatigue_I_tau_ms'].AsFloat;
+  Self.D_lambda := Self.Config.Data.Item['fatigue_D_lambda'].AsFloat;
+  Self.D_debt := Self.Config.Data.Item['fatigue_sleep_debt'].AsFloat;
+  Self.K_circadian := Self.Config.Data.Item['fatigue_K_circadian'].AsFloat;
+  Self.CircMult_min := Self.Config.Data.Item['fatigue_CircMult_min'].AsFloat;
+  Self.CircMult_max := Self.Config.Data.Item['fatigue_CircMult_max'].AsFloat;
+  Self.S_min := Self.Config.Data.Item['fatigue_S_min'].AsFloat;
+  Self.S_max := Self.Config.Data.Item['fatigue_S_max'].AsFloat;
+  Self.D_max := Self.Config.Data.Item['fatigue_D_max'].AsFloat;
+  Self.Drift_range := Self.Config.Data.Item['fatigue_Drift_range'].AsFloat;
+  Self.D_debt := Self.Config.Data.Item['fatigue_sleep_debt'].AsFloat;
+  Self.D_kpay := Self.Config.Data.Item['fatigue_sleep_repay'].AsFloat;
+  Self.LastWakeTime := Round(Self.Config.Data.Item['fatigue_last_wake_ms'].AsFloat);
+
+  // Validate loaded data
+  if (Self.D_kpay = 0.0) or (Self.Drift_range = 0.0) or
+    (Self.C_phaseHours = 0.0) then Exit(False);
+
+  Result := True;
+end;
+
+procedure TFatigue.Init(profileName: String);
+var
+  hoursAwake: Double;
+begin
+  WriteLn('[DEBUG] TFatigue.Init() starting');
+  Self.Config.Setup('jds-fatigue');
+  if Self.Config.Data = nil then
+    WriteLn('[ERROR] Self.Config.Data is nil in F.Init()!')
+  else
+    WriteLn('[OK] Self.Config.Data valid in F.Init()');
+  Self.Start := Time();
+  Self.Last := Time();
+  Self.LastSave := Time();
+
+  if not Self.LoadFromConfig() then
+  begin
+    Logger.Warn('No fatigue profile - generating new traits');
+    Self.InitProfileTraits(profileName);
+
+    if Length(Antiban.Sleeps) = 0 then
+    begin
+      PestControl.UserDisableFatigue := True;
+      Logger.Warn('No sleep schedule - fatigue disabled');
+      Exit;
+    end;
+
+    Self.LastWakeTime := Round(Time() - Antiban.Sleeps[0].Next - Random(Antiban.Sleeps[0].Length/3, Antiban.Sleeps[0].Length));
+    Self.D_debt := 0.0;
+  end;
+
+  if Self.LastWakeTime = 0 then
+    Self.LastWakeTime := Round(Time() - Antiban.Sleeps[0].Next - Random(Antiban.Sleeps[0].Length/3, Antiban.Sleeps[0].Length));
+
+  Self.InitSessionTraits(profileName);
+
+  Self.R_resource := 1.0;
+  Self.R_driftCur := 0.0;
+  Self.I_current := 0.0;
+
+  hoursAwake := Max(0.0, (Time() - Self.LastWakeTime) / ONE_HOUR);
+  Self.S_homeostat := Self.S_max - (Self.S_max - Self.S_min) * Exp(-hoursAwake * ONE_HOUR / S_TAU_WAKE_MS);
+  Self.S_homeostat := EnsureRange(Self.S_homeostat, Self.S_min, Self.S_max);
+
+  Self.BreakQuality := 0.7;//move to profile init or redesign
+
+  Logger.Info('Fatigue init - Awake:%.2fh S:%.2f%% Debt:%.1fh',
+    [hoursAwake, Self.S_homeostat * 100, Self.D_debt]);
+
+  Self.SaveToConfig();
+  Self.Config.Save();
+end;
+
+function ExpoGaussRT(mean: Double = PestControl.bRT): Double;
+var
+  mu, sigma, tau, f: Double;
+begin
+  if mean < 1 then mean := 1;
+
+  f := PestControl.F.GetLvl;
+
+  // Core latency increases gently with fatigue
+  mu := mean * (1.0 + 0.10 * f);
+
+  // Sigma: modest distribution spread
+  sigma := mu * EnsureRange((0.10 + 0.10*PestControl.RT[0].U)
+    * (1.0 + 0.30*f), 0.08, 0.28);
+
+  // Tau: substantial tail growth with fatigue
+  tau   := mu * EnsureRange((0.18 + 0.18*PestControl.RT[1].U)
+    * (1.0 + 1.2*f), 0.12, 0.75);
+
+  Result := ExpoGaussEx(mu, sigma, tau);
+end;
+
+function ExpoGaussRTInt(mean: Double): UInt64;
+begin
+  Result := Round(ExpoGaussRT(mean));
+end;
+
+// WEIBULL (math form):
+//   CDF: 1 - exp(-(x/scale)^shape)
+//   shape_k > 0, scale_lambda > 0
+//   Useful for fatigue / hazard-rate modeling.
+function WeibullEx(shape_k, scale_lambda: Double): Double;
+var
+  u: Double;
+begin
+  if shape_k <= 0 then
+    shape_k := 0.000001;
+  if scale_lambda <= 0 then
+    scale_lambda := 0.000001;
+
+  u := NZRandom; // uniform [0,1)
+
+  // Inverse CDF
+  Result := scale_lambda * Power(-Ln(u), 1.0 / shape_k);
+
+  if Result < 0 then
+    Result := 0;
 end;
 
 //override include to set zoom if it is wrong
@@ -682,7 +1299,7 @@ begin
     y := barBox.Y2 +4;
     y := DrawSep(y);
     FontSize := 12;
-    y := DrawRow('Runtime', runtimeStr, y, 'F '+ FormatFloat('##0.0', Self.F.Lvl*100)+'%');
+    y := DrawRow('Runtime', runtimeStr, y, 'F '+ FormatFloat('##0.0', Self.F.F_total*100)+'%');
     if stateStr.Contains('DEFEND') then
       y := DrawRow('State', stateStr, y, FmtTime(Time-Self.GameStart))
     else
@@ -828,7 +1445,7 @@ procedure TPestControl.UpdateAttkDelay();
 var
   candidate: Double;
 begin
-  candidate := ExpoGaussRT(Self.Tempo.LowMean * Self.F.GetRTMulti, Self.RT[0].U, Self.RT[1].U);
+  candidate := ExpoGaussRT(Self.Tempo.LowMean);
   if Self.NextAttkDelay > 0 then
   begin
     if Random() < (0.10 + 0.05 * Self.RT[2].U) then
@@ -844,7 +1461,7 @@ procedure TPestControl.UpdateXPAttkDelay();
 var
   candidate: Double;
 begin
-  candidate := ExpoGaussRT(Self.Tempo.XPMean * Self.F.GetRTMulti, Self.RT[0].U, Self.RT[1].U);
+  candidate := ExpoGaussRT(Self.Tempo.XPMean);
 
   if Self.XPAttkDelay > 0 then
   begin
@@ -875,40 +1492,6 @@ begin
     Self.LastXP := nXP;
     Self.LastXPTime := Time;
   end;
-end;
-
-procedure TFatigue.Update();
-var
-  dt, dtMin, sessionMin: Double;
-  noise, driftFactor, effectiveRate, onsetFactor: Double;
-  exp2theta, ouStdDev: Double;
-begin
-  if PestControl.UserDisableFatigue then Exit;
-  if PestControl.State in [EPestState.BREAK, EPestState.SLEEP] then Exit;
-
-  dt := Time - Self.Last;
-  dtMin := dt / 60000.0;
-  sessionMin := (Time - Self.Start) / 60000.0;
-
-  // Sigmoid ramp with per-session steepness
-  onsetFactor := 1.0 / (1.0 + Exp(-Self.OnsetSteep * (sessionMin - Self.OnsetTime)));
-
-  // Exact discrete OU process
-  exp2theta := Exp(-2.0 * Self.Revert * dtMin);
-  ouStdDev := Self.Drift * Sqrt((1.0 - exp2theta) / (2.0 * Self.Revert));
-  noise := GaussRand(0, ouStdDev);
-  Self.DriftCur := Self.DriftCur * Exp(-Self.Revert * dtMin) + noise;
-
-  // Prevent drift from making rate negative
-  driftFactor := Min(Max(0.3, 1.0 + Self.DriftCur), 1.7);
-
-  // Apply onset ramp to effective rate
-  effectiveRate := Self.Rate * driftFactor * onsetFactor;
-
-  // Exact exponential approach to saturation
-  Self.Lvl := 1.0 - (1.0 - Self.Lvl) * Exp(-effectiveRate * dtMin);
-
-  Self.Last := Time;
 end;
 
 function TAntiban.TaskDue(): Boolean;
@@ -1017,7 +1600,7 @@ begin
   shape := Random(1.4, 1.5) + 1 * Self.P[1].U;
 
   // Scale: Typical timing
-  scale := 5500 + GaussRand(400,125) + 6000 * Self.P[0].U;
+  scale := Self.F.GetRTMulti * 5500 + GaussRand(400,125) + 6000 * Self.P[0].U;
 
   // Session variance: This game's randomness
   scale := scale * (0.8 + (0.4 + Self.P[2].U/5) * Random());
@@ -1038,7 +1621,7 @@ begin
   else
     if GameTabs.Open(ERSGameTab.COMBAT) then
     begin
-      Sleep(ExGaussInt(Self.F.GetBaseRT));
+      Sleep(ExpoGaussRTInt(Self.bRT));
       Self.CombatLevel := OCR.RecognizeNumber(cbBox.Expand(3), RSFonts.PLAIN_11, [2070783], 0);
     end;
   Logger.Info('Combat Level: %d', [Self.CombatLevel]);
@@ -1168,7 +1751,7 @@ begin
   else
     Mouse.Move(destMS, True, EMouseDistribution.GAUSS);
 
-  Sleep(ExGaussInt(Self.F.GetBaseRT * 0.8));
+  Sleep(ExpoGaussRTInt(Self.bRT * 0.8));
   if not Self.InBoat() then Exit;
 
   if MainScreen.IsUpText('Walk here') then
@@ -1184,7 +1767,7 @@ end;
 procedure TPestControl.WhileInBoat();
 begin
   if not Self.UserDisableMoveInBoat then Self.MoveInBoat();
-  Sleep(ExGaussInt(Self.F.GetBaseRT));
+  Sleep(ExpoGaussRTInt(Self.bRT));
 end;
 
 //function from include, I am not author
@@ -1217,7 +1800,7 @@ begin
   if Self.Flag.DelayBoatMove then
   begin
     Self.LastBoatMove := Time;
-    Self.BoatMoveDelay := ExGaussInt(Self.F.GetBaseRT*Random(0.537, 5+5*bhM.U));
+    Self.BoatMoveDelay := ExpoGaussRTInt(Self.bRT*Random(0.537, 5+5*bhM.U));
     Logger.Info('BoatMoveDelay: %.4f', [Self.BoatMoveDelay]);
   end;
   Self.ReadPoints();
@@ -1233,7 +1816,7 @@ end;
 
 procedure TPestControl.EnterBoat();
 begin
-  Sleep(ExGaussInt(Self.F.GetBaseRT * 2.9));
+  Sleep(ExpoGaussRTInt(Self.bRT * 2.9));
   if Chat.IsTitle('~ Warning ~') then
     TerminateScript('Too many points '+Chat.ReadPointsOption());
   try
@@ -1241,7 +1824,7 @@ begin
       if SleepUntil(Self.InBoat, 50, Round(GaussRand(3000, 200))) then
       begin
         Self.SetPerGame();
-        Sleep(ExGaussInt(Self.F.GetBaseRT * 3.9));
+        Sleep(ExpoGaussRTInt(Self.bRT * 3.9));
         if not InRange(Options.GetZoomLevel(True), 30, 50) then
           if Options.SetZoomLevel(RandomMode(35+Round(10*bhM.U), 30, 50)) then
             WriteLn GetDebugLn('Options', 'Zoom adjusted level: ' + ToString(Options.ZoomLevel), ELogLevel.SUCCESS);
@@ -1252,13 +1835,14 @@ end;
 
 procedure TPestControl.EnablePrayerCheck();
 begin
-  if not (Self.Flag.NoPray) and Self.UserQuickPrayer and Self.GameStarted
-    and Self.InGame() and (Time > (Self.GameStart + Self.PrayerEnableTime)) then
-    if not Minimap.PrayerEnabled then
+  if (not Self.Flag.NoPray) and Self.UserQuickPrayer and Self.GameStarted and
+    (not Minimap.PrayerEnabled) and Self.InGame() and
+    (Time > (Self.GameStart + Self.PrayerEnableTime)) and
+    (Self.ReadPortalHP > Round(50 + 150*bhM.U)) then
       if Minimap.EnablePrayer() then
       begin
         if Biometrics.RandomBoolean() then
-          Sleep(ExGaussInt(Self.F.GetBaseRT*(0.3+random(0.01, 2.1))));
+          Sleep(ExpoGaussRTInt(Self.bRT*(0.3+random(0.01, 2.1))));
         if Biometrics.RandomBoolean(0.23) then
           Mouse.Move(Mainscreen.Bounds, True);
       end;
@@ -1268,13 +1852,16 @@ procedure TPestControl.WalkToDefend();
 var
   uniqueMiddle, midP, msP: TPoint;
 begin
-  Sleep(ExGaussInt(Self.F.GetBaseRT * 1.7));
+  Sleep(ExpoGaussRTInt(Self.bRT * 1.7));
+  if Self.F.ShouldError then
+    Sleep(LogNormalInt(Self.F.GetBaseRT, 0.35 + 0.1 * Self.RT[0].u));
   if not Self.InGame() then Exit;
   if not Self.GameStarted then
   begin
     Self.GameStarted := True;
     Self.GameStart := Time;
   end;
+
   Self.EnablePrayerCheck();
   if Self.PlatformCenter(midP) then
   begin
@@ -1293,9 +1880,9 @@ begin
         if RandomBoolean(0.63+30*bhM.U) and (_bhM.U < 0.933) then
         begin
           Minimap.WaitMoving(Round(Self.F.GetBaseRT*Random(50, 100)));
-          Sleep(ExGaussInt(Self.F.GetBaseRT*RandomLeft(0.7, 3.1)));
+          Sleep(ExpoGaussRTInt(Self.bRT*RandomLeft(0.7, 3.1)));
         end else
-          Sleep(ExGaussInt(Self.F.GetBaseRT*GaussRand(10, 2.5)));
+          Sleep(ExpoGaussRTInt(Self.bRT*GaussRand(10, 2.5)));
         Exit;
       end;
     end;
@@ -1496,6 +2083,7 @@ begin
 
   try
     if not Self.FindShifters(atpa) then Exit(False);
+    Sleep(ExpoGaussRTInt(Self.bRT*0.7));
 
     strategy := Self.ChooseStrategy();
     Self.SortByStrategy(strategy, atpa);
@@ -1517,36 +2105,35 @@ begin
   end;
 end;
 
-//function TPestControl.AttackShifter(debug: Boolean = False): Boolean;
-//begin
-//  if debug then DebugShifterClusters(Self.Shifter);
-//  try
-//    Result := Self.Shifter.Click(True, 1+Round(2*bhM.U));
-//  except Logger.Error('AttackShifter exception: %s', [GetExceptionMessage]); end;
-//end;
+procedure TPestControl.MaybeEmote();
+begin
+
+end;
 
 procedure TPestControl.DefendKnight();
 begin
-  Sleep(ExGaussInt(Self.F.GetBaseRT*0.8));
+  Sleep(ExpoGaussRTInt(Self.bRT*0.8));
   Self.UpdateXP();
   if (Time - Self.LastXPTime) < Self.XPAttkDelay then Exit;
   if (Time - Self.LastAttack) < Self.NextAttkDelay then Exit;
   if not Self.InGame() then Exit;
-  Self.EnablePrayerCheck();
+  if Biometrics.RandomBoolean(0.75) then
+    Self.EnablePrayerCheck();
 
   if Self.AttackShifter({true}) then
   begin
     Activity.Restart();
     Self.LastAttack := Time;
     Self.UpdateAttkDelay();
-    Sleep(ExGaussInt(Self.F.GetBaseRT*2.2));
+    Sleep(ExpoGaussRTInt(Self.bRT*2.2));
   end;
+  Self.EnablePrayerCheck();
 end;
 
 procedure TPestControl.LeaveTheGame();
 begin
   if not Self.InGame() then Exit;
-  Sleep(ExGaussInt(Self.F.GetBaseRT * 3.3));
+  Sleep(ExpoGaussRTInt(Self.bRT * 3.3));
   if not Self.InGame() then Exit;
   try
     Writeln('Distance to Squire: ', Self.Squire.DistanceTo(Map.Position()));
@@ -1591,11 +2178,11 @@ begin
 
   Self.Tempo.XPMean := (2573 + 990 * bhM.U) * xpVar;
   Self.Tempo.XPStick := 0.20 + 0.18 * ((bhInt shr 5) mod 1000 / 1000.0);
-  Self.XPAttkDelay := ExpoGaussRT(Self.Tempo.XPMean, Self.RT[0].U, Self.RT[1].U);
+  Self.XPAttkDelay := ExpoGaussRT(Self.Tempo.XPMean);
 
   Self.Tempo.LowMean := (750 + 350 * _bhM.U) * lowVar;
   Self.Tempo.LowStick := 0.20 + 0.18 * (((bhInt shr 5) xor 913) mod 1000 / 1000.0);
-  Self.NextAttkDelay := ExpoGaussRT(Self.Tempo.LowMean, Self.RT[0].U, Self.RT[1].U);
+  Self.NextAttkDelay := ExpoGaussRT(Self.Tempo.LowMean);
 
   Logger.Info('Tempo - XP:%.0fms(x%.2f) Low:%.0fms(x%.2f)',
     [Self.Tempo.XPMean, xpVar, Self.Tempo.LowMean, lowVar]);
@@ -1618,32 +2205,54 @@ end;
 
 procedure TPestControl.OnBreakStart(task: PBreakTask);
 begin
-  Logger.Info('Break starting - Fatigue: %.1f%%', [Self.F.GetLvl * 100]);
+  if not Self.UserDisableFatigue then
+    Logger.Info('Break starting - Fatigue: %.1f%%', [Self.F.GetLvl * 100])
+  else
+    Logger.Info('Break starting: ' + FormatMilliseconds(Round(task^.Length), TIME_FORMAL));
 end;
 
 procedure TPestControl.OnSleepStart(task: PSleepTask);
 begin
-  Logger.Info('Sleep starting - Fatigue: %.1f%%', [Self.F.GetLvl * 100]);
+  if not Self.UserDisableFatigue then
+    Logger.Info('Sleep starting - Fatigue: %.1f%%', [Self.F.GetLvl * 100])
+  else
+    Logger.Info('Sleep starting: ' + FormatMilliseconds(Round(task^.Length), TIME_FORMAL));
 end;
 
 procedure TPestControl.OnBreakEnd(task: PBreakTask);
-var before: Double;
+var
+  before: Double;
+  length: UInt64;
 begin
   Activity.Restart();
-  before := Self.F.Lvl;
-  Self.F.Recover(Self.F.BrkRecov, Round(task^.Length));
-  Logger.Info('Break ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
-    [before * 100, Self.F.Lvl * 100, (before - Self.F.Lvl) * 100]);
+  if not Self.UserDisableFatigue then
+  begin
+    before := Self.F.GetLvl;
+    length := Round(task^.Length);
+    Self.F.RecoverFromBreak(length);
+    Logger.Info('Break ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
+      [before * 100, Self.F.F_total * 100, (before - Self.F.F_total) * 100]);
+  end;
+
+  Logger.Info('Break of ' + FormatMilliseconds(length, TIME_FORMAL) + ' ended');
 end;
 
 procedure TPestControl.OnSleepEnd(task: PSleepTask);
-var before: Double;
+var
+  before: Double;
+  length: UInt64;
 begin
   Activity.Restart();
-  before := Self.F.Lvl;
-  Self.F.Recover(Self.F.SlpRecov, Round(task^.Length));
-  Logger.Info('Sleep ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
-    [before * 100, Self.F.Lvl * 100, (before - Self.F.Lvl) * 100]);
+  if not Self.UserDisableFatigue then
+  begin
+    before := Self.F.GetLvl;
+    length := Round(task^.Length);
+    Self.F.RecoverFromSleep(length);
+    Logger.Info('Sleep ended - Fatigue: %.1f%% → %.1f%% (recovered %.1f%%)',
+      [before * 100, Self.F.F_total * 100, (before - Self.F.F_total) * 100]);
+  end;
+
+  Logger.Info('Sleep of ' + FormatMilliseconds(length, TIME_FORMAL) + ' ended');
 end;
 
 procedure TPestControl.OnBreakingHud(task: PBreakTask; var countdown: TCountdown);
@@ -1761,47 +2370,6 @@ begin
     [Self.AttackWeights[0]*100, Self.AttackWeights[1]*100, Self.AttackWeights[2]*100, Self.AttackStick*100]);
 end;
 
-procedure TFatigue.Init();
-var
-  rateVar, onsetVar, brkVar, slpVar: Double;
-  rtVar, errVar, driftVar, revertVar, steepVar: Double;
-begin
-  Self.U.Create(['rate', 'drift', 'revert', 'rtMult', 'errRate', 'brkRecov', 'slpRecov', 'onsetTime']);
-
-  // Major session variance (±20%, ±15%, ±10%)
-  rateVar := EnsureRange(GaussRand(1.0, 0.10), 0.7, 1.3);
-  onsetVar := EnsureRange(GaussRand(1.0, 0.10), 0.7, 1.3);
-  brkVar := EnsureRange(GaussRand(1.0, 0.075), 0.775, 1.225);
-  slpVar := EnsureRange(GaussRand(1.0, 0.05), 0.85, 1.15);
-
-  // Minor personality variance (±5-10%)
-  rtVar := EnsureRange(GaussRand(1.0, 0.025), 0.925, 1.075);
-  errVar := EnsureRange(GaussRand(1.0, 0.05), 0.85, 1.15);
-  driftVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
-  revertVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
-  steepVar := EnsureRange(GaussRand(1.0, 0.10), 0.7, 1.3);  // ±20% for steepness
-
-  // Apply all variance
-  Self.Rate := (0.015 + 0.030 * Self.U[0].U) * rateVar;
-  Self.OnsetTime := (15.0 + 20.0 * Self.U[7].U) * onsetVar;
-  Self.OnsetSteep := (0.30) * steepVar;  // Base 0.3, vary to 0.21-0.39
-  Self.BrkRecov := (0.20 + 0.20 * Self.U[5].U) * brkVar;
-  Self.SlpRecov := (0.70 + 0.30 * Self.U[6].U) * slpVar;
-
-  Self.Drift := (0.05 + 0.10 * Self.U[1].U) * driftVar;
-  Self.Revert := (0.03 + 0.07 * Self.U[2].U) * revertVar;
-  Self.RTMult := (1.15 + 0.45 * Self.U[3].U) * rtVar;
-  Self.ErrRate := (0.02 + 0.10 * Self.U[4].U) * errVar;
-
-  Self.Lvl := 0.0;
-  Self.DriftCur := 0.0;
-  Self.Start := Time;
-  Self.Last := Time;
-
-  Logger.Info('Fatigue - Rate:%.3f Onset:%.1fmin(k=%.2f) RT:%.2fx Err:%.1f%%',
-    [Self.Rate, Self.OnsetTime, Self.OnsetSteep, Self.RTMult, Self.ErrRate*100]);
-end;
-
 procedure TPestControl.SetupMouse();
 var
   speedBase, gravBase, windBase: Double;
@@ -1841,6 +2409,10 @@ begin
   WriteLn('[INIT] Pest Control - SIMBA2000');
   Logger.Setup('Pest Control JDS');
   Logger.RepeatedMessages := True;
+
+  if not Self.UserDisableFatigue then
+    Self.F.Init(Profiles[ProfileIndex].Name + Profiles[ProfileIndex].Username);
+
   ProgressReport.Setup(
     'Pest Control JDS',
     [
@@ -1874,7 +2446,6 @@ begin
   // Result: 160-336ms with Gaussian distribution around personality baseline
   self.bRT := TruncGauss(200, 30, 173, 227) + 123 * bhM.U * TruncGauss(1.0, 0.05, 0.85, 1.15);
 
-  Self.F.Init();
   Self.InitAttackProfile();
   Self.SetAttackTempo();
   Self.ActivityThresh := EnsureRange(Self.UserActiveThreshold+Random(-7, 7), 50, 100);
@@ -1908,7 +2479,7 @@ begin
   Antiban.Zoom.Min := 30;
   Antiban.Zoom.Max := 50;
   Antiban.Skills := [ERSSkill.RANGED, ERSSkill.MAGIC, ERSSkill.PRAYER, ERSSkill.ATTACK, ERSSkill.STRENGTH, ERSSkill.DEFENCE, ERSSkill.TOTAL];
-  
+
   Activity.Restart();
   
   WriteLn('[INIT] Initialization complete');
@@ -2002,8 +2573,9 @@ begin
 end;
 
 var
-  Form: TScriptForm;
   PCConfig: TConfigJSON;
+
+  Form: TScriptForm;
   AutoStartTimer: TLazTimer;
   CountdownLabel: TLazLabel;
   TimerStartTime: UInt64;
@@ -2176,7 +2748,6 @@ begin
   else
     PCConfig.Data.AddInt('combat_level', PestControl.UserCombatLevel);
 
-  //SAVE!!!!
   PCConfig.Save();
 end;
 
@@ -2409,7 +2980,8 @@ begin
   if PCConfig.Data.Has('disable_fatigue') then
     ChkDisableFatigue.SetChecked(PCConfig.Data.Item['disable_fatigue'].AsBool);
   if PCConfig.Data.Has('combat_level') then
-  EditCombatLevel.Text := ToStr(PCConfig.Data.Item['combat_level'].AsInt);
+    EditCombatLevel.Text := ToStr(PCConfig.Data.Item['combat_level'].AsInt);
+
   // Goals panel at bottom
   goalsPanel := Self.CreateGoals(tab, True, True, False, EOrientation.HORIZONTAL);
   goalsPanel.Align := ELazAlign.Bottom;
