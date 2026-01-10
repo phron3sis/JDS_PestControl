@@ -3,8 +3,9 @@
 {$DEFINE SCRIPT_GUI}
 {$I WaspLib/osrs.simba}
 const
-  USE_AUTO_START    = TRUE;//auto-start
-  AUTO_START_DELAY  = 30;  //delay(in seconds) before auto-starting
+  USE_AUTO_START    = TRUE; //auto-start
+  AUTO_START_DELAY  = 30;   //delay(in seconds) before auto-starting
+  DEBUG_FATIUGE     = FALSE;// uses image debug, please take a look
 type
   TPestControlGameData = record
     Nov, Inter, Vet: record
@@ -231,6 +232,15 @@ var
 // =============================================================================
 // HELPER FUNCTIONS - Distribution Math
 // =============================================================================
+function FmtTime(ms: UInt64): String;
+begin
+  if ms < 60000 then
+    Result := FormatFloat('0.0', ms / 1000) + 's'
+  else if ms < 3600000 then
+    Result := FormatMilliseconds(ms, 'm\m s\s')
+  else
+    Result := FormatMilliseconds(ms, 'h\h m\m');
+end;
 
 // Truncated Gaussian with re-sample instead of EnsureRange
 function TruncGauss(mu, sigma, lo, hi: Double): Double;
@@ -324,9 +334,99 @@ begin
   Writeln GetDebugLn('Salt not found: ' + salt, ELogLevel.ERROR, True);
 end;
 
-// =============================================================================
-// HELPER FUNCTIONS
-// =============================================================================
+var
+  debugFatigueMS: UInt64;
+
+procedure TFatigue.DebugAll;
+var
+  s: String;
+  lines: TStringArray;
+  i, y, mid, pad: Integer;
+  cfgStart, cfgEnd, width: Integer;
+  left, right, header: String;
+  img: TImage;
+  function TsPretty(ms: UInt64): String;
+  var now: Int64;
+  begin
+    if ms = 0 then Exit('n/a');
+    now := Time();
+    Result := TDateTime.CreateFromSystem()
+                .AddMilliseconds(Int64(ms) - now)
+                .ToString('hh:nn:ss:am/pm')
+              + '  (' + FmtTime(UInt64(Max(0, now - Int64(ms)))) + ' ago)';
+  end;
+begin
+  if not DEBUG_FATIUGE or (Time < debugFatigueMS) then Exit;
+  debugFatigueMS := Time + ONE_SECOND;
+
+  header := 'Script Start at: ' + TsPretty(self.Start);
+  header += ' | running for: ' + FmtTime(GetTimeRunning);
+  s := ToStr(Self);
+
+  // strip CONFIG block
+  cfgStart := s.IndexOf('CONFIG = ');
+  if cfgStart >= 0 then
+  begin
+    cfgEnd := s.IndexOf('}},', cfgStart);
+    if cfgEnd >= 0 then
+      s.DeleteRange(cfgStart, cfgEnd + 2);
+  end;
+
+  // one field per line
+  s := s.Replace(', ', #10);
+  s := s.Replace('{', '');
+  s := s.Replace('}', '');
+
+  lines := s.SplitLines;
+
+  for i := 0 to High(lines) do
+  begin
+    if lines[i].StartsWith('START =') then
+      lines[i] := 'START = ' + TsPretty(UInt64(lines[i].After('=').Trim.ToInt(0)))
+    else if lines[i].StartsWith('LAST =') then
+      lines[i] := 'LAST = ' + TsPretty(UInt64(lines[i].After('=').Trim.ToInt(0)))
+    else if lines[i].StartsWith('LASTWAKETIME =') then
+      lines[i] := 'LASTWAKETIME = ' + TsPretty(UInt64(lines[i].After('=').Trim.ToInt(0)))
+    else if lines[i].StartsWith('LASTSLEEPTIME =') then
+      lines[i] := 'LASTSLEEPTIME = ' + TsPretty(UInt64(lines[i].After('=').Trim.ToInt(0)))
+    else if lines[i].StartsWith('LASTSAVE =') then
+      lines[i] := 'LASTSAVE = ' + TsPretty(UInt64(lines[i].After('=').Trim.ToInt(0)));
+  end;
+
+  mid := (Length(lines) + 1) div 2;
+  pad := 0;
+  for i := 0 to mid - 1 do
+    pad := Max(pad, lines[i].Trim.Length);
+  pad := EnsureRange(pad + 2, 24, 60);
+
+  for i := 0 to high(lines) do
+    width := Max(width, lines[i].Length);
+
+  img := new TImage(EnsureRange(width*14*2+40, 600, 1100), mid * 18 + 10+40);
+  img.Fill($FFFFFF);
+  img.FontName := 'Consolas';
+  img.FontSize := 14;
+  img.FontBold := False;
+  img.DrawColor := colors.BLACK;
+
+  y:= 5;
+  img.Drawtext(header, Point(5, y));
+
+  y += 18;
+  for i := 0 to mid - 1 do
+  begin
+    left := lines[i].Trim;
+
+    right := '';
+    if (i + mid) < Length(lines) then
+      right := lines[i + mid].Trim;
+
+    img.DrawText(left.PadRight(pad) + '  ' + right, Point(5, y));
+    Inc(y, 18);
+  end;
+
+  img.Show(False);
+end;
 
 // Ramp function for regime transitions
 function Ramp(x, x0, x1: Double): Double;
@@ -606,6 +706,7 @@ begin
     Self.LastSave := Time();
     Logger.Success('-Saved Fatigue Profile Data-',);
   end;
+
 end;
 
 procedure TFatigue.RecoverFromBreak(const breakDuration_ms: UInt64);
@@ -843,7 +944,7 @@ begin
   Self.Drift_range := Self.Config.Data.Item['fatigue_Drift_range'].AsFloat;
   Self.D_debt := Self.Config.Data.Item['fatigue_sleep_debt'].AsFloat;
   Self.D_kpay := Self.Config.Data.Item['fatigue_sleep_repay'].AsFloat;
-  Self.LastWakeTime := Round(Self.Config.Data.Item['fatigue_last_wake_ms'].AsFloat);
+  Self.LastWakeTime := Self.Config.Data.Item['fatigue_last_wake_ms'].AsInt;
 
   // Validate loaded data
   if (Self.D_kpay = 0.0) or (Self.Drift_range = 0.0) or
@@ -1366,16 +1467,6 @@ begin
   Self.SEShielded := SimilarColors(Target.GetColor(Point(457, 95)), SHIELD_COLOR, TOL);
   Self.SWShielded := SimilarColors(Target.GetColor(Point(495, 95)), SHIELD_COLOR, TOL);
   //writeln('W: ', Self.WShielded, '| E: ', Self.EShielded, '| SE: ', Self.SEShielded, '| SW: ', Self.SWShielded);
-end;
-
-function FmtTime(ms: UInt64): String;
-begin
-  if ms < 60000 then
-    Result := FormatFloat('0.0', ms / 1000) + 's'
-  else if ms < 3600000 then
-    Result := FormatMilliseconds(ms, 'm\m s\s')
-  else
-    Result := FormatMilliseconds(ms, 'h\h m\m');
 end;
 
 procedure TPestControl.UpdateAndDrawHUD(onBreak: Boolean = False; onSleep: Boolean = False; remaining: UInt64 = 0; Force: Boolean = False);
@@ -2710,6 +2801,9 @@ begin
     or (Profiles[ProfileIndex].Username.Length < 5) then
       RaiseException('NO USER SETUP - ADD A VALID USER');
 
+  //remove debug
+  debugFatigueMS := Time;
+
   if not Self.UserDisableFatigue then
     Self.F.Init();
 
@@ -2793,6 +2887,7 @@ begin
   JustDidAntiban := False;
 
   repeat
+    Self.F.DebugAll();
     nState := Self.GetState();
 
     if nState <> Self.State then
