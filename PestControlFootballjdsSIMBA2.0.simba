@@ -63,15 +63,12 @@ const
   S_TAU_WAKE_MS  = 65520000.0;   // 18.2 hours in ms
   S_TAU_SLEEP_MS = 15120000.0;   // 4.2 hours in ms
 
-  // Inertia thresholds
-  NAP_THRESHOLD_MIN = 20.0;  // Minutes
-
 type
   TFatigue = record
     // =========================================================================
     // TIMING (Timestamps in milliseconds)
     // =========================================================================
-    Start, Last, LastWakeTime, LastSleepTime, LastSave: Int64;
+    Start, Last, LastWakeTime, LastSleepTime, LastSave: UInt64;
 
     // Store data JSON
     Config: TConfigJSON;
@@ -111,6 +108,7 @@ type
     R_onsetSteep: Double;              // Sigmoid steepness
     BreakQuality: Double;              // Current break quality [0..1]
     D_kpay: Double;                    // Sleep debt recovery [0.4 .. 1.0]
+    nap_thresh_ms: UInt64;             // Inertia threshold in milliseconds
 
     // =========================================================================
     // OUTPUT CAPS (Rendering constraints)
@@ -137,18 +135,18 @@ type
     S: array of EPestState;     // group of states to emote in
     E: array of ERSEmote;       // group of emotes for specific states
     Min, Max: Integer;          // number of emotes to do in a row
-    DelayMin, DelayMax: Int64;  // ms delay between bursts of emotes
+    DelayMin, DelayMax: UInt64;  // ms delay between bursts of emotes
   end;
 
   TUserEmotes = array of TStateGroup;
 
 type
   TAttackTempo = record
-    XPMean, LowMean: Int64;
+    XPMean, LowMean: UInt64;
     XPStick, LowStick: Double;
   end;
   TStateTimer = record
-    Times: array[EPestState] of Int64;  // milliseconds per state
+    Times: array[EPestState] of UInt64;  // milliseconds per state
   end;
 type
   TUV = record
@@ -166,7 +164,7 @@ type
     end;
 
     State: EPestState;
-    StateT: Int64;
+    StateT: UInt64;
     StateTimer: TStateTimer;
     
     // Map coordinates
@@ -188,29 +186,29 @@ type
 
     // Timing
     F: TFatigue;//Fatigue
-    bRT: Int64;
+    bRT: UInt64;
     RT: TUVArray;//0..2 RT_U1, RT_U2, RTC_U
     Tempo: TAttackTempo;
-    XPAttkDelay: Int64;
-    NextAttkDelay, LastAttack: Int64;
+    XPAttkDelay: UInt64;
+    NextAttkDelay, LastAttack: UInt64;
     LastXP,
     LastXPTime,
     HUDLastUpdate,
-    GameStart: Int64;
+    GameStart: UInt64;
     GameStarted: Boolean;
 
     // Prayer
-    PrayerEnableTime: Int64;
+    PrayerEnableTime: UInt64;
     
     // Boat movement
-    LastBoatMove: Int64;
-    BoatMoveDelay: Int64;
+    LastBoatMove: UInt64;
+    BoatMoveDelay: UInt64;
     
     // Activity
     ActivityThresh: Int32;
     
     // Stats
-    Start, LastWin, CombatLevel: Int64;
+    Start, LastWin, CombatLevel: UInt64;
     KnightHP, wHP, eHP, seHP, swHP, portalsHP: Int32;
     WShielded, EShielded, SEShielded, SWShielded: Boolean;
     GamesWon, PtsPerGame, LeaveGameCount: UInt32;
@@ -219,7 +217,7 @@ type
 
     UserDisableHUD, UserDisableMoveInBoat, UserDisablePace, UserDisableLeaveGame: Boolean;
     UserDisableFatigue: Boolean;
-    Actions, MaxActions, MaxTime: Int64;
+    Actions, MaxActions, MaxTime: UInt64;
     UserActiveThreshold, UserCombatLevel, UserSpendPointsAt: Int32;
     UserRewards: TStringArray;
     UserRwardAmmount: TIntegerArray;
@@ -267,9 +265,9 @@ begin
   Result := LogNormalEx(Ln(mean) - 0.5 * sigma * sigma, sigma);
 end;
 
-function LogNormalInt(mean, sigma:Double): Int64;
+function LogNormalInt(mean, sigma:Double): UInt64;
 begin
-  Result := Round(LogNormal(mean, sigma));
+  Result := Max(0, Round(LogNormal(mean, sigma)));
 end;
 
 // EX-GAUSSIAN (math form):
@@ -374,27 +372,30 @@ begin
 end;
 
 // Safe hash to normalized [0..1]
-function HashToNormalized(str: String): Double;
+function HashToU(salt: String): Double;
 var
-  hashStr: String;
+  hashStr, userStr: String;
   hashValue: UInt64;
+  eps: Double = 5.42101086242752E-20;
 begin
-  hashStr := HashString(EHashAlgo.SHA1, str);
+  userStr := Profiles[ProfileIndex].Name + Profiles[ProfileIndex].Username;
+  hashStr := HashString(EHashAlgo.SHA1, userStr + salt);
   hashValue := StrToUInt64('$' + Copy(hashStr, 1, 16));
   Result := hashValue / High(UInt64);
-  Result := EnsureRange(Result, 0.0001, 0.9999);
+  Result := EnsureRange(Result, eps, 1.0 - eps);
+  Writeln('HashToU: ', salt, '=', Result);
 end;
 
 // =============================================================================
 // TFATIGUE METHODS
 // =============================================================================
 
-procedure TFatigue.InitProfileTraits(profileName: String);
+procedure TFatigue.InitProfileTraits();
 var
   tau_days: Double;
 begin
   // Set RandSeed sequence
-  RandSeed := Round(HashToNormalized(profileName + 'profile_traits') * High(UInt32));
+  RandSeed := Round(HashToU('profile_traits') * High(UInt32));
 
   // C_phaseHours: Normal(mean=0, sd=1.3), clamp [-4.5, +4.5]
   Self.C_phaseHours := TruncGauss(0.0, 1.3, -4.5, 4.5);
@@ -438,14 +439,14 @@ begin
     Self.S_min, Self.S_max, Self.D_max, Self.Drift_range]);
 end;
 
-procedure TFatigue.InitSessionTraits(profileName: String);
+procedure TFatigue.InitSessionTraits();
 var
   dayNumber: UInt64;
   HL_work, HL_break, HL_revert: Double;
 begin
   // Generate deterministic seed for this day
   dayNumber := Time() div ONE_DAY;
-  RandSeed := Round(HashToNormalized(profileName + 'day' + ToStr(dayNumber)) * High(UInt32));
+  RandSeed := Round(HashToU('day' + ToStr(dayNumber)) * High(UInt32));
 
   // R_deplete: via half-life Lognormal(median=30, log_sigma=0.6), clamp [8, 90]
   HL_work := EnsureRange(LogNormal(30.0, 0.6), 8.0, 90.0);
@@ -474,8 +475,11 @@ begin
   // ErrRate: Beta [0.02, 0.10]
   Self.ErrRate := EnsureRange(0.02 + SampleBeta(2.0, 8.0) * 0.08, 0.02, 0.10);
 
-  //
+  // Cap fatigue level
   Self.F_cap := TruncGauss(1.1, 0.08, 0.9, 1.2);
+
+  // Session nap threshold in minutes
+  Self.nap_thresh_ms := Round(TruncGauss(20*ONE_MINUTE, 4*ONE_MINUTE, 14.3*ONE_MINUTE, 26.3*ONE_MINUTE));
 
   // New random seed
   Randomize();
@@ -604,7 +608,7 @@ begin
   end;
 end;
 
-procedure TFatigue.RecoverFromBreak(breakDuration_ms: UInt64);
+procedure TFatigue.RecoverFromBreak(const breakDuration_ms: UInt64);
 var
   breakMin: Double;
   napFactor, contextFactor: Double;
@@ -613,7 +617,7 @@ var
   dt: TDateTime;
   beforeR: Double;
 begin
-  breakMin := breakDuration_ms / 60000.0;
+
   beforeR := Self.R_resource;
 
   // Resource recovery - exponential approach
@@ -621,9 +625,9 @@ begin
   Self.R_resource := EnsureRange(Self.R_resource, 0.0, 1.0);
 
   // Inertia trigger if break >= nap threshold
-  if breakMin >= NAP_THRESHOLD_MIN then
+  if breakDuration_ms >= Self.nap_thresh_ms then
   begin
-    napFactor := EnsureRange((breakMin - 15.0) / 30.0, 0.0, 1.0);
+    napFactor := EnsureRange((breakDuration_ms - Self.nap_thresh_ms) / (30.0 * ONE_MINUTE), 0.0, 1.0);
 
     dt := TDateTime.CreateFromSystem();
     hourOfDay := dt.Hour + dt.Minute / 60.0;
@@ -651,7 +655,7 @@ begin
   Self.Update(True);
 end;
 
-procedure TFatigue.RecoverFromSleep(sleepDuration_ms: UInt64);
+procedure TFatigue.RecoverFromSleep(const sleepDuration_ms: UInt64);
 var
   sleepHours: Double;
   deficit, surplus: Double;
@@ -742,7 +746,7 @@ begin
   Result := PestControl.bRT * Self.GetRTMulti;
 end;
 
-procedure TConfigJSON.SetConfig(const key: String; value: Int64); overload;
+procedure TConfigJSON.SetConfig(const key: String; value: UInt64); overload;
 begin
   if not Self.Data.Has(key) then
     Self.Data.AddInt(key, value)
@@ -789,8 +793,7 @@ begin
   begin
     WriteLn('[ERROR] Self.Config.Data is nil!');
     Exit;
-  end else
-    Writeln(Self.Config.Data);
+  end;
 
   Self.Config.SetConfig('fatigue_C_phaseHours', Self.C_phaseHours);
   Self.Config.SetConfig('fatigue_D_required', Self.D_required);
@@ -811,7 +814,7 @@ begin
   Self.Config.SetConfig('fatigue_sleep_debt', Self.D_debt);
   Self.Config.SetConfig('fatigue_sleep_repay', Self.D_kpay);
 
-  WriteLn('[DEBUG After SetConfig] last_wake in data=', Self.Config.Data.Item['fatigue_last_wake_ms'].AsFloat);
+  WriteLn('[DEBUG After SetConfig] last_wake in data=', Self.Config.Data.Item['fatigue_last_wake_ms'].AsInt);
 end;
 
 function TFatigue.LoadFromConfig(): Boolean;
@@ -821,7 +824,7 @@ begin
     Logger.Warn('TFatigue.LoadFromConfig() - Self.UserDisableFatigue=true');
     Exit();
   end;
-  writeln('TFatigue.LoadFromConfig(): Boolean;');
+
   if not Self.Config.Data.Has('fatigue_sleep_repay') then Exit(False);
 
   Self.C_phaseHours := Self.Config.Data.Item['fatigue_C_phaseHours'].AsFloat;
@@ -847,11 +850,12 @@ begin
     (Self.C_phaseHours = 0.0) then Exit(False);
 
   Result := True;
+  writeln('TFatigue.LoadFromConfig()=', Result);
 end;
 
-procedure TFatigue.Init(profileName: String);
+procedure TFatigue.Init();
 var
-  hoursAwake: Double;
+  awakeMS: UInt64;
 begin
   WriteLn('[DEBUG] TFatigue.Init() starting');
   Self.Config.Setup('jds-fatigue');
@@ -866,7 +870,7 @@ begin
   if not Self.LoadFromConfig() then
   begin
     Logger.Warn('No fatigue profile - generating new traits');
-    Self.InitProfileTraits(profileName);
+    Self.InitProfileTraits();
 
     if Length(Antiban.Sleeps) = 0 then
     begin
@@ -882,26 +886,26 @@ begin
   if Self.LastWakeTime = 0 then
     Self.LastWakeTime := Round(Time() - Antiban.Sleeps[0].Next - Random(Antiban.Sleeps[0].Length/3, Antiban.Sleeps[0].Length));
 
-  Self.InitSessionTraits(profileName);
+  Self.InitSessionTraits();
 
   Self.R_resource := 1.0;
   Self.R_driftCur := 0.0;
   Self.I_current := 0.0;
 
-  hoursAwake := Max(0.0, (Time() - Self.LastWakeTime) / ONE_HOUR);
-  Self.S_homeostat := Self.S_max - (Self.S_max - Self.S_min) * Exp(-hoursAwake * ONE_HOUR / S_TAU_WAKE_MS);
+  awakeMs := Max(0, Time() - Self.LastWakeTime);
+  Self.S_homeostat := Self.S_max - (Self.S_max - Self.S_min) * Exp(-awakeMs / S_TAU_WAKE_MS);
   Self.S_homeostat := EnsureRange(Self.S_homeostat, Self.S_min, Self.S_max);
 
-  Self.BreakQuality := 0.7;//move to profile init or redesign
+  Self.BreakQuality := 0.4 + 0.25 * HashToU('break_quality');//move to profile init or redesign
 
   Logger.Info('Fatigue init - Awake:%.2fh S:%.2f%% Debt:%.1fh',
-    [hoursAwake, Self.S_homeostat * 100, Self.D_debt]);
+    [awakeMS/ONE_Hour, Self.S_homeostat * 100, Self.D_debt]);
 
   Self.SaveToConfig();
   Self.Config.Save();
 end;
 
-function ExpoGaussRT(mean: Double = PestControl.bRT): Int64;
+function ExpoGaussRT(mean: Double = PestControl.bRT): UInt64;
 var
   mu, sigma, tau, f: Double;
 begin
@@ -1364,7 +1368,7 @@ begin
   //writeln('W: ', Self.WShielded, '| E: ', Self.EShielded, '| SE: ', Self.SEShielded, '| SW: ', Self.SWShielded);
 end;
 
-function FmtTime(ms: Int64): String;
+function FmtTime(ms: UInt64): String;
 begin
   if ms < 60000 then
     Result := FormatFloat('0.0', ms / 1000) + 's'
@@ -1712,7 +1716,7 @@ end;
 
 procedure TPestControl.UpdateAttkDelay();
 var
-  candidate: Int64;
+  candidate: UInt64;
 begin
   candidate := ExpoGaussRT(Self.Tempo.LowMean);
   if Self.NextAttkDelay > 0 then
@@ -1729,7 +1733,7 @@ end;
 
 procedure TPestControl.UpdateXPAttkDelay();
 var
-  candidate: Int64;
+  candidate: UInt64;
 begin
   candidate := ExpoGaussRT(Self.Tempo.XPMean);
 
@@ -1873,7 +1877,7 @@ begin
   result := EPestState.UNKNOWN;
 end;
 
-function TPestControl.PrayerSample(): Int64;
+function TPestControl.PrayerSample(): UInt64;
 var
   shape, scale: Double;
 begin
@@ -2470,7 +2474,7 @@ begin
     [Self.Tempo.XPMean, xpVar, Self.Tempo.LowMean, lowVar]);
 end;
 
-procedure TStateTimer.Add(State: EPestState; Ms: Int64);
+procedure TStateTimer.Add(State: EPestState; Ms: UInt64);
 begin
   Self.Times[State] := Self.Times[State] + Ms;
 end;
@@ -2702,8 +2706,12 @@ begin
   self.bRT := Round(TruncGauss(200, 30, 173, 227) + 123
     * bhM.U * TruncGauss(1.0, 0.05, 0.85, 1.15));
 
+  if (Profiles[ProfileIndex].Name.Length < 5)
+    or (Profiles[ProfileIndex].Username.Length < 5) then
+      RaiseException('NO USER SETUP - ADD A VALID USER');
+
   if not Self.UserDisableFatigue then
-    Self.F.Init(Profiles[ProfileIndex].Name + Profiles[ProfileIndex].Username);
+    Self.F.Init();
 
   ProgressReport.Setup(
     'Pest Control JDS',
