@@ -622,7 +622,7 @@ begin
   end;
 
 
-  Self.PointsOCR.X1 := Self.Bounds.X1 + 89;
+  Self.PointsOCR.X1 := Self.Bounds.X1 + 83;
   Self.PointsOCR.Y1 := Self.Bounds.Y2 - 37;
   Self.PointsOCR.X2 := Self.Bounds.X1 + 133;
   Self.PointsOCR.Y2 := Self.Bounds.Y2 - 18;
@@ -665,6 +665,9 @@ begin
   Self.Costs += [30, 15, 15];
   Self.Costs += [250, 250, 250, 150, 200, 200, 200, 10];
 
+  Writeln(GetTimeRunning,' ', Self.ItemBoxes.Length);
+  Writeln(GetTimeRunning,' ',Self.RewardStrings.Length);
+
   if (self.Costs.Length <> Self.ItemBoxes.Length) or
     (Self.ItemBoxes.Length <> Self.RewardStrings.Length + 14) then
     RaiseException('!FATAL! TRSPestShop.Setup(); Reward strings don''t match boxes!');
@@ -675,6 +678,7 @@ begin
     Self.Bounds.Center.X + 74,
     Self.Bounds.Y2 - 10
   );
+  self.ConfirmButton.EnabledColors := [[$1F98FF, 0]];
 
   Self.NPC := TRSEntity.Create(
     @Map.Walker,
@@ -697,10 +701,174 @@ begin
 
 end;
 
+function TRSPestShop.IsOpen(): Boolean;
+begin
+  result := Target.CountColor(2070783, 0, [163, 21, 359, 39]) = 638;
+end;
+
+function TRSPestShop.isClosed(): Boolean;
+begin
+  result := not Self.IsOpen();
+end;
+
+function TRSPestShop.WaitOpen(): Boolean;
+begin
+  result := SleepUntil(Self.IsOpen(), 50, random(2000, 4000));
+end;
+
+function TRSPestShop.DidPurchase(): Boolean;
+begin
+  Result := Chat.HasContinue and not Chat.LeveledUp();
+  writeln('DidPurchase():', result, ' | GetTimeRunning=', GetTimeRunning);
+end;
+
+function TRSPestShop.WaitPurchased(openAgain: Boolean = False): Boolean;
+var
+ t: Int64;
+begin
+  t := Time + Random(1500, 4000);
+  writeln('WaitPurchased GetTimeRunning=',GetTimeRunning, ' | t=',t);
+  repeat
+    writeln('in waitpurchased loop GetTimeRunning=',GetTimeRunning);
+    if Self.DidPurchase then
+    begin
+      if openAgain and Chat.Continue() then
+        Exit(Self.WaitOpen())
+      else
+        Exit(True);
+    end;
+  until (Time > t);
+  writeln('WaitPurchased GetTimeRunning=',GetTimeRunning);
+end;
+
+function TRSPestShop.Close(escape: Boolean): Boolean;
+begin
+  Result := Self.Title.Close(escape);
+end;
+
+function TRSPestShop.Close(escapeProbability: Single = -1): Boolean; overload;
+begin
+  Result := Self.Title.Close(escapeProbability);
+end;
+
+function TRSPestShop.Open(attempts: Integer = 3): Boolean;
+var
+  i: Integer;
+begin
+  if Chat.HasContinue() then
+  begin
+    writeln('Chat.HasContinue()=', FormatMilliseconds(GetTimeRunning, TIME_SHORT));
+    Target.KeyPress(EKeyCode.SPACE);
+    result := Self.WaitOpen();
+    if result then Exit;
+  end;
+  if attempts <= 3 then attempts := random(3,5);
+  for i := 0 to attempts do
+  begin
+    writeln('in Open loop GetTimeRunning=',GetTimeRunning, ' | i=', i);
+    if Self.IsOpen() then Exit(true);
+    if ChooseOption.IsOpen() then
+    begin
+      if ChooseOption.Select(['Exchange Void Knight', 'Exchange Void'], True, True) then
+        if Self.WaitOpen() then
+          Exit(True);
+      ChooseOption.Close();
+      Sleep(60, 200);
+    end;
+    if self.NPC.DistanceTo(Map.Position()) > RandomMode(4, 4, 7) then
+      Map.Walker.WebWalk(Self.NPC.Coordinates[Random(0, Self.NPC.Coordinates.High)], 2, 0.3);
+    if Self.NPC.Interact(['Exchange Void Knight', 'Exchange Void'], 1) then
+      if Self.WaitOpen() then
+        Exit(True);
+  end;
+end;
+
+function TRSPestShop.ReadPoints: Integer;
+begin
+  Result := 0;
+  if not Self.IsOpen() then Exit;
+  result := OCR.RecognizeNumber(Self.PointsOCR, RSFonts.BOLD_SHADOW, [RSFonts.WHITE], 0);
+  Self.SpendablePoints := Result;
+end;
+
+
+function TRSPestShop.BuyReward(reward:String; pts: Integer): Boolean;
+var
+  ptBox, textBox: Tbox;
+  f: TRSFonts;
+  s: String;
+  xpBefore: UInt64;
+  idx, i, invCt: Integer;// TBoxArray index of reward string
+begin
+  if not Self.IsOpen() then Exit;
+  if not Self.RewardStrings.Contains(reward) then
+    RaiseException('!FATAL! TRSPestShop.BuyReward(); Reward INVALID!');
+  xpBefore := XPBar.Read;
+  invCt := Inventory.Slots.Count();
+  if reward.Contains('Void', True) then
+    Self.Scroll.SetLevel(100)
+  else
+    Self.Scroll.SetLevel(0);
+  Sleep(60, 400);
+  idx := (Self.RewardStrings.IndexOf(reward)+1)*3 - 1;
+  if reward in ['Attack', 'Defence', 'Magic', 'Prayer', 'Strength', 'Ranged', 'Hitpoints'] then
+    if pts = 1 then idx-=2
+    else if pts = 10 then
+      idx-=1;
+  Self.SpendablePoints := Self.ReadPoints;
+  if pts > Self.SpendablePoints then
+  begin
+    Writeln(GetTimeRunning,' ','Not enough points to purchase...');
+    Exit;
+  end;
+  Mouse.Click(Self.ItemBoxes[idx].Expand(-1), EMouseButton.LEFT);
+  Sleep(220, 480);
+
+  if self.ConfirmButton.WaitEnabled() then
+  begin
+    Self.ConfirmButton.Click();
+    if SleepUntil(Self.isClosed(), RandomLeft(111, 321), RandomLeft(1800, 5300)) then
+      Result := (Inventory.Slots.Count() <> invCt) or (XPBar.Read <> xpBefore);
+    if Result then Self.SpendablePoints-=pts;
+    writeln(GetTimeRunning,' ','did buy ', result);
+  end;
+end;
+
+procedure TRSPestShop.PurchaseExp(expString: String; stopAt: Integer);
+var
+  spend, remaining, before, fails, attempts: Integer;
+  tEnd: UInt64;
+begin
+  tEnd := Time + Random(ONE_MINUTE*5, ONE_MINUTE*8);
+  attempts := Random(10, 20);
+  fails := 0;
+  repeat
+    writeln('in PurchaseExp GetTimeRunning=',GetTimeRunning);
+    if not Self.Open() then
+      Exit;
+    Sleep(120, 500);
+    Self.SpendablePoints := Self.ReadPoints;
+    remaining := Self.SpendablePoints - stopAt;
+    if remaining <= 0 then Break;
+
+    writeln(GetTimeRunning,' ','TRSPestShop.PurchaseExp() remaining points=', remaining);
+    spend := 1 + 9*(Ord(remaining >= 10) and 1) + 90*(Ord(remaining >= 100) and 1);
+
+    writeln(GetTimeRunning,' ','TRSPestShop.PurchaseExp() spendable points', spend);
+    before := Self.SpendablePoints;
+    if not Self.BuyReward(expString, spend) then
+      Inc(fails);
+
+    if Self.SpendablePoints >= before then
+      Inc(fails);
+    Sleep(120, 500);
+  until (Self.SpendablePoints <= stopAt) or (Time >= tEnd) or (fails >= attempts);
+end;
+
 function TPestControl.SpendPestPoints(): Boolean;
 begin
   Sleep(ExpoGaussRT(Self.bRT));
-
+  //PestShop.PurchaseExp('Prayer', 0);
   Sleep(ExpoGaussRT(Self.bRT));
 end;
 
