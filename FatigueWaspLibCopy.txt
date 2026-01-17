@@ -1,0 +1,1786 @@
+{$DEFINE WL_FATIGUE_INCLUDED}
+{$IFNDEF WL_OSR}
+  {$I WaspLib/osrs.simba}
+{$ENDIF}
+
+(*
+================================================================================
+TFatigue - Biomathematical Fatigue Simulation System
+================================================================================
+
+Research basis:
+  - Borbély two-process model (Process S + Process C)
+  - Rajdev et al. (2013) unified model
+  - McCauley et al. (2013) dynamic circadian amplitude
+  - Ramakrishnan et al. (2016) validated parameters
+  - Ratcliff & Van Dongen (2011) diffusion model RT parameters
+  - Nir et al. ex-Gaussian τ sensitivity (128% ± 79% under TSD)
+
+Individual differences:
+  - Three INDEPENDENT vulnerability dimensions (factor analysis):
+    1. Self-evaluation (sleepiness/mood)
+    2. Cognitive processing (errors, lapses, RT)
+    3. Behavioral alertness (attention)
+  - ICC 0.67-0.96 for fatigue responses
+  - 51-83% heritability
+  - Continuous distribution (NOT trimodal)
+
+================================================================================
+*)
+
+type
+  EFTrait = enum(
+
+    // Vulnerability cluster (0-7)
+    FATIGUE_CEILING,
+    DEBT_SENS,
+    ERR_RATE_MAX,
+    LAPSE_RATE_MAX,
+    RT_TAU_GROWTH,
+    RT_SIGMA_GROWTH,
+    RT_MU_GROWTH,
+    TOT_WEIGHT,
+
+    // Chronotype cluster (8-13)
+    PHASE_OFFSET,
+    CIRC_PERIOD,
+    CIRC_AMP,
+    TAU_WAKE,
+    KAPPA_LAMBDA_W,
+    SESSION_REGEN_H,
+
+    // Sleep architecture cluster (14-18)
+    SLEEP_NEED,
+    TAU_SLEEP,
+    DEBT_TAU,
+    DEBT_REPAY,
+    KAPPA_LAMBDA_S,
+
+    // Sleep inertia cluster (19-20) - INDEPENDENT of vulnerability
+    INERTIA_MAG,
+    INERTIA_TAU,
+
+    // Microsleep/break cluster (21-24)
+    NAP_THRESH,
+    MICROSLEEP_SENS,
+    BREAK_RECOVERY,
+    TOT_RESET_THRESH,
+
+    // Expression cluster (25-30) - HOW fatigue manifests per individual
+    ATTENTION_SENS,
+    PRECISION_SENS,
+    IMPATIENCE_SENS,
+    ERR_POWER,
+    LAPSE_POWER,
+    TAU_POWER
+  );
+
+const
+  FATIGUE_TRAIT_COUNT = Ord(High(EFTrait)) + 1;
+type
+  TFatigueProfile = record
+    ProfileHash: UInt64;
+
+    // Vulnerability cluster
+    FatigueCeiling: Double;
+    DebtSens: Double;
+    ErrRateMax: Double;
+    LapseRateMax: Double;
+    RTTauGrowth: Double;
+    RTSigmaGrowth: Double;
+    RTMuGrowth: Double;
+    ToTWeight: Double;
+
+    // Chronotype cluster
+    PhaseOffset_h: Double;
+    CircadianPeriod_h: Double;
+    CircadianAmp: Double;
+    TauWake_h: Double;
+    KappaLambdaWake: Double;
+    SessionRegenHour: Double;
+    CircHarmonics: array[0..4] of Double;
+
+    // Sleep architecture cluster
+    SleepNeed_h: Double;
+    TauSleep_h: Double;
+    DebtTau_d: Double;
+    DebtRepay: Double;
+    KappaLambdaSleep: Double;
+    DebtMin: Double;  // computed as -0.5 / SleepNeed_h
+
+    // Sleep inertia cluster (INDEPENDENT of vulnerability: ρ=0.205, p=0.40)
+    InertiaMag: Double;
+    InertiaTau_h: Double;
+
+    // Microsleep/break cluster
+    NapThresh_h: Double;
+    MicrosleepSens: Double;
+    BreakRecovery: Double;
+    ToTResetThresh_h: Double;
+
+    // Expression cluster - HOW fatigue manifests (per factor analysis: 3 independent dimensions)
+    AttentionSens: Double;    // Behavioral alertness dimension
+    PrecisionSens: Double;    // Motor control (weakly correlated with cognitive)
+    ImpatienceSens: Double;   // Decision fatigue dimension
+    ErrPower: Double;         // Cognitive processing - nonlinearity of error curve
+    LapsePower: Double;       // Cognitive processing - nonlinearity of lapse curve
+    TauPower: Double;         // Cognitive processing - nonlinearity of RT tail
+
+    // Asymptotes (derived)
+    S_min: Double;
+    S_max: Double;
+    KappaMin: Double;
+    KappaMax: Double;
+
+    // Interaction terms (derived)
+    W_F: Double;
+    W_X: Double;
+  end;
+
+  TFatigueSession = record
+    DaySeed: UInt64;
+    DateGenerated: Integer;
+    ToTOnRate_ph: Double;
+    ToTOffShort_ph: Double;
+    ToTOffLong_ph: Double;
+    MicroThresh_s: Double;
+    ShortThresh_s: Double;
+    DriftScale: Double;
+    DriftRevert_ph: Double;
+    BreakQuality: Double;
+    W_F_Session: Double;
+    W_X_Session: Double;
+  end;
+
+  TFatigueState = record
+    S: Double;
+    Debt: Double;
+    I: Double;
+    Kappa: Double;
+    LastWake_ms: Int64;
+    LastSleep_ms: Int64;
+    LastSave_ms: Int64;
+    IsAsleep: Boolean;
+    SleepDurations_h: array of Double;
+    WakeDurations_h: array of Double;
+    SleepTimestamps_ms: array of Int64;
+    TotalSleep_h: Double;
+    TotalWake_h: Double;
+    OffTaskStart_ms: Int64;
+  end;
+
+  TFatigueRuntime = record
+    ToT: Double;
+    BoutStart_ms: Int64;
+    LastUpdate_ms: Int64;
+    C_raw: Double;
+    C_scaled: Double;
+    S_norm: Double;
+    P_sleep: Double;
+    Z_raw: Double;
+    F_level: Double;
+    F_norm: Double;
+    Drift: Double;
+    DriftMixer: UInt64;
+    BifurcationWarned: Boolean;
+    LowerAsymptote: Double;
+  end;
+
+  TFatigueMatrix = array[0..FATIGUE_TRAIT_COUNT-1] of array[0..FATIGUE_TRAIT_COUNT-1] of Double;
+
+  type
+  TFatigueInternal = record
+    BoundsLo, BoundsHi: array[EFTrait] of Double;
+    CholeskyL, CorrMatrix: TFatigueMatrix;
+    CholeskyComputed, CorrInitialized: Boolean;
+    CircHarmonicsPop: array[0..4] of Double;
+  end;
+
+  TFatigue = record
+    Profile: TFatigueProfile;
+    Session: TFatigueSession;
+    State: TFatigueState;
+    Runtime: TFatigueRuntime;
+    Config: TConfigJSON;
+    Enabled: Boolean;
+    Initialized: Boolean;
+    Debugging: Boolean;
+  end;
+
+var
+  Fatigue: TFatigue;
+  _Fatigue: TFatigueInternal;
+
+
+// ============================================================================
+// INITIALIZATION OF BOUNDS AND CORRELATION MATRIX
+// ============================================================================
+
+procedure _InitFatigueBounds();
+begin
+  // === VULNERABILITY CLUSTER (0-7) ===
+  // FatigueCeiling: normalized max impairment [0.40..1.00], research: continuous distribution
+  _Fatigue.BoundsLo[EFTrait.FATIGUE_CEILING] := 0.40;
+  _Fatigue.BoundsHi[EFTrait.FATIGUE_CEILING] := 1.00;
+  // DebtSens: multiplier for sleep debt impact [0.50..2.50]
+  _Fatigue.BoundsLo[EFTrait.DEBT_SENS] := 0.50;
+  _Fatigue.BoundsHi[EFTrait.DEBT_SENS] := 2.50;
+  // ErrRateMax: max commission error rate at ceiling [0.01..0.12]
+  _Fatigue.BoundsLo[EFTrait.ERR_RATE_MAX] := 0.01;
+  _Fatigue.BoundsHi[EFTrait.ERR_RATE_MAX] := 0.12;
+  // LapseRateMax: max omission rate at ceiling [0.02..0.18]
+  _Fatigue.BoundsLo[EFTrait.LAPSE_RATE_MAX] := 0.02;
+  _Fatigue.BoundsHi[EFTrait.LAPSE_RATE_MAX] := 0.18;
+  // RTTauGrowth: ex-Gaussian τ multiplier at ceiling [1.80..4.00], research: 128%±79% increase
+  _Fatigue.BoundsLo[EFTrait.RT_TAU_GROWTH] := 1.80;
+  _Fatigue.BoundsHi[EFTrait.RT_TAU_GROWTH] := 4.00;
+  // RTSigmaGrowth: ex-Gaussian σ multiplier [1.10..1.40], research: NS effect
+  _Fatigue.BoundsLo[EFTrait.RT_SIGMA_GROWTH] := 1.10;
+  _Fatigue.BoundsHi[EFTrait.RT_SIGMA_GROWTH] := 1.40;
+  // RTMuGrowth: ex-Gaussian μ multiplier [1.00..1.15], research: NS effect
+  _Fatigue.BoundsLo[EFTrait.RT_MU_GROWTH] := 1.00;
+  _Fatigue.BoundsHi[EFTrait.RT_MU_GROWTH] := 1.15;
+  // ToTWeight: time-on-task contribution weight [0.10..0.40]
+  _Fatigue.BoundsLo[EFTrait.TOT_WEIGHT] := 0.10;
+  _Fatigue.BoundsHi[EFTrait.TOT_WEIGHT] := 0.40;
+
+  // === CHRONOTYPE CLUSTER (8-13) ===
+  // PhaseOffset: hours from population mean [-3.0..+3.0], research: ±3h range
+  _Fatigue.BoundsLo[EFTrait.PHASE_OFFSET] := -3.00;
+  _Fatigue.BoundsHi[EFTrait.PHASE_OFFSET] := 3.00;
+  // CircadianPeriod: intrinsic τ [23.50..24.70], research: 24.18±0.20h
+  _Fatigue.BoundsLo[EFTrait.CIRC_PERIOD] := 23.50;
+  _Fatigue.BoundsHi[EFTrait.CIRC_PERIOD] := 24.70;
+  // CircadianAmp: amplitude multiplier [0.15..0.40]
+  _Fatigue.BoundsLo[EFTrait.CIRC_AMP] := 0.15;
+  _Fatigue.BoundsHi[EFTrait.CIRC_AMP] := 0.40;
+  // TauWake: homeostatic rise time constant [18.0..40.0]h, research: 24.2±1.4h (Ramakrishnan) or 18.2h (Borbély)
+  _Fatigue.BoundsLo[EFTrait.TAU_WAKE] := 18.00;
+  _Fatigue.BoundsHi[EFTrait.TAU_WAKE] := 40.00;
+  // KappaLambdaWake: dynamic amplitude rise rate [0.10..0.18], research: 0.136±0.016
+  _Fatigue.BoundsLo[EFTrait.KAPPA_LAMBDA_W] := 0.10;
+  _Fatigue.BoundsHi[EFTrait.KAPPA_LAMBDA_W] := 0.18;
+  // SessionRegenHour: daily session regeneration hour [3.0..9.0], correlated with chronotype
+  _Fatigue.BoundsLo[EFTrait.SESSION_REGEN_H] := 3.00;
+  _Fatigue.BoundsHi[EFTrait.SESSION_REGEN_H] := 9.00;
+
+  // === SLEEP ARCHITECTURE CLUSTER (14-18) ===
+  // SleepNeed: biological sleep requirement [7.0..10.0]h, research: 8.16±0.73h
+  _Fatigue.BoundsLo[EFTrait.SLEEP_NEED] := 7.00;
+  _Fatigue.BoundsHi[EFTrait.SLEEP_NEED] := 10.00;
+  // TauSleep: homeostatic decay time constant [1.2..4.2]h, research: 2.11±0.11h
+  _Fatigue.BoundsLo[EFTrait.TAU_SLEEP] := 1.20;
+  _Fatigue.BoundsHi[EFTrait.TAU_SLEEP] := 4.20;
+  // DebtTau: allostatic time constant [4.0..10.0] days, research: 7.0±1.67d
+  _Fatigue.BoundsLo[EFTrait.DEBT_TAU] := 4.00;
+  _Fatigue.BoundsHi[EFTrait.DEBT_TAU] := 10.00;
+  // DebtRepay: debt recovery rate during sleep [0.30..0.90]
+  _Fatigue.BoundsLo[EFTrait.DEBT_REPAY] := 0.30;
+  _Fatigue.BoundsHi[EFTrait.DEBT_REPAY] := 0.90;
+  // KappaLambdaSleep: amplitude decay rate [-0.18..-0.10], research: -0.136
+  _Fatigue.BoundsLo[EFTrait.KAPPA_LAMBDA_S] := -0.18;
+  _Fatigue.BoundsHi[EFTrait.KAPPA_LAMBDA_S] := -0.10;
+
+  // === SLEEP INERTIA CLUSTER (19-20) - INDEPENDENT of vulnerability ===
+  // InertiaMag: post-wake impairment magnitude [0.05..0.50], research: 1.70±1.17 KSS
+  _Fatigue.BoundsLo[EFTrait.INERTIA_MAG] := 0.05;
+  _Fatigue.BoundsHi[EFTrait.INERTIA_MAG] := 0.50;
+  // InertiaTau: decay time constant [0.30..1.17]h, research: 0.67h subjective, 1.17h cognitive
+  _Fatigue.BoundsLo[EFTrait.INERTIA_TAU] := 0.30;
+  _Fatigue.BoundsHi[EFTrait.INERTIA_TAU] := 1.17;
+
+  // === MICROSLEEP/BREAK CLUSTER (21-24) ===
+  // NapThresh: break duration triggering microsleep risk [0.25..0.75]h
+  _Fatigue.BoundsLo[EFTrait.NAP_THRESH] := 0.25;
+  _Fatigue.BoundsHi[EFTrait.NAP_THRESH] := 0.75;
+  // MicrosleepSens: microsleep probability multiplier [0.30..2.00]
+  _Fatigue.BoundsLo[EFTrait.MICROSLEEP_SENS] := 0.30;
+  _Fatigue.BoundsHi[EFTrait.MICROSLEEP_SENS] := 2.00;
+  // BreakRecovery: ToT recovery effectiveness [0.60..1.40]
+  _Fatigue.BoundsLo[EFTrait.BREAK_RECOVERY] := 0.60;
+  _Fatigue.BoundsHi[EFTrait.BREAK_RECOVERY] := 1.40;
+  // ToTResetThresh: break duration for full ToT reset [0.25..1.00]h
+  _Fatigue.BoundsLo[EFTrait.TOT_RESET_THRESH] := 0.25;
+  _Fatigue.BoundsHi[EFTrait.TOT_RESET_THRESH] := 1.00;
+
+  // === EXPRESSION CLUSTER (25-30) - HOW fatigue manifests ===
+  // Research: 3 independent dimensions, individuals consistent WITHIN but not BETWEEN dimensions
+
+  // AttentionSens: attention narrowing sensitivity [0.10..0.30]
+  // Research: up to 15% decline in 30 min vigilance, poorly quantified at population level
+  _Fatigue.BoundsLo[EFTrait.ATTENTION_SENS] := 0.10;
+  _Fatigue.BoundsHi[EFTrait.ATTENTION_SENS] := 0.30;
+
+  // PrecisionSens: motor precision degradation [0.04..0.12]
+  // Research: 3-5% accuracy reduction per unit fatigue, affects accuracy > speed
+  _Fatigue.BoundsLo[EFTrait.PRECISION_SENS] := 0.04;
+  _Fatigue.BoundsHi[EFTrait.PRECISION_SENS] := 0.12;
+
+  // ImpatienceSens: decision threshold lowering [0.20..0.50]
+  // Research: drift rate reduced 0.18 SD, 27% increased temporal discounting
+  _Fatigue.BoundsLo[EFTrait.IMPATIENCE_SENS] := 0.20;
+  _Fatigue.BoundsHi[EFTrait.IMPATIENCE_SENS] := 0.50;
+
+  // ErrPower: error rate curve nonlinearity [1.5..2.5]
+  // Higher = more threshold-like (low errors until suddenly high)
+  _Fatigue.BoundsLo[EFTrait.ERR_POWER] := 1.50;
+  _Fatigue.BoundsHi[EFTrait.ERR_POWER] := 2.50;
+
+  // LapsePower: lapse rate curve nonlinearity [1.4..2.2]
+  _Fatigue.BoundsLo[EFTrait.LAPSE_POWER] := 1.40;
+  _Fatigue.BoundsHi[EFTrait.LAPSE_POWER] := 2.20;
+
+  // TauPower: RT tail growth nonlinearity [1.2..1.8]
+  // Research: τ sensitivity >> σ > μ under fatigue
+  _Fatigue.BoundsLo[EFTrait.TAU_POWER] := 1.20;
+  _Fatigue.BoundsHi[EFTrait.TAU_POWER] := 1.80;
+
+  // Population circadian harmonics (Achermann & Borbély 1992)
+  _Fatigue.CircHarmonicsPop[0] := 0.97;   // 24h fundamental
+  _Fatigue.CircHarmonicsPop[1] := 0.22;   // 12h (afternoon dip)
+  _Fatigue.CircHarmonicsPop[2] := 0.07;   // 8h
+  _Fatigue.CircHarmonicsPop[3] := 0.03;   // 6h
+  _Fatigue.CircHarmonicsPop[4] := 0.001;  // 4.8h (negligible)
+end;
+
+procedure _InitFatigueCorrMatrix();
+var
+  i, j: Integer;
+begin
+  if _Fatigue.CorrInitialized then Exit;
+
+  // Initialize: diagonal = 1.0, off-diagonal = 0.0
+  for i := 0 to FATIGUE_TRAIT_COUNT - 1 do
+    for j := 0 to FATIGUE_TRAIT_COUNT - 1 do
+      if i = j then
+        _Fatigue.CorrMatrix[i, j] := 1.0
+      else
+        _Fatigue.CorrMatrix[i, j] := 0.0;
+
+  // =========================================================================
+  // VULNERABILITY CLUSTER internal correlations (indices 0-7)
+  // Research: ICC 0.67-0.96, 51-83% heritability, continuous distribution
+  // =========================================================================
+  _Fatigue.CorrMatrix[0, 1] := 0.65; _Fatigue.CorrMatrix[1, 0] := 0.65;  // Ceiling-DebtSens
+  _Fatigue.CorrMatrix[0, 2] := 0.70; _Fatigue.CorrMatrix[2, 0] := 0.70;  // Ceiling-ErrMax
+  _Fatigue.CorrMatrix[0, 3] := 0.72; _Fatigue.CorrMatrix[3, 0] := 0.72;  // Ceiling-LapseMax
+  _Fatigue.CorrMatrix[0, 4] := 0.55; _Fatigue.CorrMatrix[4, 0] := 0.55;  // Ceiling-TauGrowth
+  _Fatigue.CorrMatrix[0, 5] := 0.48; _Fatigue.CorrMatrix[5, 0] := 0.48;  // Ceiling-SigmaGrowth
+  _Fatigue.CorrMatrix[0, 6] := 0.40; _Fatigue.CorrMatrix[6, 0] := 0.40;  // Ceiling-MuGrowth
+  _Fatigue.CorrMatrix[0, 7] := 0.58; _Fatigue.CorrMatrix[7, 0] := 0.58;  // Ceiling-ToTWeight
+
+  _Fatigue.CorrMatrix[1, 2] := 0.60; _Fatigue.CorrMatrix[2, 1] := 0.60;
+  _Fatigue.CorrMatrix[1, 3] := 0.58; _Fatigue.CorrMatrix[3, 1] := 0.58;
+  _Fatigue.CorrMatrix[1, 4] := 0.50; _Fatigue.CorrMatrix[4, 1] := 0.50;
+  _Fatigue.CorrMatrix[1, 5] := 0.45; _Fatigue.CorrMatrix[5, 1] := 0.45;
+  _Fatigue.CorrMatrix[1, 6] := 0.38; _Fatigue.CorrMatrix[6, 1] := 0.38;
+  _Fatigue.CorrMatrix[1, 7] := 0.52; _Fatigue.CorrMatrix[7, 1] := 0.52;
+
+  _Fatigue.CorrMatrix[2, 3] := 0.75; _Fatigue.CorrMatrix[3, 2] := 0.75;  // Err-Lapse high
+  _Fatigue.CorrMatrix[2, 4] := 0.62; _Fatigue.CorrMatrix[4, 2] := 0.62;
+  _Fatigue.CorrMatrix[2, 5] := 0.52; _Fatigue.CorrMatrix[5, 2] := 0.52;
+  _Fatigue.CorrMatrix[2, 6] := 0.42; _Fatigue.CorrMatrix[6, 2] := 0.42;
+  _Fatigue.CorrMatrix[2, 7] := 0.55; _Fatigue.CorrMatrix[7, 2] := 0.55;
+
+  _Fatigue.CorrMatrix[3, 4] := 0.68; _Fatigue.CorrMatrix[4, 3] := 0.68;
+  _Fatigue.CorrMatrix[3, 5] := 0.55; _Fatigue.CorrMatrix[5, 3] := 0.55;
+  _Fatigue.CorrMatrix[3, 6] := 0.45; _Fatigue.CorrMatrix[6, 3] := 0.45;
+  _Fatigue.CorrMatrix[3, 7] := 0.58; _Fatigue.CorrMatrix[7, 3] := 0.58;
+
+  _Fatigue.CorrMatrix[4, 5] := 0.70; _Fatigue.CorrMatrix[5, 4] := 0.70;  // RT params correlated
+  _Fatigue.CorrMatrix[4, 6] := 0.55; _Fatigue.CorrMatrix[6, 4] := 0.55;
+  _Fatigue.CorrMatrix[4, 7] := 0.50; _Fatigue.CorrMatrix[7, 4] := 0.50;
+
+  _Fatigue.CorrMatrix[5, 6] := 0.65; _Fatigue.CorrMatrix[6, 5] := 0.65;
+  _Fatigue.CorrMatrix[5, 7] := 0.45; _Fatigue.CorrMatrix[7, 5] := 0.45;
+
+  _Fatigue.CorrMatrix[6, 7] := 0.38; _Fatigue.CorrMatrix[7, 6] := 0.38;
+
+  // =========================================================================
+  // CHRONOTYPE CLUSTER internal (indices 8-13)
+  // =========================================================================
+  _Fatigue.CorrMatrix[8, 9] := 0.55; _Fatigue.CorrMatrix[9, 8] := 0.55;
+  _Fatigue.CorrMatrix[8, 10] := 0.45; _Fatigue.CorrMatrix[10, 8] := 0.45;
+  _Fatigue.CorrMatrix[8, 11] := 0.52; _Fatigue.CorrMatrix[11, 8] := 0.52;
+  _Fatigue.CorrMatrix[8, 12] := 0.40; _Fatigue.CorrMatrix[12, 8] := 0.40;
+  _Fatigue.CorrMatrix[8, 13] := 0.65; _Fatigue.CorrMatrix[13, 8] := 0.65;  // Phase-SessionRegen high
+
+  _Fatigue.CorrMatrix[9, 10] := 0.48; _Fatigue.CorrMatrix[10, 9] := 0.48;
+  _Fatigue.CorrMatrix[9, 11] := 0.50; _Fatigue.CorrMatrix[11, 9] := 0.50;
+  _Fatigue.CorrMatrix[9, 12] := 0.45; _Fatigue.CorrMatrix[12, 9] := 0.45;
+  _Fatigue.CorrMatrix[9, 13] := 0.45; _Fatigue.CorrMatrix[13, 9] := 0.45;
+
+  _Fatigue.CorrMatrix[10, 11] := 0.42; _Fatigue.CorrMatrix[11, 10] := 0.42;
+  _Fatigue.CorrMatrix[10, 12] := 0.55; _Fatigue.CorrMatrix[12, 10] := 0.55;
+  _Fatigue.CorrMatrix[10, 13] := 0.35; _Fatigue.CorrMatrix[13, 10] := 0.35;
+
+  _Fatigue.CorrMatrix[11, 12] := 0.48; _Fatigue.CorrMatrix[12, 11] := 0.48;
+  _Fatigue.CorrMatrix[11, 13] := 0.48; _Fatigue.CorrMatrix[13, 11] := 0.48;
+
+  _Fatigue.CorrMatrix[12, 13] := 0.35; _Fatigue.CorrMatrix[13, 12] := 0.35;
+
+  // =========================================================================
+  // SLEEP ARCHITECTURE internal (indices 14-18)
+  // =========================================================================
+  _Fatigue.CorrMatrix[14, 15] := 0.52; _Fatigue.CorrMatrix[15, 14] := 0.52;
+  _Fatigue.CorrMatrix[14, 16] := 0.48; _Fatigue.CorrMatrix[16, 14] := 0.48;
+  _Fatigue.CorrMatrix[14, 17] := 0.42; _Fatigue.CorrMatrix[17, 14] := 0.42;
+  _Fatigue.CorrMatrix[14, 18] := 0.38; _Fatigue.CorrMatrix[18, 14] := 0.38;
+
+  _Fatigue.CorrMatrix[15, 16] := 0.45; _Fatigue.CorrMatrix[16, 15] := 0.45;
+  _Fatigue.CorrMatrix[15, 17] := 0.40; _Fatigue.CorrMatrix[17, 15] := 0.40;
+  _Fatigue.CorrMatrix[15, 18] := 0.42; _Fatigue.CorrMatrix[18, 15] := 0.42;
+
+  _Fatigue.CorrMatrix[16, 17] := 0.50; _Fatigue.CorrMatrix[17, 16] := 0.50;
+  _Fatigue.CorrMatrix[16, 18] := 0.40; _Fatigue.CorrMatrix[18, 16] := 0.40;
+
+  _Fatigue.CorrMatrix[17, 18] := 0.38; _Fatigue.CorrMatrix[18, 17] := 0.38;
+
+  // =========================================================================
+  // SLEEP INERTIA internal (indices 19-20)
+  // Research: INDEPENDENT of sleep deprivation vulnerability (ρ=0.205, p=0.40)
+  // =========================================================================
+  _Fatigue.CorrMatrix[19, 20] := 0.55; _Fatigue.CorrMatrix[20, 19] := 0.55;
+
+  // =========================================================================
+  // MICROSLEEP/BREAK internal (indices 21-24)
+  // =========================================================================
+  _Fatigue.CorrMatrix[21, 22] := 0.55; _Fatigue.CorrMatrix[22, 21] := 0.55;
+  _Fatigue.CorrMatrix[21, 23] := 0.45; _Fatigue.CorrMatrix[23, 21] := 0.45;
+  _Fatigue.CorrMatrix[21, 24] := 0.42; _Fatigue.CorrMatrix[24, 21] := 0.42;
+
+  _Fatigue.CorrMatrix[22, 23] := 0.42; _Fatigue.CorrMatrix[23, 22] := 0.42;
+  _Fatigue.CorrMatrix[22, 24] := 0.45; _Fatigue.CorrMatrix[24, 22] := 0.45;
+
+  _Fatigue.CorrMatrix[23, 24] := 0.55; _Fatigue.CorrMatrix[24, 23] := 0.55;
+
+  // =========================================================================
+  // EXPRESSION CLUSTER internal (indices 25-30)
+  // Research: 3 INDEPENDENT dimensions - attention, motor, cognitive processing
+  // Individuals consistent WITHIN but not BETWEEN dimensions
+  // =========================================================================
+
+  // AttentionSens (25) - behavioral alertness dimension, weakly correlated with others
+  // PrecisionSens (26) - motor dimension, moderate with attention
+  _Fatigue.CorrMatrix[25, 26] := 0.35; _Fatigue.CorrMatrix[26, 25] := 0.35;
+  // ImpatienceSens (27) - decision dimension, moderate with cognitive
+  _Fatigue.CorrMatrix[25, 27] := 0.30; _Fatigue.CorrMatrix[27, 25] := 0.30;
+  _Fatigue.CorrMatrix[26, 27] := 0.25; _Fatigue.CorrMatrix[27, 26] := 0.25;
+
+  // ErrPower, LapsePower, TauPower (28-30) - same cognitive mechanism, HIGH correlation
+  _Fatigue.CorrMatrix[25, 28] := 0.28; _Fatigue.CorrMatrix[28, 25] := 0.28;
+  _Fatigue.CorrMatrix[25, 29] := 0.32; _Fatigue.CorrMatrix[29, 25] := 0.32;
+  _Fatigue.CorrMatrix[25, 30] := 0.25; _Fatigue.CorrMatrix[30, 25] := 0.25;
+
+  _Fatigue.CorrMatrix[26, 28] := 0.20; _Fatigue.CorrMatrix[28, 26] := 0.20;
+  _Fatigue.CorrMatrix[26, 29] := 0.22; _Fatigue.CorrMatrix[29, 26] := 0.22;
+  _Fatigue.CorrMatrix[26, 30] := 0.28; _Fatigue.CorrMatrix[30, 26] := 0.28;
+
+  _Fatigue.CorrMatrix[27, 28] := 0.45; _Fatigue.CorrMatrix[28, 27] := 0.45;  // Impatience-ErrPower
+  _Fatigue.CorrMatrix[27, 29] := 0.48; _Fatigue.CorrMatrix[29, 27] := 0.48;  // Impatience-LapsePower
+  _Fatigue.CorrMatrix[27, 30] := 0.40; _Fatigue.CorrMatrix[30, 27] := 0.40;
+
+  // Powers highly correlated (same cognitive mechanism)
+  _Fatigue.CorrMatrix[28, 29] := 0.65; _Fatigue.CorrMatrix[29, 28] := 0.65;  // Err-Lapse powers
+  _Fatigue.CorrMatrix[28, 30] := 0.45; _Fatigue.CorrMatrix[30, 28] := 0.45;  // Err-Tau powers
+  _Fatigue.CorrMatrix[29, 30] := 0.55; _Fatigue.CorrMatrix[30, 29] := 0.55;  // Lapse-Tau powers
+
+  // =========================================================================
+  // CROSS-CLUSTER CORRELATIONS
+  // =========================================================================
+
+  // Vulnerability <-> Chronotype (moderate: 0.25-0.38)
+  _Fatigue.CorrMatrix[0, 8] := 0.28; _Fatigue.CorrMatrix[8, 0] := 0.28;
+  _Fatigue.CorrMatrix[0, 11] := 0.38; _Fatigue.CorrMatrix[11, 0] := 0.38;
+  _Fatigue.CorrMatrix[3, 8] := 0.32; _Fatigue.CorrMatrix[8, 3] := 0.32;
+  _Fatigue.CorrMatrix[7, 11] := 0.32; _Fatigue.CorrMatrix[11, 7] := 0.32;
+
+  // Vulnerability <-> Sleep Architecture (moderate: 0.30-0.42)
+  _Fatigue.CorrMatrix[0, 14] := 0.38; _Fatigue.CorrMatrix[14, 0] := 0.38;
+  _Fatigue.CorrMatrix[1, 14] := 0.42; _Fatigue.CorrMatrix[14, 1] := 0.42;
+  _Fatigue.CorrMatrix[1, 16] := 0.40; _Fatigue.CorrMatrix[16, 1] := 0.40;
+  _Fatigue.CorrMatrix[7, 14] := 0.40; _Fatigue.CorrMatrix[14, 7] := 0.40;
+
+  // Vulnerability <-> Inertia (LOW: ~0.15-0.20, research: INDEPENDENT)
+  _Fatigue.CorrMatrix[0, 19] := 0.18; _Fatigue.CorrMatrix[19, 0] := 0.18;
+  _Fatigue.CorrMatrix[0, 20] := 0.15; _Fatigue.CorrMatrix[20, 0] := 0.15;
+  _Fatigue.CorrMatrix[1, 19] := 0.20; _Fatigue.CorrMatrix[19, 1] := 0.20;
+
+  // Vulnerability <-> Microsleep (higher: 0.40-0.48)
+  _Fatigue.CorrMatrix[0, 21] := 0.42; _Fatigue.CorrMatrix[21, 0] := 0.42;
+  _Fatigue.CorrMatrix[0, 22] := 0.45; _Fatigue.CorrMatrix[22, 0] := 0.45;
+  _Fatigue.CorrMatrix[3, 21] := 0.45; _Fatigue.CorrMatrix[21, 3] := 0.45;
+  _Fatigue.CorrMatrix[3, 22] := 0.48; _Fatigue.CorrMatrix[22, 3] := 0.48;
+
+  // Vulnerability <-> Expression (moderate, same cognitive domain)
+  _Fatigue.CorrMatrix[0, 25] := 0.45; _Fatigue.CorrMatrix[25, 0] := 0.45;  // Ceiling-AttentionSens
+  _Fatigue.CorrMatrix[0, 26] := 0.25; _Fatigue.CorrMatrix[26, 0] := 0.25;  // Ceiling-PrecisionSens (low)
+  _Fatigue.CorrMatrix[0, 27] := 0.50; _Fatigue.CorrMatrix[27, 0] := 0.50;  // Ceiling-ImpatienceSens
+  _Fatigue.CorrMatrix[0, 28] := 0.40; _Fatigue.CorrMatrix[28, 0] := 0.40;  // Ceiling-ErrPower
+  _Fatigue.CorrMatrix[0, 29] := 0.42; _Fatigue.CorrMatrix[29, 0] := 0.42;  // Ceiling-LapsePower
+  _Fatigue.CorrMatrix[0, 30] := 0.38; _Fatigue.CorrMatrix[30, 0] := 0.38;  // Ceiling-TauPower
+
+  // ErrRateMax <-> ErrPower, LapseRateMax <-> LapsePower (same construct)
+  _Fatigue.CorrMatrix[2, 28] := 0.55; _Fatigue.CorrMatrix[28, 2] := 0.55;
+  _Fatigue.CorrMatrix[3, 29] := 0.58; _Fatigue.CorrMatrix[29, 3] := 0.58;
+  _Fatigue.CorrMatrix[4, 30] := 0.60; _Fatigue.CorrMatrix[30, 4] := 0.60;  // TauGrowth-TauPower
+
+  // Sleep Architecture <-> Break Recovery (moderate: 0.38-0.45)
+  _Fatigue.CorrMatrix[14, 23] := 0.45; _Fatigue.CorrMatrix[23, 14] := 0.45;
+  _Fatigue.CorrMatrix[15, 23] := 0.40; _Fatigue.CorrMatrix[23, 15] := 0.40;
+  _Fatigue.CorrMatrix[14, 24] := 0.42; _Fatigue.CorrMatrix[24, 14] := 0.42;
+
+  _Fatigue.CorrInitialized := True;
+end;
+
+// ============================================================================
+// HASH UTILITIES
+// ============================================================================
+
+function _FatigueRotL64(x: UInt64; r: Integer): UInt64;
+begin
+  Result := (x shl r) or (x shr (64 - r));
+end;
+
+function _FatigueHashXX64(const s: String; seed: UInt64): UInt64;
+const
+  PRIME64_1 = UInt64($9E3779B185EBCA87);
+  PRIME64_2 = UInt64($C2B2AE3D27D4EB4F);
+  PRIME64_3 = UInt64($165667B19E3779F9);
+  PRIME64_5 = UInt64($27D4EB2F165667C5);
+var
+  i: Integer;
+  h: UInt64;
+begin
+  h := seed + PRIME64_5 + UInt64(Length(s));
+
+  for i := 1 to Length(s) do
+  begin
+    h := h xor (UInt64(Ord(s[i])) * PRIME64_5);
+    h := _FatigueRotL64(h, 11);
+    h := h * PRIME64_1;
+  end;
+
+  h := h xor (h shr 33);
+  h := h * PRIME64_2;
+  h := h xor (h shr 29);
+  h := h * PRIME64_3;
+  h := h xor (h shr 32);
+
+  Result := h;
+end;
+
+function _FatigueSplitMix64(var x: UInt64): UInt64;
+begin
+  x := x + UInt64($9E3779B97F4A7C15);
+  Result := x;
+  Result := (Result xor (Result shr 30)) * UInt64($BF58476D1CE4E5B9);
+  Result := (Result xor (Result shr 27)) * UInt64($94D049BB133111EB);
+  Result := Result xor (Result shr 31);
+end;
+
+function _FatigueUniform01(var mixer: UInt64): Double;
+const
+  INV_POW2_53 = 1.1102230246251565e-16;
+var
+  x: UInt64;
+begin
+  x := _FatigueSplitMix64(mixer);
+  Result := (x shr 11) * INV_POW2_53;
+  if Result = 0.0 then
+    Result := INV_POW2_53;
+end;
+
+function _FatigueNormal01(var mixer: UInt64): Double;
+var
+  u1, u2: Double;
+begin
+  u1 := _FatigueUniform01(mixer);
+  u2 := _FatigueUniform01(mixer);
+  Result := Sqrt(-2.0 * Ln(u1)) * Cos(2.0 * PI * u2);
+end;
+
+function _FatigueNormalCDF(x: Double): Double;
+const
+  a1 =  0.254829592;
+  a2 = -0.284496736;
+  a3 =  1.421413741;
+  a4 = -1.453152027;
+  a5 =  1.061405429;
+  p  =  0.3275911;
+var
+  sign: Integer;
+  t, y: Double;
+begin
+  sign := 1;
+  if x < 0 then sign := -1;
+  x := Abs(x) / Sqrt(2.0);
+
+  t := 1.0 / (1.0 + p * x);
+  y := 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Exp(-x * x);
+
+  Result := 0.5 * (1.0 + sign * y);
+end;
+
+// ============================================================================
+// CHOLESKY DECOMPOSITION WITH RIDGE REGULARIZATION
+// ============================================================================
+// Research: Warton (2008), Ledoit & Wolf (2004)
+// Problem: High cross-cluster correlations create near-singular matrix
+// Solution: Correlation-preserving shrinkage R_δ = (R + δI) / (1 + δ)
+//   - Shrinks off-diagonal by factor 1/(1+δ)
+//   - Keeps diagonal = 1.0 (valid correlation matrix)
+//   - Eigenvalue λ_i becomes (λ_i + δ)/(1 + δ), always positive for δ > |λ_min|
+
+procedure _FatigueComputeCholesky();
+const
+  // Ridge parameter: must exceed magnitude of most negative eigenvalue
+  // For 31-trait matrix with r~0.5-0.7 cross-correlations, 0.15 provides margin
+  RIDGE_DELTA = 0.15;
+  MIN_DIAG = 0.001;
+var
+  i, j, k: Integer;
+  sum, diag, shrink: Double;
+  RegMatrix: TFatigueMatrix;
+begin
+  if _Fatigue.CholeskyComputed then Exit;
+
+  _InitFatigueCorrMatrix();
+
+  // Apply correlation-preserving ridge shrinkage
+  shrink := 1.0 / (1.0 + RIDGE_DELTA);
+  for i := 0 to FATIGUE_TRAIT_COUNT - 1 do
+    for j := 0 to FATIGUE_TRAIT_COUNT - 1 do
+      if i = j then
+        RegMatrix[i, j] := 1.0  // Diagonal stays 1.0
+      else
+        RegMatrix[i, j] := _Fatigue.CorrMatrix[i, j] * shrink;
+
+  // Initialize L to zero
+  for i := 0 to FATIGUE_TRAIT_COUNT - 1 do
+    for j := 0 to FATIGUE_TRAIT_COUNT - 1 do
+      _Fatigue.CholeskyL[i, j] := 0.0;
+
+  // Cholesky-Banachiewicz algorithm on regularized matrix
+  for i := 0 to FATIGUE_TRAIT_COUNT - 1 do
+  begin
+    for j := 0 to i do
+    begin
+      sum := 0.0;
+
+      if j = i then
+      begin
+        for k := 0 to j - 1 do
+          sum := sum + _Fatigue.CholeskyL[j, k] * _Fatigue.CholeskyL[j, k];
+        diag := RegMatrix[j, j] - sum;
+        if diag < MIN_DIAG then diag := MIN_DIAG;
+        _Fatigue.CholeskyL[j, j] := Sqrt(diag);
+      end
+      else
+      begin
+        for k := 0 to j - 1 do
+          sum := sum + _Fatigue.CholeskyL[i, k] * _Fatigue.CholeskyL[j, k];
+        if _Fatigue.CholeskyL[j, j] > MIN_DIAG then
+          _Fatigue.CholeskyL[i, j] := (RegMatrix[i, j] - sum) / _Fatigue.CholeskyL[j, j]
+        else
+          _Fatigue.CholeskyL[i, j] := 0.0;
+      end;
+    end;
+  end;
+
+  _Fatigue.CholeskyComputed := True;
+end;
+
+// ============================================================================
+// TRAIT GENERATION
+// ============================================================================
+
+procedure TFatigue.GenerateProfile(const profileName: String);
+var
+  mixer: UInt64;
+  Z, U, Correlated: array[0..FATIGUE_TRAIT_COUNT-1] of Double;
+  i, k: Integer;
+  sum, val: Double;
+begin
+  _InitFatigueBounds();
+  _FatigueComputeCholesky();
+
+  Self.Profile.ProfileHash := _FatigueHashXX64(profileName + '|fatigue', UInt64($D6AFEDBEEF123456));
+  mixer := Self.Profile.ProfileHash;
+
+  // Generate independent standard normal values
+  for i := 0 to FATIGUE_TRAIT_COUNT - 1 do
+    Z[i] := _FatigueNormal01(mixer);
+
+  // Apply Cholesky factor for correlated traits
+  for i := 0 to FATIGUE_TRAIT_COUNT - 1 do
+  begin
+    sum := 0.0;
+    for k := 0 to i do
+      sum := sum + _Fatigue.CholeskyL[i, k] * Z[k];
+    Correlated[i] := sum;
+  end;
+
+  // Transform to uniform [0,1] via CDF
+  for i := 0 to FATIGUE_TRAIT_COUNT - 1 do
+    U[i] := _FatigueNormalCDF(Correlated[i]);
+
+  // === VULNERABILITY CLUSTER ===
+  Self.Profile.FatigueCeiling := _Fatigue.BoundsLo[EFTrait.FATIGUE_CEILING] + U[Ord(EFTrait.FATIGUE_CEILING)] * (_Fatigue.BoundsHi[EFTrait.FATIGUE_CEILING] - _Fatigue.BoundsLo[EFTrait.FATIGUE_CEILING]);
+  Self.Profile.DebtSens := _Fatigue.BoundsLo[EFTrait.DEBT_SENS] + U[Ord(EFTrait.DEBT_SENS)] * (_Fatigue.BoundsHi[EFTrait.DEBT_SENS] - _Fatigue.BoundsLo[EFTrait.DEBT_SENS]);
+  Self.Profile.ErrRateMax := _Fatigue.BoundsLo[EFTrait.ERR_RATE_MAX] + U[Ord(EFTrait.ERR_RATE_MAX)] * (_Fatigue.BoundsHi[EFTrait.ERR_RATE_MAX] - _Fatigue.BoundsLo[EFTrait.ERR_RATE_MAX]);
+  Self.Profile.LapseRateMax := _Fatigue.BoundsLo[EFTrait.LAPSE_RATE_MAX] + U[Ord(EFTrait.LAPSE_RATE_MAX)] * (_Fatigue.BoundsHi[EFTrait.LAPSE_RATE_MAX] - _Fatigue.BoundsLo[EFTrait.LAPSE_RATE_MAX]);
+  Self.Profile.RTTauGrowth := _Fatigue.BoundsLo[EFTrait.RT_TAU_GROWTH] + U[Ord(EFTrait.RT_TAU_GROWTH)] * (_Fatigue.BoundsHi[EFTrait.RT_TAU_GROWTH] - _Fatigue.BoundsLo[EFTrait.RT_TAU_GROWTH]);
+  Self.Profile.RTSigmaGrowth := _Fatigue.BoundsLo[EFTrait.RT_SIGMA_GROWTH] + U[Ord(EFTrait.RT_SIGMA_GROWTH)] * (_Fatigue.BoundsHi[EFTrait.RT_SIGMA_GROWTH] - _Fatigue.BoundsLo[EFTrait.RT_SIGMA_GROWTH]);
+  Self.Profile.RTMuGrowth := _Fatigue.BoundsLo[EFTrait.RT_MU_GROWTH] + U[Ord(EFTrait.RT_MU_GROWTH)] * (_Fatigue.BoundsHi[EFTrait.RT_MU_GROWTH] - _Fatigue.BoundsLo[EFTrait.RT_MU_GROWTH]);
+  Self.Profile.ToTWeight := _Fatigue.BoundsLo[EFTrait.TOT_WEIGHT] + U[Ord(EFTrait.TOT_WEIGHT)] * (_Fatigue.BoundsHi[EFTrait.TOT_WEIGHT] - _Fatigue.BoundsLo[EFTrait.TOT_WEIGHT]);
+
+  // === CHRONOTYPE CLUSTER ===
+  Self.Profile.PhaseOffset_h := _Fatigue.BoundsLo[EFTrait.PHASE_OFFSET] + U[Ord(EFTrait.PHASE_OFFSET)] * (_Fatigue.BoundsHi[EFTrait.PHASE_OFFSET] - _Fatigue.BoundsLo[EFTrait.PHASE_OFFSET]);
+  Self.Profile.CircadianPeriod_h := _Fatigue.BoundsLo[EFTrait.CIRC_PERIOD] + U[Ord(EFTrait.CIRC_PERIOD)] * (_Fatigue.BoundsHi[EFTrait.CIRC_PERIOD] - _Fatigue.BoundsLo[EFTrait.CIRC_PERIOD]);
+  Self.Profile.CircadianAmp := _Fatigue.BoundsLo[EFTrait.CIRC_AMP] + U[Ord(EFTrait.CIRC_AMP)] * (_Fatigue.BoundsHi[EFTrait.CIRC_AMP] - _Fatigue.BoundsLo[EFTrait.CIRC_AMP]);
+  Self.Profile.TauWake_h := _Fatigue.BoundsLo[EFTrait.TAU_WAKE] + U[Ord(EFTrait.TAU_WAKE)] * (_Fatigue.BoundsHi[EFTrait.TAU_WAKE] - _Fatigue.BoundsLo[EFTrait.TAU_WAKE]);
+  Self.Profile.KappaLambdaWake := _Fatigue.BoundsLo[EFTrait.KAPPA_LAMBDA_W] + U[Ord(EFTrait.KAPPA_LAMBDA_W)] * (_Fatigue.BoundsHi[EFTrait.KAPPA_LAMBDA_W] - _Fatigue.BoundsLo[EFTrait.KAPPA_LAMBDA_W]);
+  Self.Profile.SessionRegenHour := _Fatigue.BoundsLo[EFTrait.SESSION_REGEN_H] + U[Ord(EFTrait.SESSION_REGEN_H)] * (_Fatigue.BoundsHi[EFTrait.SESSION_REGEN_H] - _Fatigue.BoundsLo[EFTrait.SESSION_REGEN_H]);
+
+  // Per-account harmonic multipliers (mildly correlated with CircadianAmp)
+  for i := 0 to 4 do
+  begin
+    val := 0.85 + _FatigueUniform01(mixer) * 0.30;
+    val := val + (U[Ord(EFTrait.CIRC_AMP)] - 0.5) * 0.10;
+    Self.Profile.CircHarmonics[i] := Max(0.80, Min(1.20, val));
+  end;
+
+  // === SLEEP ARCHITECTURE CLUSTER ===
+  Self.Profile.SleepNeed_h := _Fatigue.BoundsLo[EFTrait.SLEEP_NEED] + U[Ord(EFTrait.SLEEP_NEED)] * (_Fatigue.BoundsHi[EFTrait.SLEEP_NEED] - _Fatigue.BoundsLo[EFTrait.SLEEP_NEED]);
+  Self.Profile.DebtMin := -0.5 / Self.Profile.SleepNeed_h;
+  Self.Profile.TauSleep_h := _Fatigue.BoundsLo[EFTrait.TAU_SLEEP] + U[Ord(EFTrait.TAU_SLEEP)] * (_Fatigue.BoundsHi[EFTrait.TAU_SLEEP] - _Fatigue.BoundsLo[EFTrait.TAU_SLEEP]);
+  Self.Profile.DebtTau_d := _Fatigue.BoundsLo[EFTrait.DEBT_TAU] + U[Ord(EFTrait.DEBT_TAU)] * (_Fatigue.BoundsHi[EFTrait.DEBT_TAU] - _Fatigue.BoundsLo[EFTrait.DEBT_TAU]);
+  Self.Profile.DebtRepay := _Fatigue.BoundsLo[EFTrait.DEBT_REPAY] + U[Ord(EFTrait.DEBT_REPAY)] * (_Fatigue.BoundsHi[EFTrait.DEBT_REPAY] - _Fatigue.BoundsLo[EFTrait.DEBT_REPAY]);
+  Self.Profile.KappaLambdaSleep := _Fatigue.BoundsLo[EFTrait.KAPPA_LAMBDA_S] + U[Ord(EFTrait.KAPPA_LAMBDA_S)] * (_Fatigue.BoundsHi[EFTrait.KAPPA_LAMBDA_S] - _Fatigue.BoundsLo[EFTrait.KAPPA_LAMBDA_S]);
+
+  // === SLEEP INERTIA CLUSTER (INDEPENDENT of vulnerability) ===
+  Self.Profile.InertiaMag := _Fatigue.BoundsLo[EFTrait.INERTIA_MAG] + U[Ord(EFTrait.INERTIA_MAG)] * (_Fatigue.BoundsHi[EFTrait.INERTIA_MAG] - _Fatigue.BoundsLo[EFTrait.INERTIA_MAG]);
+  Self.Profile.InertiaTau_h := _Fatigue.BoundsLo[EFTrait.INERTIA_TAU] + U[Ord(EFTrait.INERTIA_TAU)] * (_Fatigue.BoundsHi[EFTrait.INERTIA_TAU] - _Fatigue.BoundsLo[EFTrait.INERTIA_TAU]);
+
+  // === MICROSLEEP/BREAK CLUSTER ===
+  Self.Profile.NapThresh_h := _Fatigue.BoundsLo[EFTrait.NAP_THRESH] + U[Ord(EFTrait.NAP_THRESH)] * (_Fatigue.BoundsHi[EFTrait.NAP_THRESH] - _Fatigue.BoundsLo[EFTrait.NAP_THRESH]);
+  Self.Profile.MicrosleepSens := _Fatigue.BoundsLo[EFTrait.MICROSLEEP_SENS] + U[Ord(EFTrait.MICROSLEEP_SENS)] * (_Fatigue.BoundsHi[EFTrait.MICROSLEEP_SENS] - _Fatigue.BoundsLo[EFTrait.MICROSLEEP_SENS]);
+  Self.Profile.BreakRecovery := _Fatigue.BoundsLo[EFTrait.BREAK_RECOVERY] + U[Ord(EFTrait.BREAK_RECOVERY)] * (_Fatigue.BoundsHi[EFTrait.BREAK_RECOVERY] - _Fatigue.BoundsLo[EFTrait.BREAK_RECOVERY]);
+  Self.Profile.ToTResetThresh_h := _Fatigue.BoundsLo[EFTrait.TOT_RESET_THRESH] + U[Ord(EFTrait.TOT_RESET_THRESH)] * (_Fatigue.BoundsHi[EFTrait.TOT_RESET_THRESH] - _Fatigue.BoundsLo[EFTrait.TOT_RESET_THRESH]);
+
+  // === EXPRESSION CLUSTER (HOW fatigue manifests) ===
+  Self.Profile.AttentionSens := _Fatigue.BoundsLo[EFTrait.ATTENTION_SENS] + U[Ord(EFTrait.ATTENTION_SENS)] * (_Fatigue.BoundsHi[EFTrait.ATTENTION_SENS] - _Fatigue.BoundsLo[EFTrait.ATTENTION_SENS]);
+  Self.Profile.PrecisionSens := _Fatigue.BoundsLo[EFTrait.PRECISION_SENS] + U[Ord(EFTrait.PRECISION_SENS)] * (_Fatigue.BoundsHi[EFTrait.PRECISION_SENS] - _Fatigue.BoundsLo[EFTrait.PRECISION_SENS]);
+  Self.Profile.ImpatienceSens := _Fatigue.BoundsLo[EFTrait.IMPATIENCE_SENS] + U[Ord(EFTrait.IMPATIENCE_SENS)] * (_Fatigue.BoundsHi[EFTrait.IMPATIENCE_SENS] - _Fatigue.BoundsLo[EFTrait.IMPATIENCE_SENS]);
+  Self.Profile.ErrPower := _Fatigue.BoundsLo[EFTrait.ERR_POWER] + U[Ord(EFTrait.ERR_POWER)] * (_Fatigue.BoundsHi[EFTrait.ERR_POWER] - _Fatigue.BoundsLo[EFTrait.ERR_POWER]);
+  Self.Profile.LapsePower := _Fatigue.BoundsLo[EFTrait.LAPSE_POWER] + U[Ord(EFTrait.LAPSE_POWER)] * (_Fatigue.BoundsHi[EFTrait.LAPSE_POWER] - _Fatigue.BoundsLo[EFTrait.LAPSE_POWER]);
+  Self.Profile.TauPower := _Fatigue.BoundsLo[EFTrait.TAU_POWER] + U[Ord(EFTrait.TAU_POWER)] * (_Fatigue.BoundsHi[EFTrait.TAU_POWER] - _Fatigue.BoundsLo[EFTrait.TAU_POWER]);
+
+  // === DERIVED VALUES ===
+  Self.Profile.S_min := 0.0 + _FatigueUniform01(mixer) * 0.10;
+  Self.Profile.S_max := Self.Profile.FatigueCeiling;
+  Self.Profile.KappaMin := 0.10 + _FatigueUniform01(mixer) * 0.15;
+  Self.Profile.KappaMax := 0.85 + _FatigueUniform01(mixer) * 0.15;
+
+  // Interaction weights derived from vulnerability
+  Self.Profile.W_F := 0.35 + (U[Ord(EFTrait.FATIGUE_CEILING)] - 0.5) * 0.20;
+  Self.Profile.W_F := Max(0.20, Min(0.55, Self.Profile.W_F));
+  Self.Profile.W_X := 0.25 + (U[Ord(EFTrait.TOT_WEIGHT)] - 0.5) * 0.15;
+  Self.Profile.W_X := Max(0.10, Min(0.45, Self.Profile.W_X));
+end;
+
+// ============================================================================
+// SESSION GENERATION
+// ============================================================================
+
+procedure TFatigue.GenerateSession();
+const
+  BREAK_MICRO_BASE_S = 30;
+  BREAK_SHORT_BASE_S = 600;
+var
+  mixer: UInt64;
+  daysSinceEpoch: Integer;
+  variance: Double;
+begin
+  daysSinceEpoch := Trunc((Time() / 1000.0 / 3600.0 - Self.Profile.SessionRegenHour) / 24.0);
+
+  if Self.Session.DateGenerated = daysSinceEpoch then Exit;
+
+  Self.Session.DateGenerated := daysSinceEpoch;
+  Self.Session.DaySeed := _FatigueHashXX64(ToStr(Self.Profile.ProfileHash) + '|day|' + ToStr(daysSinceEpoch), UInt64($DA7C0FFEE000001));
+
+  mixer := Self.Session.DaySeed;
+
+  variance := 0.80 + _FatigueUniform01(mixer) * 0.40;
+  Self.Session.ToTOnRate_ph := 0.60 * variance;
+
+  variance := 0.80 + _FatigueUniform01(mixer) * 0.40;
+  Self.Session.ToTOffShort_ph := 1.5 * Self.Profile.BreakRecovery * variance;
+
+  variance := 0.80 + _FatigueUniform01(mixer) * 0.40;
+  Self.Session.ToTOffLong_ph := 3.0 * Self.Profile.BreakRecovery * variance;
+
+  variance := 0.75 + _FatigueUniform01(mixer) * 0.50;
+  Self.Session.MicroThresh_s := BREAK_MICRO_BASE_S * variance;
+
+  variance := 0.75 + _FatigueUniform01(mixer) * 0.50;
+  Self.Session.ShortThresh_s := BREAK_SHORT_BASE_S * variance;
+
+  Self.Session.DriftScale := 0.70 + _FatigueUniform01(mixer) * 0.60;
+  Self.Session.DriftRevert_ph := 0.3 + _FatigueUniform01(mixer) * 0.4;
+  Self.Session.BreakQuality := 0.80 + _FatigueUniform01(mixer) * 0.40;
+
+  variance := 0.85 + _FatigueUniform01(mixer) * 0.30;
+  Self.Session.W_F_Session := Self.Profile.W_F * variance;
+
+  variance := 0.85 + _FatigueUniform01(mixer) * 0.30;
+  Self.Session.W_X_Session := Self.Profile.W_X * variance;
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'Session regenerated for day ' + ToStr(daysSinceEpoch)));
+end;
+
+// ============================================================================
+// HISTORY MANAGEMENT
+// ============================================================================
+
+procedure TFatigue.AddSleepToHistory(duration_h: Double; timestamp_ms: Int64);
+const
+  MAX_HISTORY_DAYS = 14;
+begin
+  Self.State.SleepDurations_h += duration_h;
+  Self.State.SleepTimestamps_ms += timestamp_ms;
+
+  if Self.State.LastWake_ms > 0 then
+    Self.State.WakeDurations_h += (timestamp_ms - Self.State.LastWake_ms) / 3600000.0;
+
+  while Length(Self.State.SleepDurations_h) > MAX_HISTORY_DAYS do
+  begin
+    Delete(Self.State.SleepDurations_h, 0, 1);
+    Delete(Self.State.SleepTimestamps_ms, 0, 1);
+  end;
+
+  while Length(Self.State.WakeDurations_h) > MAX_HISTORY_DAYS do
+    Delete(Self.State.WakeDurations_h, 0, 1);
+end;
+
+function TFatigue.GetAverageSleepDuration(): Double;
+var
+  i: Integer;
+  sum: Double;
+begin
+  if Length(Self.State.SleepDurations_h) = 0 then
+    Exit(Self.Profile.SleepNeed_h);
+
+  sum := 0.0;
+  for i := 0 to High(Self.State.SleepDurations_h) do
+    sum := sum + Self.State.SleepDurations_h[i];
+
+  Result := sum / Length(Self.State.SleepDurations_h);
+end;
+
+function TFatigue.GetAverageSleepHour(): Double;
+var
+  i: Integer;
+  sum: Double;
+begin
+  if Length(Self.State.SleepTimestamps_ms) = 0 then Exit(23.0);
+
+  sum := 0;
+  for i := 0 to High(Self.State.SleepTimestamps_ms) do
+    sum := sum + ((Self.State.SleepTimestamps_ms[i] mod 86400000) / 3600000.0);
+
+  Result := sum / Length(Self.State.SleepTimestamps_ms);
+end;
+
+function TFatigue.GetAverageWakeDuration(): Double;
+var
+  i: Integer;
+  sum: Double;
+begin
+  if Length(Self.State.WakeDurations_h) = 0 then Exit(16.0);
+
+  sum := 0;
+  for i := 0 to High(Self.State.WakeDurations_h) do
+    sum := sum + Self.State.WakeDurations_h[i];
+
+  Result := sum / Length(Self.State.WakeDurations_h);
+end;
+// ============================================================================
+// TIME SIMULATION
+// ============================================================================
+
+function TFatigue.ParseTimeToHour(timeStr: String): Double;
+var
+  parts: TStringArray;
+begin
+  parts := timeStr.Split(':');
+  if Length(parts) >= 2 then
+    Result := StrToInt(parts[0], 23) + StrToInt(parts[1], 0) / 60.0
+  else
+    Result := 23.0;
+end;
+
+// Extract sleep schedule from Antiban
+procedure TFatigue.SimulateBackwards(days: Integer);
+var
+  schedHour, schedLength_h, schedVar: Double;
+  sleepHour, sleepLength_h, wakeDuration_h: Double;
+  sleepTime_ms, wakeTime_ms, prevWakeTime_ms, dayStart_ms: Int64;
+  d: Integer;
+begin
+  Self.State.SleepDurations_h := [];
+  Self.State.WakeDurations_h := [];
+  Self.State.SleepTimestamps_ms := [];
+
+  if Length(Antiban.Sleeps) = 0 then Exit;
+
+  schedHour := Self.ParseTimeToHour(Antiban.Sleeps[0].Time);
+  schedLength_h := Antiban.Sleeps[0].Length / Double(ONE_HOUR);
+  schedVar := Antiban.Sleeps[0].StdVar;
+
+  // First wake: day before simulation starts
+  prevWakeTime_ms := Time() - Int64(days + 1) * ONE_DAY + Trunc((schedHour + schedLength_h) * ONE_HOUR);
+
+  for d := days downto 1 do
+  begin
+    dayStart_ms := Time() - Int64(d) * ONE_DAY;
+
+    // Gaussian variance same as Antiban.TakeSleep uses
+    sleepHour := schedHour + GaussRand(0, schedVar * 2);
+    if sleepHour >= 24.0 then sleepHour -= 24.0;
+    if sleepHour < 0.0 then sleepHour += 24.0;
+
+    sleepLength_h := GaussRand(schedLength_h, schedLength_h * schedVar);
+    sleepLength_h := Max(3.0, Min(14.0, sleepLength_h));
+
+    sleepTime_ms := dayStart_ms + Trunc(sleepHour * ONE_HOUR);
+    wakeTime_ms := sleepTime_ms + Trunc(sleepLength_h * ONE_HOUR);
+    wakeDuration_h := (sleepTime_ms - prevWakeTime_ms) / Double(ONE_HOUR);
+
+    Self.State.SleepDurations_h += sleepLength_h;
+    Self.State.SleepTimestamps_ms += sleepTime_ms;
+    if wakeDuration_h > 0 then
+      Self.State.WakeDurations_h += wakeDuration_h;
+
+    prevWakeTime_ms := wakeTime_ms;
+  end;
+
+  Self.State.LastSleep_ms := Self.State.SleepTimestamps_ms[High(Self.State.SleepTimestamps_ms)];
+  Self.State.LastWake_ms := prevWakeTime_ms;
+  Self.State.IsAsleep := False;
+  Self.State.I := 0;
+  Self.State.Debt := 0;
+  Self.State.Kappa := (Self.Profile.KappaMin + Self.Profile.KappaMax) / 2;
+  Self.State.S := Self.Profile.S_min + (Self.Profile.S_max - Self.Profile.S_min) *
+    (1.0 - Exp(-(Time() - Self.State.LastWake_ms) / Double(ONE_HOUR) / Self.Profile.TauWake_h));
+end;
+
+procedure TFatigue.ReconstructGap();
+var
+  gap_h, schedHour, schedLength_h, schedVar, sleepLength_h, offTask_h: Double;
+  dayStart_ms, sleepTime_ms, wakeTime_ms: Int64;
+begin
+  if Self.State.LastSave_ms <= 0 then Exit;
+
+  gap_h := (Time() - Self.State.LastSave_ms) / Double(ONE_HOUR);
+  if gap_h < 0.25 then Exit;
+
+  if Length(Antiban.Sleeps) = 0 then Exit;
+
+  schedHour := Self.ParseTimeToHour(Antiban.Sleeps[0].Time);
+  schedLength_h := Antiban.Sleeps[0].Length / Double(ONE_HOUR);
+  schedVar := Antiban.Sleeps[0].StdVar;
+
+  // Check each day in gap
+  dayStart_ms := Self.State.LastSave_ms - (Self.State.LastSave_ms mod ONE_DAY);
+  while dayStart_ms < Time() do
+  begin
+    sleepTime_ms := dayStart_ms + Trunc(schedHour * ONE_HOUR);
+
+    if (sleepTime_ms > Self.State.LastSave_ms) and (sleepTime_ms < Time()) then
+    begin
+      sleepLength_h := GaussRand(schedLength_h, schedLength_h * schedVar);
+      sleepLength_h := Max(3.0, Min(14.0, sleepLength_h));
+      wakeTime_ms := sleepTime_ms + Trunc(sleepLength_h * ONE_HOUR);
+
+      Self.State.SleepDurations_h += sleepLength_h;
+      Self.State.SleepTimestamps_ms += sleepTime_ms;
+      Self.State.WakeDurations_h += (sleepTime_ms - Self.State.LastWake_ms) / Double(ONE_HOUR);
+
+      Self.State.LastSleep_ms := sleepTime_ms;
+      Self.State.LastWake_ms := wakeTime_ms;
+      Self.Runtime.ToT := 0;  // Sleep resets ToT
+    end;
+
+    dayStart_ms += ONE_DAY;
+  end;
+
+  // ToT decay for non-sleep gap time
+  if Self.State.OffTaskStart_ms > 0 then
+    offTask_h := (Time() - Self.State.OffTaskStart_ms) / Double(ONE_HOUR)
+  else
+    offTask_h := gap_h;
+
+  if Self.Runtime.ToT > 0 then
+    Self.Runtime.ToT := Self.Runtime.ToT * Exp(-Self.Session.ToTOffLong_ph * offTask_h);
+
+  Self.State.OffTaskStart_ms := 0;
+
+  // Update S
+  Self.State.S := Self.Profile.S_min + (Self.Profile.S_max - Self.Profile.S_min) *
+    (1.0 - Exp(-(Time() - Self.State.LastWake_ms) / Double(ONE_HOUR) / Self.Profile.TauWake_h));
+end;
+
+// ============================================================================
+// CIRCADIAN CALCULATION
+// ============================================================================
+
+function TFatigue.CalculateCircadian(time_ms: Int64): Double;
+const
+  CIRC_PHASE_REF_H = 4.5;
+var
+  hourOfDay, phase, circTime: Double;
+  i: Integer;
+  harmonic: Double;
+begin
+  hourOfDay := Frac(time_ms / 86400000.0) * 24.0;
+  phase := CIRC_PHASE_REF_H + Self.Profile.PhaseOffset_h;
+  circTime := (hourOfDay - phase) / Self.Profile.CircadianPeriod_h * 24.0;
+
+  Result := 0.0;
+  for i := 0 to 4 do
+  begin
+    harmonic := _Fatigue.CircHarmonicsPop[i] * Self.Profile.CircHarmonics[i];
+    Result := Result + harmonic * Sin((i + 1) * 2.0 * PI * circTime / 24.0);
+  end;
+
+  Result := Result / 1.3;
+  Result := Max(-1.0, Min(1.0, Result));
+end;
+
+// ============================================================================
+// STATE UPDATES
+// ============================================================================
+
+procedure TFatigue.UpdateHomeostatic(dt_h: Double);
+var L, debtEffect, target: Double;
+begin
+  if Self.State.IsAsleep then begin
+    debtEffect := Max(0.0, Self.State.Debt) * (Self.Profile.S_max - Self.Profile.S_min) * Self.Profile.DebtSens * 0.5;
+    L := Min(Self.Profile.S_min + debtEffect, Self.Profile.S_max * 0.80);
+    Self.Runtime.LowerAsymptote := L;
+    Self.State.S := L + (Self.State.S - L) * Exp(-dt_h / Self.Profile.TauSleep_h);
+  end else begin
+    target := Self.Profile.S_max;
+    Self.State.S := target - (target - Self.State.S) * Exp(-dt_h / Self.Profile.TauWake_h);
+    Self.Runtime.LowerAsymptote := Self.Profile.S_min;
+  end;
+  Self.State.S := Max(0.0, Min(1.0, Self.State.S));
+end;
+
+// Rajdev-validated debt mechanics: debt modulates RECOVERY FLOOR, not direct impairment
+procedure TFatigue.UpdateDebt(dt_h: Double);
+const
+  DEBT_MAX = 1.0;
+var
+  loss: Double;
+begin
+  if Self.State.IsAsleep then loss := -(24.0 / Self.Profile.SleepNeed_h - 1.0) else loss := 1.0;
+  Self.State.Debt := Max(Self.Profile.DebtMin, Min(DEBT_MAX, Self.State.Debt + (loss - Self.State.Debt) * dt_h / (Self.Profile.DebtTau_d * 24.0)));
+end;
+
+procedure TFatigue.UpdateSleepInertia(dt_h: Double);
+begin
+  if not Self.State.IsAsleep then
+    Self.State.I := Self.State.I * Exp(-dt_h / Self.Profile.InertiaTau_h);
+
+  Self.State.I := Max(0.0, Min(Self.Profile.InertiaMag, Self.State.I));
+end;
+
+procedure TFatigue.UpdateKappa(dt_h: Double);
+var
+  lambda: Double;
+begin
+  if Self.State.IsAsleep then
+  begin
+    lambda := Self.Profile.KappaLambdaSleep;
+    Self.State.Kappa := Self.State.Kappa * Exp(lambda * dt_h);
+  end
+  else
+  begin
+    lambda := Self.Profile.KappaLambdaWake;
+    Self.State.Kappa := Self.State.Kappa + lambda * Self.State.Kappa * (Self.Profile.KappaMax - Self.State.Kappa) * dt_h;
+  end;
+
+  Self.State.Kappa := Max(Self.Profile.KappaMin * 0.95, Min(Self.Profile.KappaMax * 1.05, Self.State.Kappa));
+end;
+
+procedure TFatigue.UpdateDrift(dt_h: Double);
+var
+  noise: Double;
+begin
+  noise := _FatigueNormal01(Self.Runtime.DriftMixer);
+  Self.Runtime.Drift := Self.Runtime.Drift * Exp(-Self.Session.DriftRevert_ph * dt_h) + Self.Session.DriftScale * 0.02 * noise * Sqrt(dt_h);
+  Self.Runtime.Drift := Max(-0.15, Min(0.15, Self.Runtime.Drift));
+end;
+
+// ============================================================================
+// MAIN UPDATE
+// ============================================================================
+
+procedure TFatigue.LogCSV(onTask: Boolean);
+var
+  path: String;
+begin
+  path := 'fatigue' + PATH_SEP + Profiles[ProfileIndex].Username + '.csv';
+  FileAppend(WLEnv.ConfigsDir + path,
+  ToStr(Time()) + ',' +
+  ToStr(Self.State.IsAsleep) + ',' +
+  ToStr(Round((Time() - Self.State.LastWake_ms) / Double(ONE_HOUR), 2)) + ',' +
+  ToStr(Self.State.OffTaskStart_ms) + ',' +
+  ToStr(onTask) + ',' +
+  ToStr(Round(Self.State.S, 4)) + ',' +
+  ToStr(Round(Self.State.Debt, 4)) + ',' +
+  ToStr(Round(Self.State.I, 4)) + ',' +
+  ToStr(Round(Self.Runtime.ToT, 4)) + ',' +
+  ToStr(Round(Self.Runtime.C_raw, 4)) + ',' +
+  ToStr(Round(Self.Runtime.S_norm, 4)) + ',' +
+  ToStr(Round(Self.Runtime.P_sleep, 4)) + ',' +
+  ToStr(Round(Self.Runtime.Z_raw, 4)) + ',' +
+  ToStr(Round(Self.Runtime.F_norm, 4)) + ',' +
+  ToStr(Round(Self.Runtime.Drift, 4)) +
+  LINE_SEP);
+end;
+
+procedure TFatigue.Update(onTask: Boolean = True);
+const
+  BIFURCATION_WAKE_H = 20.2;
+var
+  now_ms, dt_ms: Int64;
+  dt_h, dailyWake_h: Double;
+  offTaskDuration_s, recoveryRate: Double;
+begin
+  if not Self.Enabled or not Self.Initialized then Exit;
+
+  now_ms := Time();
+  Self.GenerateSession();
+
+  if Self.Runtime.LastUpdate_ms = 0 then
+    Self.Runtime.LastUpdate_ms := now_ms - 1000;
+
+  dt_ms := now_ms - Self.Runtime.LastUpdate_ms;
+
+  // Failsafe: negative delta (clock change/rollover)
+  if dt_ms < 0 then
+  begin
+    Self.Runtime.LastUpdate_ms := now_ms;
+    Exit;
+  end;
+
+  // Failsafe: tiny delta, skip computation
+  if dt_ms < 100 then Exit;
+
+  dt_h := dt_ms / 3600000.0;
+
+  // Failsafe: huge gap, reinitialize
+  if dt_h > 24.0 then
+  begin
+    Self.SimulateBackwards(3);
+    Self.GenerateSession();
+    Self.Runtime.LastUpdate_ms := now_ms;
+    Self.State.OffTaskStart_ms := 0;
+    Self.Runtime.ToT := 0;
+    Exit;
+  end;
+
+  // Biological updates - always happen regardless of task state
+  Self.UpdateHomeostatic(dt_h);
+  Self.UpdateDebt(dt_h);
+  Self.UpdateSleepInertia(dt_h);
+  Self.UpdateKappa(dt_h);
+  Self.UpdateDrift(dt_h);
+
+  // ToT update - depends on task state
+  if onTask then
+  begin
+    // Returning to task after being off
+    if Self.State.OffTaskStart_ms > 0 then
+    begin
+      offTaskDuration_s := (now_ms - Self.State.OffTaskStart_ms) / 1000.0;
+
+      // Apply recovery based on off-task duration (research-backed tiers)
+      if offTaskDuration_s >= Self.Profile.ToTResetThresh_h * 3600.0 then
+        Self.Runtime.ToT := 0.0
+      else if offTaskDuration_s >= Self.Session.ShortThresh_s then
+      begin
+        recoveryRate := Self.Session.ToTOffLong_ph * Self.Session.BreakQuality;
+        Self.Runtime.ToT := Self.Runtime.ToT * Exp(-recoveryRate * offTaskDuration_s / 3600.0);
+      end
+      else if offTaskDuration_s >= Self.Session.MicroThresh_s then
+      begin
+        recoveryRate := Self.Session.ToTOffShort_ph * Self.Session.BreakQuality;
+        Self.Runtime.ToT := Self.Runtime.ToT * Exp(-recoveryRate * offTaskDuration_s / 3600.0);
+      end
+      else
+      begin
+        recoveryRate := Self.Session.ToTOffShort_ph * 0.3;
+        Self.Runtime.ToT := Self.Runtime.ToT * Exp(-recoveryRate * offTaskDuration_s / 3600.0);
+      end;
+
+      Self.State.OffTaskStart_ms := 0;
+    end;
+
+    // Accumulate ToT while on-task
+    Self.Runtime.ToT := Min(1.0, Self.Runtime.ToT + Self.Session.ToTOnRate_ph * dt_h);
+  end
+  else
+  begin
+    // Off-task: mark start time if not already set
+    if Self.State.OffTaskStart_ms = 0 then
+      Self.State.OffTaskStart_ms := now_ms;
+    // ToT unchanged until we return to task - recovery applied then
+  end;
+
+  // Circadian and composite calculations
+  Self.Runtime.C_raw := Self.CalculateCircadian(now_ms);
+  Self.Runtime.C_scaled := Self.State.Kappa * Self.Runtime.C_raw * Self.Profile.CircadianAmp;
+  Self.Runtime.S_norm := (Self.State.S - Self.Profile.S_min) / (Self.Profile.S_max - Self.Profile.S_min);
+  Self.Runtime.P_sleep := Max(0.0, Min(1.5, Self.Runtime.S_norm + Self.Runtime.C_scaled));
+
+  Self.Runtime.Z_raw := Self.Runtime.P_sleep +
+    Self.Session.W_F_Session * Self.Profile.ToTWeight * Self.Runtime.ToT +
+    Self.Session.W_X_Session * Self.Runtime.P_sleep * Self.Runtime.ToT +
+    Self.State.I + Self.Runtime.Drift;
+
+  Self.Runtime.F_level := Max(0.0, Min(Self.Profile.FatigueCeiling, Self.Runtime.Z_raw));
+  Self.Runtime.F_norm := Self.Runtime.F_level / Self.Profile.FatigueCeiling;
+
+  Self.Runtime.LastUpdate_ms := now_ms;
+
+  // McCauley bifurcation warning
+  if Self.State.LastWake_ms > 0 then
+  begin
+    dailyWake_h := (now_ms - Self.State.LastWake_ms) / 3600000.0;
+    if (dailyWake_h > BIFURCATION_WAKE_H) and (not Self.Runtime.BifurcationWarned) then
+    begin
+      WriteLn(GetDebugLn('Fatigue', 'WARNING: Daily wake (' + ToStr(Round(dailyWake_h, 1)) + 'h) exceeds bifurcation threshold (20.2h)', ELogLevel.WARN));
+      Self.Runtime.BifurcationWarned := True;
+    end;
+  end;
+
+  // Periodic save
+  if (now_ms - Self.State.LastSave_ms) > ONE_MINUTE * 3 then
+  begin
+    Self.LogCSV(True);
+    Self.Save();
+  end;
+end;
+
+procedure TFatigue._EnsureUpdated(onTask: Boolean = True);
+begin
+  if not Self.Enabled then Exit;
+  if Time() - Self.Runtime.LastUpdate_ms >= 100 then
+    Self.Update(onTask);
+end;
+
+// ============================================================================
+// SLEEP/WAKE/BREAK EVENTS
+// ============================================================================
+
+// OnSleep - biological transition
+procedure TFatigue.OnSleep();
+begin
+  Self.State.IsAsleep := True;
+  Self.State.LastSleep_ms := Time();
+
+  if Self.State.LastWake_ms > 0 then
+    Self.State.TotalWake_h := Self.State.TotalWake_h +
+      (Time() - Self.State.LastWake_ms) / 3600000.0;
+
+  Self.Save();
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'Sleep started. S=' + ToStr(Round(Self.State.S, 3))));
+end;
+
+// OnWake - biological transition + ToT reset
+procedure TFatigue.OnWake();
+var
+  sleepDuration_h: Double;
+begin
+  Self.State.IsAsleep := False;
+  sleepDuration_h := (Time() - Self.State.LastSleep_ms) / 3600000.0;
+  Self.State.LastWake_ms := Time();
+
+  Self.AddSleepToHistory(sleepDuration_h, Self.State.LastSleep_ms);
+  Self.State.TotalSleep_h := Self.State.TotalSleep_h + sleepDuration_h;
+
+  Self.State.I := Self.Profile.InertiaMag;
+  Self.Runtime.ToT := 0.0;
+  Self.State.OffTaskStart_ms := 0;
+  Self.Runtime.BifurcationWarned := False;
+
+  Self.Save();
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'Woke up. Slept ' + ToStr(Round(sleepDuration_h, 1)) +
+      'h. I=' + ToStr(Round(Self.State.I, 2))));
+end;
+
+// ============================================================================
+// OUTPUT PROPERTIES - Research-backed per-account expression
+// ============================================================================
+
+property TFatigue.FatigueLevel: Double;
+begin
+  Self._EnsureUpdated();
+  Result := Self.Runtime.F_level;
+end;
+
+property TFatigue.FatigueNormalized: Double;
+begin
+  Self._EnsureUpdated();
+  Result := Self.Runtime.F_norm;
+end;
+
+// RT μ: research shows NS effect under fatigue, linear
+property TFatigue.RTMuMultiplier: Double;
+begin
+  Self._EnsureUpdated();
+  Result := 1.0 + Self.Runtime.F_norm * (Self.Profile.RTMuGrowth - 1.0);
+end;
+
+// RT σ: research shows NS effect, linear
+property TFatigue.RTSigmaMultiplier: Double;
+begin
+  Self._EnsureUpdated();
+  Result := 1.0 + Self.Runtime.F_norm * (Self.Profile.RTSigmaGrowth - 1.0);
+end;
+
+// RT τ: research shows MAJOR effect (128%±79%), nonlinear with per-account power
+property TFatigue.RTTauMultiplier: Double;
+begin
+  Self._EnsureUpdated();
+  Result := 1.0 + Power(Self.Runtime.F_norm, Self.Profile.TauPower) * (Self.Profile.RTTauGrowth - 1.0);
+end;
+
+// Error rate: per-account power determines curve shape (threshold-like vs gradual)
+property TFatigue.ErrorRate: Double;
+begin
+  Self._EnsureUpdated();
+  Result := Power(Self.Runtime.F_norm, Self.Profile.ErrPower) * Self.Profile.ErrRateMax;
+end;
+
+// Lapse rate: per-account power, correlated with but distinct from error power
+property TFatigue.LapseRate: Double;
+begin
+  Self._EnsureUpdated();
+  Result := Power(Self.Runtime.F_norm, Self.Profile.LapsePower) * Self.Profile.LapseRateMax;
+end;
+
+// Attention: behavioral alertness dimension (INDEPENDENT of cognitive per research)
+// Floor derived from sensitivity: higher sens = lower floor
+property TFatigue.AttentionMultiplier: Double;
+var
+  floor: Double;
+begin
+  Self._EnsureUpdated();
+  floor := Max(0.55, 1.0 - Self.Profile.AttentionSens * 1.5);
+  Result := Max(floor, 1.0 - Self.Runtime.F_norm * Self.Profile.AttentionSens);
+end;
+
+// Precision: motor dimension (weakly correlated with cognitive)
+// Research: affects accuracy > speed, 3-5% per unit fatigue
+property TFatigue.PrecisionMultiplier: Double;
+var
+  floor: Double;
+begin
+  Self._EnsureUpdated();
+  floor := Max(0.82, 1.0 - Self.Profile.PrecisionSens * 1.5);
+  Result := Max(floor, 1.0 - Self.Runtime.F_norm * Self.Profile.PrecisionSens);
+end;
+
+// Impatience: decision fatigue dimension
+// Research: 27% increased temporal discounting, drift rate reduced 0.18 SD
+property TFatigue.ImpatienceMultiplier: Double;
+begin
+  Self._EnsureUpdated();
+  Result := 1.0 + Self.Runtime.F_norm * Self.Profile.ImpatienceSens;
+end;
+
+// ============================================================================
+// OUTPUT METHODS - Functions with parameters or side effects
+// ============================================================================
+
+procedure TFatigue.AdjRTParams(var mu: Double; var sigma: Double; var tau: Double);
+begin
+  Self._EnsureUpdated();
+  mu := mu * Self.RTMuMultiplier;
+  sigma := sigma * Self.RTSigmaMultiplier;
+  tau := tau * Self.RTTauMultiplier;
+end;
+
+procedure TFatigue.GetRTParams(mu, sigma, tau: Double; out adjMu, adjSigma, adjTau: Double);
+begin
+  Self._EnsureUpdated();
+  adjMu := mu * Self.RTMuMultiplier;
+  adjSigma := sigma * Self.RTSigmaMultiplier;
+  adjTau := tau * Self.RTTauMultiplier;
+end;
+
+// Commission - should I do wrong action?
+function TFatigue.ShouldError(): Boolean;
+var
+  mixer: UInt64;
+begin
+  Self._EnsureUpdated();
+  mixer := UInt64(Time()) xor Self.Profile.ProfileHash xor UInt64($E2202000000);
+  Result := _FatigueUniform01(mixer) < Self.ErrorRate;
+end;
+
+// Omission - should I skip this action?
+function TFatigue.ShouldLapse(): Boolean;
+var
+  mixer: UInt64;
+begin
+  Self._EnsureUpdated();
+  mixer := UInt64(Time()) xor Self.Profile.ProfileHash xor UInt64($1A95E00000);
+  Result := _FatigueUniform01(mixer) < Self.LapseRate;
+end;
+
+function TFatigue.ShouldMicrosleep(out duration_ms: Int32): Boolean;
+var
+  threshold, prob: Double;
+  mixer: UInt64;
+begin
+  Result := False;
+  duration_ms := 0;
+
+  // Individual threshold: inverse of sensitivity
+  // High MicrosleepSens (2.0) → threshold ~0.35 (microsleeps earlier)
+  // Low MicrosleepSens (0.3) → threshold ~0.85 (resistant)
+  threshold := 1.0 - (Self.Profile.MicrosleepSens * 0.35);
+  threshold := Max(0.25, Min(0.85, threshold));
+
+  // Only possible above personal threshold
+  if Self.Runtime.P_sleep < threshold then Exit;
+
+  // Probability scales with how far past threshold, amplified by ToT
+  prob := (Self.Runtime.P_sleep - threshold) * 0.03 * (1.0 + Self.Runtime.ToT);
+
+  mixer := UInt64(Time()) xor Self.Profile.ProfileHash xor UInt64(Round(Self.Runtime.ToT * 1000));
+  if _FatigueUniform01(mixer) < prob then
+  begin
+    Result := True;
+    // Duration: 3-15 seconds, research-backed
+    duration_ms := RandomLeft(3000, 15000);
+  end;
+end;
+
+// ============================================================================
+// PERSISTENCE
+// ============================================================================
+
+procedure TFatigue.Save();
+var
+  path: String;
+  Fjson: TJSONObject;
+  sleepArr, wakeArr, timestampArr: TJSONArray;
+  i: Integer;
+begin
+  if not Self.Initialized then Exit;
+
+  path := WLEnv.ConfigsDir + 'fatigue' + PATH_SEP + Profiles[ProfileIndex].Name + '.json';
+
+  if not DirExists(WLEnv.ConfigsDir + 'fatigue') then
+    DirCreate(WLEnv.ConfigsDir + 'fatigue');
+
+  Fjson := new TJSONObject;
+
+  Fjson.AddFloat('S', Self.State.S);
+  Fjson.AddFloat('Debt', Self.State.Debt);
+  Fjson.AddFloat('I', Self.State.I);
+  Fjson.AddFloat('Kappa', Self.State.Kappa);
+  Fjson.AddInt('LastWake_ms', Self.State.LastWake_ms);
+  Fjson.AddInt('LastSleep_ms', Self.State.LastSleep_ms);
+  Fjson.AddBool('IsAsleep', Self.State.IsAsleep);
+  Fjson.AddFloat('TotalSleep_h', Self.State.TotalSleep_h);
+  Fjson.AddFloat('TotalWake_h', Self.State.TotalWake_h);
+  Fjson.AddFloat('ToT', Self.Runtime.ToT);
+  Fjson.AddFloat('Drift', Self.Runtime.Drift);
+  Fjson.AddInt('LastSave_ms', Time());
+  Fjson.AddInt('OffTaskStart_ms', Self.State.OffTaskStart_ms);
+
+  sleepArr := new TJSONArray;
+  for i := 0 to High(Self.State.SleepDurations_h) do
+    sleepArr.AddFloat('', Self.State.SleepDurations_h[i]);
+  Fjson.AddArray('SleepDurations_h', sleepArr);
+
+  wakeArr := new TJSONArray;
+  for i := 0 to High(Self.State.WakeDurations_h) do
+    wakeArr.AddFloat('', Self.State.WakeDurations_h[i]);
+  Fjson.AddArray('WakeDurations_h', wakeArr);
+
+  timestampArr := new TJSONArray;
+  for i := 0 to High(Self.State.SleepTimestamps_ms) do
+    timestampArr.AddInt('', Self.State.SleepTimestamps_ms[i]);
+  Fjson.AddArray('SleepTimestamps_ms', timestampArr);
+
+  TJSONParser(Fjson).Save(path);
+  Self.State.LastSave_ms := Time();
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'State saved'));
+end;
+
+procedure TFatigue.Load();
+var
+  path: String;
+  Fjson: TJSONParser;
+  arr: TJSONItem;
+  i: Integer;
+begin
+  path := WLEnv.ConfigsDir + 'fatigue' + PATH_SEP + Profiles[ProfileIndex].Name + '.json';
+
+  if not FileExists(path) then Exit;
+
+  Fjson := new TJSONParser;
+  Fjson.Load(path);
+
+  if Fjson.Has('S') then Self.State.S := Fjson.Item['S'].AsFloat;
+  if Fjson.Has('Debt') then Self.State.Debt := Fjson.Item['Debt'].AsFloat;
+  if Fjson.Has('I') then Self.State.I := Fjson.Item['I'].AsFloat;
+  if Fjson.Has('Kappa') then Self.State.Kappa := Fjson.Item['Kappa'].AsFloat;
+  if Fjson.Has('LastWake_ms') then Self.State.LastWake_ms := Fjson.Item['LastWake_ms'].AsInt;
+  if Fjson.Has('LastSleep_ms') then Self.State.LastSleep_ms := Fjson.Item['LastSleep_ms'].AsInt;
+  if Fjson.Has('IsAsleep') then Self.State.IsAsleep := Fjson.Item['IsAsleep'].AsBool;
+  if Fjson.Has('TotalSleep_h') then Self.State.TotalSleep_h := Fjson.Item['TotalSleep_h'].AsFloat;
+  if Fjson.Has('TotalWake_h') then Self.State.TotalWake_h := Fjson.Item['TotalWake_h'].AsFloat;
+  if Fjson.Has('ToT') then Self.Runtime.ToT := Fjson.Item['ToT'].AsFloat;
+  if Fjson.Has('Drift') then Self.Runtime.Drift := Fjson.Item['Drift'].AsFloat;
+  if Fjson.Has('LastSave_ms') then Self.State.LastSave_ms := Fjson.Item['LastSave_ms'].AsInt;          // NEW
+  if Fjson.Has('OffTaskStart_ms') then Self.State.OffTaskStart_ms := Fjson.Item['OffTaskStart_ms'].AsInt;  // NEW
+
+  if Fjson.Has('SleepDurations_h') then
+  begin
+    arr := Fjson.Item['SleepDurations_h'];
+    SetLength(Self.State.SleepDurations_h, arr.Count);
+    for i := 0 to arr.Count - 1 do
+      Self.State.SleepDurations_h[i] := arr.Item[i].AsFloat;
+  end;
+
+  if Fjson.Has('WakeDurations_h') then
+  begin
+    arr := Fjson.Item['WakeDurations_h'];
+    SetLength(Self.State.WakeDurations_h, arr.Count);
+    for i := 0 to arr.Count - 1 do
+      Self.State.WakeDurations_h[i] := arr.Item[i].AsFloat;
+  end;
+
+  for i := 0 to High(Self.State.WakeDurations_h) do
+  if Self.State.WakeDurations_h[i] < 0 then
+    Self.State.WakeDurations_h[i] := Abs(Self.State.WakeDurations_h[i]);
+
+  if Fjson.Has('SleepTimestamps_ms') then
+  begin
+    arr := Fjson.Item['SleepTimestamps_ms'];
+    SetLength(Self.State.SleepTimestamps_ms, arr.Count);
+    for i := 0 to arr.Count - 1 do
+      Self.State.SleepTimestamps_ms[i] := arr.Item[i].AsInt;
+  end;
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'State loaded. S=' + ToStr(Round(Self.State.S, 3))));
+end;
+
+// ============================================================================
+// ANTIBAN CALLBACKS
+// ============================================================================
+
+procedure _Fatigue_OnStartSleep(task: PSleepTask);
+begin
+  Fatigue.OnSleep();
+end;
+
+procedure _Fatigue_OnFinishSleep(task: PSleepTask);
+begin
+  Fatigue.OnWake();
+end;
+
+procedure _Fatigue_OnBreaking(task: PBreakTask; var countdown: TCountdown);
+begin
+  Fatigue._EnsureUpdated(False);
+end;
+
+procedure _Fatigue_OnSleeping(task: PSleepTask; var countdown: TCountdown);
+begin
+  Fatigue._EnsureUpdated(False);
+end;
+
+// ============================================================================
+// SETUP
+// ============================================================================
+
+procedure TFatigue.Setup();
+var
+  profileName: String;
+  historyDays: Integer;
+  mixer: UInt64;
+begin
+  if ProfileIndex < 0 then
+  begin
+    WriteLn(GetDebugLn('Fatigue', 'WARNING: Invalid ProfileIndex. Fatigue disabled.', ELogLevel.WARN));
+    Self.Enabled := False;
+    Exit;
+  end;
+
+  if Length(Antiban.Sleeps) = 0 then
+  begin
+    WriteLn(GetDebugLn('Fatigue', 'WARNING: Antiban.Sleeps is empty. Fatigue requires sleep schedule.', ELogLevel.WARN));
+    Self.Enabled := False;
+    Exit;
+  end;
+
+  profileName := Profiles[ProfileIndex].Name;
+  Self.GenerateProfile(profileName);
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'Profile: Ceiling=' + ToStr(Round(Self.Profile.FatigueCeiling, 2)) +
+      ' SleepNeed=' + ToStr(Round(Self.Profile.SleepNeed_h, 1)) + 'h' +
+      ' AttSens=' + ToStr(Round(Self.Profile.AttentionSens, 2)) +
+      ' ErrPow=' + ToStr(Round(Self.Profile.ErrPower, 2))));
+
+  Self.Load();
+  Self.GenerateSession();
+  Self.ReconstructGap();
+
+  if Length(Self.State.SleepDurations_h) = 0 then
+  begin
+    mixer := Self.Profile.ProfileHash;
+    historyDays := 3 + Trunc(_FatigueUniform01(mixer) * 5.0);
+    Self.SimulateBackwards(historyDays);
+  end;
+
+  // FINAL FAILSAFE - script starting = player awake
+  if Self.State.IsAsleep then
+  begin
+    Self.State.IsAsleep := False;
+    Self.State.LastWake_ms := Time();
+    Self.State.I := Self.Profile.InertiaMag;
+    if Self.Debugging then
+      WriteLn(GetDebugLn('Fatigue', 'Forced awake state on script start'));
+  end;
+
+
+  Self.Runtime.BoutStart_ms := Time();
+  Self.Runtime.LastUpdate_ms := Time();
+  Self.Runtime.DriftMixer := Self.Profile.ProfileHash xor UInt64(Time());
+
+  // Sleep transitions (biological state changes)
+  Antiban.OnStartSleep := @_Fatigue_OnStartSleep;
+  Antiban.OnFinishSleep := @_Fatigue_OnFinishSleep;
+
+  // Periodic updates during breaks/sleeps
+  Antiban.OnBreaking := @_Fatigue_OnBreaking;
+  Antiban.OnSleeping := @_Fatigue_OnSleeping;
+
+  Self.Enabled := True;
+  Self.Initialized := True;
+
+  WriteLn(GetDebugLn('Fatigue', 'Fatigue system initialized. Sleeps=' + ToStr(Length(Self.State.SleepDurations_h))));
+end;
+
+// ============================================================================
+// DEBUG
+// ============================================================================
+
+procedure TFatigue.DebugPrint();
+var
+  awake_h, sleepAvg_h: Double;
+  pct: Integer;
+  state: String;
+
+  function _FBar(value, maxVal: Double; width: Integer): String;
+  var
+    filled, i: Integer;
+  begin
+    filled := Max(0, Min(width, Round((value / maxVal) * width)));
+    Result := '[';
+    for i := 1 to filled do
+      Result := Result + '#';
+    for i := filled + 1 to width do
+      Result := Result + '-';
+    Result := Result + ']';
+  end;
+
+  function _FDebtLabel(debt: Double): String;
+  begin
+    if debt < - 0.05 then
+      Result := 'BANKED'
+    else if debt < 0.15 then
+      Result := 'NEUTRAL'
+    else if debt < 0.40 then
+      Result := 'MILD'
+    else if debt < 0.65 then
+      Result := 'MODERATE'
+    else if debt < 0.85 then
+      Result := 'HIGH'
+    else
+      Result := 'SEVERE';
+  end;
+
+  function _FCircLabel(c_raw: Double): String;
+  begin
+    if c_raw < - 0.6 then
+      Result := 'PEAK'
+    else if c_raw < - 0.2 then
+      Result := 'Good'
+    else if c_raw < 0.2 then
+      Result := 'Neutral'
+    else if c_raw < 0.6 then
+      Result := 'Dip'
+    else
+      Result := 'TROUGH';
+  end;
+begin
+  if not Self.Initialized then
+  begin
+    WriteLn('Fatigue: Not initialized');
+    Exit;
+  end;
+  Self._EnsureUpdated();
+  if Self.State.LastWake_ms > 0 then
+    awake_h := (Time() - Self.State.LastWake_ms) / 3600000.0
+  else
+    awake_h := 0;
+  sleepAvg_h := Self.GetAverageSleepDuration();
+  pct := Round(Self.FatigueLevel * 100);
+  if Self.State.IsAsleep then
+    state := 'ZZZ';
+  WriteLn(GetDebugLn('+====================================================================+', ELogLevel.SUCCESS, False));
+  WriteLn('|                     FATIGUE STATUS REPORT                          |');
+  WriteLn('  TIREDNESS:    ' + _FBar(Self.FatigueLevel, 1.0, 30) + ' ' + ToStr(pct) + '%');
+  WriteLn('  State: ' + state + '   |   Awake: ' + ToStr(Round(awake_h, 1)) + 'h   |   Avg Sleep: ' + ToStr(Round(sleepAvg_h, 1)) + 'h/night');
+  WriteLn('+--------------------------------------------------------------------+');
+  WriteLn('|  FATIGUE SOURCES                                                   |');
+  WriteLn('  Sleep Pressure:   ' + _FBar(Self.State.S, 1.0, 20) + ' ' + ToStr(Round(Self.State.S * 100)) + '%');
+  WriteLn('  Sleep Debt:       ' + _FBar(Max(0, Self.State.Debt), 1.0, 20) + ' ' + _FDebtLabel(Self.State.Debt));
+  WriteLn('  Body Clock:       ' + _FBar((Self.Runtime.C_raw + 1) / 2, 1.0, 20) + ' ' + _FCircLabel(Self.Runtime.C_raw));
+  WriteLn('  Time on Task:     ' + _FBar(Self.Runtime.ToT, 1.0, 20) + ' ' + ToStr(Round(Self.Runtime.ToT * 100)) + '%');
+  if Self.State.I > 0.02 then
+    WriteLn('  Grogginess:       ' + _FBar(Self.State.I / Self.Profile.InertiaMag, 1.0, 20) + ' ' + ToStr(Round(Self.State.I / Self.Profile.InertiaMag * 100)) + '%');
+  WriteLn('+--------------------------------------------------------------------+');
+  WriteLn('|  PERFORMANCE IMPACT                                                |');
+  WriteLn(Format('  Reaction Speed . . . . . %.1f%% of normal', [Self.RTMuMultiplier * 100]));
+  WriteLn(Format('  Slow Reaction Spikes . . %.1f%%', [Self.RTTauMultiplier * 100]));
+  WriteLn(Format('  Attention. . . . . . . . %.1f%% of normal', [Self.AttentionMultiplier * 100]));
+  WriteLn(Format('  Click Accuracy . . . . . %.1f%% of normal', [Self.PrecisionMultiplier * 100]));
+  WriteLn(Format('  Mistake Chance . . . . . %.2f%%', [Self.ErrorRate * 100]));
+  WriteLn(Format('  Space-out Chance . . . . %.2f%%', [Self.LapseRate * 100]));
+  WriteLn('+--------------------------------------------------------------------+');
+  WriteLn('|  RECOVERY INFO                                                     |');
+  WriteLn('  Sleep Recovery Floor: ' + ToStr(Round(Self.Runtime.LowerAsymptote * 100)) + '%');
+  WriteLn('+====================================================================+');
+end;
