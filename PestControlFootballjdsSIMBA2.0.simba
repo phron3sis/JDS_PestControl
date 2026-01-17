@@ -59,14 +59,8 @@ type
 // TYPES
 // =============================================================================
 type
-  TUV = record
-    Hash, Salt: String;   // Hash string + Salt
-    U: Double;// U (0..1)
-  end;
-  TUVArray = array of TUV;
-
   TDeseqState = record
-    U: TUVArray;
+    U: TDoubleArray;
 
     // Per-game (set in SetPerGame)
     WinThreshGame: Double;
@@ -94,7 +88,7 @@ type
     // Account unique decisions
     Flag: record
       NoPray, NoLeave, NoPace, NoBoatMove, DelayBoatMove: Boolean;
-      Choices: TUVArray;
+      Choices: TDoubleArray;
       GameKnightOffset: TPoint;
     end;
 
@@ -107,12 +101,12 @@ type
     BoatBox: TBox;
 
     // U's and Choices
-    P: TUVArray; // Prayer
-    M: TUVArray; // Mouse
-    B: TUVArray; // Boat
-    SampleRTUs: TUVArray; // Random RT selection U's
+    P: TDoubleArray; // Prayer
+    M: TDoubleArray; // Mouse
+    B: TDoubleArray; // Boat
+    SampleRTUs: TDoubleArray; // Random RT selection U's
     Deseq: TDeseqState; // Desequence
-    attkC: TUVArray; // Attack choices
+    attkC: TDoubleArray; // Attack choices
     AttackChoice: EAttackChoice;
     AttackIndex: Int32;
     AttackWeights: array[0..2] of Double;
@@ -124,7 +118,7 @@ type
 
     // Timing
     bRT: UInt64;
-    RT: TUVArray;//0..2 RT_U1, RT_U2, RTC_U
+    RT: TDoubleArray;//0..2 RT_U1, RT_U2, RTC_U
     Tempo: TAttackTempo;
     XPAttkDelay: UInt64;
     NextAttkDelay, LastAttack: UInt64;
@@ -166,7 +160,7 @@ type
 
 var
   PestControl: TPestControl;
-  bhM, _bhM: TUV;
+  bhM, _bhM: Double;
 
 // =============================================================================
 // HELPER FUNCTIONS - Distribution Math
@@ -399,7 +393,7 @@ begin
   if mean < 1 then mean := 1;
 
   // Per-account sigma preference (0.3-0.7 range)
-  sigma := 0.3 + 0.4 * PestControl.RT[3].U;
+  sigma := 0.3 + 0.4 * PestControl.RT[3];
 
   {$IFDEF WL_FATIGUE_INCLUDED}
   // Fatigue: slower + heavier tail
@@ -428,8 +422,8 @@ var
 begin
   if mean < 1 then mean := 1;
   mu := mean;
-  sigma := mu * (0.10 + 0.08*PestControl.RT[0].U);
-  tau   := mu * (0.22 + 0.15*PestControl.RT[1].U);
+  sigma := mu * (0.10 + 0.08*PestControl.RT[0]);
+  tau   := mu * (0.22 + 0.15*PestControl.RT[1]);
   {$IFDEF WL_FATIGUE_INCLUDED}
   if shouldLog then
     Logger.Warn('mu=%.2f | simga=%.2f | tau=%.2f', [mu, sigma, tau]);
@@ -472,7 +466,7 @@ begin
   if mean < 1 then mean := 1;
 
   // Per-account shape preference (1.2-2.2 range, higher = less tail)
-  shape := 1.2 + 1.0 * PestControl.RT[4].U;
+  shape := 1.2 + 1.0 * PestControl.RT[4];
   scale := mean / Gamma(1.0 + 1.0/shape);
 
   {$IFDEF WL_FATIGUE_INCLUDED}
@@ -486,9 +480,9 @@ end;
 
 function SampleRT(mean: Double = PestControl.bRT): UInt64;
 begin
-  if SoftRandBool(PestControl.RT[5].U, 2.0, 0.55) then
+  if SoftRandBool(PestControl.RT[5], 2.0, 0.55) then
     Result := ExpoGaussRT(mean)
-  else if SoftRandBool(PestControl.RT[6].U, 2.0, 0.65) then
+  else if SoftRandBool(PestControl.RT[6], 2.0, 0.65) then
     Result := WeibullRT(mean)
   else
     Result := LogNormalRT(mean);
@@ -501,46 +495,29 @@ var
   ident, msg, hex: String;
   v, k: UInt64;
 begin
-  if InRange(ProfileIndex, 0, High(Profiles)) and
-     ((Profiles[ProfileIndex].Name <> '') or (Profiles[ProfileIndex].Username <> '')) then
-    ident := IntToStr(Length(Profiles[ProfileIndex].Name)) + ':' +
-             Profiles[ProfileIndex].Name + ':' +
-             Profiles[ProfileIndex].Username
-  else
-    ident := '0:ANON:' + SimbaEnv.SimbaPath;
+  ident := Profiles[ProfileIndex].Name + ':' +
+    Profiles[ProfileIndex].Username;
 
-  msg := 'HashToU|v1|' + ident + '|' + salt;
+  msg := 'HashToU:v1:' + ident + ':' + salt;
   hex := HashString(EHashAlgo.SHA256, msg);
   v := StrToUInt64('$' + Copy(hex, 1, 16));
   k := (v shr 11);
   Result := (k * INV_POW2_53) + (0.5 * INV_POW2_53);
 end;
 
-procedure TUV.Create(salt: String = '');
+procedure Double.CreateU(const salt: String = '');
 begin
-  Self.Hash := Profiles[ProfileIndex].Name + Profiles[ProfileIndex].Username;
-  Self.Salt := salt;
-  Self.U := HashToU(salt);
-  WriteLn(PadR(Self.Salt, 16), Self.U);
+  Self := HashToU(salt);
+  WriteLn(PadR(Salt, 16), Self);
 end;
 
-procedure TUVArray.Create(salts: TStringArray);
+procedure TDoubleArray.CreateU(const salts: TStringArray = ['']);
 var
-  i: Int32;
+  i : Integer;
 begin
   SetLength(Self, salts.Length);
   for i := 0 to salts.High do
-    Self[i].Create(salts[i]);
-end;
-
-function TUVArray.Get(salt: String): Double;
-var
-  i: Integer;
-begin
-  for i := 0 to Self.High do
-    if Self[i].Salt = salt then
-      Exit(Self[i].U);
-  Writeln GetDebugLn('Salt not found: ' + salt, ELogLevel.ERROR, True);
+    Self[i].CreateU(salts[i]);
 end;
 
 procedure TPestControl.CloseSkillInterface();
@@ -552,7 +529,7 @@ begin
   Sleep(Self.bRT, 1800);
   Writeln(GetDebugLn('SKILL INTERFACE CLOSED - why was it open? lol, Message footballjds!', ELogLevel.ERROR));
   Inc(Self.SkillInterfacesClosed);
-  if Self.SkillInterfacesClosed > (5 + 10 * _bhM.U) then
+  if Self.SkillInterfacesClosed > (5 + 10 * _bhM) then
     TerminateScript('TOO MANY INTERFACES CLOSED, failsafe. Message footballjds!!!');
 end;
 
@@ -664,9 +641,6 @@ begin
     1, 10, 100, 1, 10, 100, 1, 10, 100, 1, 10, 100];
   Self.Costs += [30, 15, 15];
   Self.Costs += [250, 250, 250, 150, 200, 200, 200, 10];
-
-  Writeln(GetTimeRunning,' ', Self.ItemBoxes.Length);
-  Writeln(GetTimeRunning,' ',Self.RewardStrings.Length);
 
   if (self.Costs.Length <> Self.ItemBoxes.Length) or
     (Self.ItemBoxes.Length <> Self.RewardStrings.Length + 14) then
@@ -888,7 +862,7 @@ begin
 
   Result := Self.ZoomLevel;
   if InRange(Result, 30, 50) then exit;
-  if Self.SetZoomLevel(RandomMode(35+Round(10*bhM.U), 30, 50)) then
+  if Self.SetZoomLevel(RandomMode(35+Round(10*bhM), 30, 50)) then
   begin
     Result := Self.ZoomLevel;
     WriteLn GetDebugLn('Options', 'Zoom adjusted level: ' + ToString(Self.ZoomLevel), ELogLevel.SUCCESS);
@@ -1217,7 +1191,7 @@ begin
     {$IFDEF WL_FATIGUE_INCLUDED}
     y := DrawRow('Runtime', runtimeStr, y, 'F '+ FormatFloat('##0.0', Fatigue.FatigueLevel*100)+'%');
     {$ELSE}
-    y := DrawRow('Runtime', runtimeStr, y, 'F ');
+    y := DrawRow('Runtime', runtimeStr, y, 'F-N/A');
     {$ENDIF}
 
     if stateStr.Contains('DEFEND') then
@@ -1353,12 +1327,12 @@ var
 begin
   if not Self.PlatformCenter(platMean) then Exit;
   Result := Distance(Minimap.Center, platMean)
-          < 13 + 3 * bhM.U + Random(-1, 1);
+          < 13 + 3 * bhM + Random(-1, 1);
 end;
 
 function TPestControl.AtBoatPlank(pos: TPoint): Boolean;
 begin
-  Result := Distance(pos, Self.AtPlank) < 5+5*bhM.U;
+  Result := Distance(pos, Self.AtPlank) < 6+5*bhM;
 end;
 
 procedure TPestControl.UpdateAttkDelay();
@@ -1368,7 +1342,7 @@ begin
   candidate := ExpoGaussRT(Self.Tempo.LowMeanGame);
   if Self.NextAttkDelay > 0 then
   begin
-    if Random() < (0.05 + 0.10 * Self.RT[2].U) then
+    if Random() < (0.05 + 0.10 * Self.RT[2]) then
       Self.NextAttkDelay := candidate
     else
       Self.NextAttkDelay := Round(Self.Tempo.LowStick * Self.NextAttkDelay
@@ -1387,7 +1361,7 @@ begin
 
   if Self.XPAttkDelay > 0 then
   begin
-    if Random() < (0.05 + 0.10 * Self.RT[2].U) then
+    if Random() < (0.05 + 0.10 * Self.RT[2]) then
       Self.XPAttkDelay := candidate
     else
       Self.XPAttkDelay := Round(Self.Tempo.XPStick * Self.XPAttkDelay
@@ -1497,7 +1471,7 @@ begin
 
   if Self.InGame() then
   begin
-    if not Self.UserDisableLeaveGame and not Self.Flag.NoLeave and (Self.ReadPortalHP >= 50+199*bhM.U)
+    if not Self.UserDisableLeaveGame and not Self.Flag.NoLeave and (Self.ReadPortalHP >= 50+199*bhM)
       and (Self.ReadActivityBar() < 1) then
         Exit(EPestState.EXIT_GAME);
     if Self.AtKnight() then Exit(EPestState.DEFEND);
@@ -1523,13 +1497,13 @@ var
   shape, scale: Double;
 begin
   // Shape: How decision probability builds over time
-  shape := Random(1.4, 1.5) + 1 * Self.P[1].U;
+  shape := Random(1.4, 1.5) + 1 * Self.P[1];
 
   // Scale: Typical timing
-  scale := 5500 + GaussRand(400,125) + 6000 * Self.P[0].U;
+  scale := 5500 + GaussRand(400,125) + 6000 * Self.P[0];
 
   // Session variance: This game's randomness
-  scale := scale * (0.8 + (0.4 + Self.P[2].U/5) * Random());
+  scale := scale * (0.8 + (0.4 + Self.P[2]/5) * Random());
 
   // Sample from Weibull
   Result := Round(WeibullEx(shape, scale));
@@ -1628,7 +1602,7 @@ var
   r, cumulative: Double;
   i: Int32;
 begin
-  u := PestControl.Flag.Choices.Get('BoatBehavior');
+  u := PestControl.Flag.Choices[5];
   // Overlapping Gaussians centered at 0.25, 0.5, 0.75, 0.9
   probs[0] := Exp(-Sqr((u - 0.25) / 0.2));
   probs[1] := Exp(-Sqr((u - 0.50) / 0.2));
@@ -1652,8 +1626,8 @@ function TPestControl.BoatMoveSample(): UInt64;
 var
   shape, scale: Double;
 begin
-  shape := 1.3 + 1.2 * Self.M[0].U;  // 1.3-2.5, increasing hazard
-  scale := 8000 + 20000 * Self.M[1].U;  // 8-28s base
+  shape := 1.3 + 1.2 * Self.M[0];  // 1.3-2.5, increasing hazard
+  scale := 8000 + 20000 * Self.M[1];  // 8-28s base
   scale := scale * TruncGauss(1.0, 0.15, 0.7, 1.3);  // per-sample variance
   Result := Round(WeibullEx(shape, scale));
 end;
@@ -1672,12 +1646,12 @@ begin
   if Time < (Self.LastBoatMove + Self.BoatMoveDelay) then Exit;
   if not Self.InBoat() then Exit;
 
-  boatArea := Self.BoatBox.Expand(Random(-4, 6 - Round(4 * bhM.U)));
+  boatArea := Self.BoatBox.Expand(Random(-4, 6 - Round(4 * bhM)));
   current := Map.Position();
 
   primary := SoftBehaviorSelect();
 
-  if Random() < 0.60 + 0.35 * bhM.U then
+  if Random() < 0.60 + 0.35 * bhM then
     behavior := primary
   else
     behavior := Biometrics.RandomModeInteger(primary, 0, 3);
@@ -1692,11 +1666,11 @@ begin
     else mean := boatArea.RandomPoint();
   end;
 
-  weight := 2 + 8 * bhM.U;      // 2-10
-  bias := 0.5 + 1.0 * _bhM.U;   // 0.5-1.5
+  weight := 2 + 8 * bhM;      // 2-10
+  bias := 0.5 + 1.0 * _bhM;   // 0.5-1.5
 
   target := boatArea.RandomWeightedPoint(mean, weight, bias);
-  if current.DistanceTo(target) < 5 + 3 * bhM.U then
+  if current.DistanceTo(target) < 5 + 3 * bhM then
     target := boatArea.RandomWeightedPoint(
       [boatArea.X1 + boatArea.X2 - mean.X, boatArea.Y1 + boatArea.Y2 - mean.Y],
       weight * 0.5, bias * 1.5);
@@ -1704,7 +1678,7 @@ begin
   destMS := Map.Walker.GetQuadMS(current, target, [1], Minimap.CompassRadians);
   if not Mainscreen.Bounds.ContainsQuad(destMS) then
     Exit;
-  if randomBoolean(0.05*bhm.U) then
+  if randomBoolean(0.05*bhm) then
     Mouse.Move(Mainscreen.Bounds, True, EMouseDistribution.GAUSS)
   else
     Mouse.Move(destMS, True, EMouseDistribution.GAUSS);
@@ -1749,10 +1723,10 @@ begin
   {$IFDEF WL_FATIGUE_INCLUDED}
     errRate := Fatigue.ErrorRate;
   {$ENDIF}
-  Self.Flag.NoPray := RandomBoolean(errRate + 0.001347 + 0.026438 * Self.Flag.Choices[0].U);
-  Self.Flag.NoLeave := RandomBoolean(errRate + 0.00173 + 0.09573 * Self.Flag.Choices[1].U);
-  Self.Flag.NoBoatMove := RandomBoolean(Power(Self.Flag.Choices[2].U, 3) * 0.10 * (1 + Self.Flag.Choices[3].U));
-  Self.Flag.DelayBoatMove := RandomBoolean(0.15 + 0.55 * Power(Self.Flag.Choices[4].U, 0.7));
+  Self.Flag.NoPray := RandomBoolean(errRate + 0.001347 + 0.026438 * Self.Flag.Choices[0]);
+  Self.Flag.NoLeave := RandomBoolean(errRate + 0.00173 + 0.09573 * Self.Flag.Choices[1]);
+  Self.Flag.NoBoatMove := RandomBoolean(Power(Self.Flag.Choices[2], 3) * 0.10 * (1 + Self.Flag.Choices[3]));
+  Self.Flag.DelayBoatMove := RandomBoolean(0.15 + 0.55 * Power(Self.Flag.Choices[4], 0.7));
 
   Logger.Info('Self.Flag errRate %.2f', [errRate]);
   Logger.Info('Self.Flag.NoPray: %s', [toStr(Self.Flag.NoPray)]);
@@ -1768,8 +1742,8 @@ begin
   Self.Deseq.KnightHPLvl := Random(80, 100);
 
   // Per-game position preference drift (±3-8  based on biometric)
-  driftX := Round(GaussRand(0, 2 + 3 * bhM.U));
-  driftY := Round(GaussRand(0, 2 + 3 * _bhM.U));
+  driftX := Round(GaussRand(0, 2 + 3 * bhM));
+  driftY := Round(GaussRand(0, 2 + 3 * _bhM));
   Self.Flag.GameKnightOffset := Point(driftX, driftY);
 
   // Drift tempo per game
@@ -1838,13 +1812,13 @@ begin
   if Chat.IsTitle('~ Warning ~') then
     TerminateScript('Too many points '+Chat.ReadPointsOption());
   try
-    if Self.Gangplank.Click(True, 1 + Round(3*bhM.U)) then
+    if Self.Gangplank.Click(True, 1 + Round(3*bhM)) then
       if SleepUntil(Self.InBoat, 50, Round(GaussRand(3000, 200))) then
       begin
         Self.SetPerGame();
         Sleep(ExpoGaussRT(Self.bRT * 3.9));
         if not InRange(Options.GetZoomLevel(True), 30, 50) then
-          if Options.SetZoomLevel(RandomMode(35+Round(10*bhM.U), 30, 50)) then
+          if Options.SetZoomLevel(RandomMode(35+Round(10*bhM), 30, 50)) then
             WriteLn GetDebugLn('Options', 'Zoom adjusted level: ' + ToString(Options.ZoomLevel), ELogLevel.SUCCESS);
         Exit;
       end;
@@ -1856,7 +1830,7 @@ begin
   if (not Self.Flag.NoPray) and Self.UserQuickPrayer and Self.GameStarted and
     (not Minimap.PrayerEnabled) and Self.InGame() and
     (Time > (Self.GameStart + Self.PrayerEnableTime)) and
-    (Self.ReadPortalHP > Round(50 + 150*bhM.U)) then
+    (Self.ReadPortalHP > Round(50 + 150*bhM)) then
       if Minimap.EnablePrayer() then
       begin
         if Biometrics.RandomBoolean() then
@@ -1874,7 +1848,7 @@ begin
 
   {$IFDEF WL_FATIGUE_INCLUDED}
   if Fatigue.ShouldLapse then
-    Sleep(LogNormalInt(Self.bRT, 0.35 + 0.1 * Self.RT[0].u));
+    Sleep(LogNormalInt(Self.bRT, 0.35 + 0.1 * Self.RT[0]));
   {$ENDIF}
 
   if not Self.InGame() then Exit;
@@ -1899,7 +1873,7 @@ begin
       if Mainscreen.Bounds.Contains(msP) then
       begin
         Mouse.Click(msP, EMouseButton.LEFT);
-        if RandomBoolean(0.63+0.30*bhM.U) and SoftRandBool(_bhM.U, 2, 0.95) then
+        if RandomBoolean(0.63+0.30*bhM) and SoftRandBool(_bhM, 2, 0.95) then
         begin
           Minimap.WaitMoving(Round(Self.bRT*Random(100, 200)));
           Sleep(ExpoGaussRT(Self.bRT*RandomLeft(0.7, 3.1)));
@@ -1913,7 +1887,7 @@ begin
   uniqueMiddle.X += Biometrics.RandomModeInteger(0, -6, 6);
   uniqueMiddle.Y += Biometrics.RandomModeInteger(0, -6, 6);
   try
-    Logger.Info('Walk to middle: ' + ToStr(Map.Walker.WebWalk(uniqueMiddle, 7+Round(5*bhM.U), 0.2+0.4*_bhM.U)));
+    Logger.Info('Walk to middle: ' + ToStr(Map.Walker.WebWalk(uniqueMiddle, 7+Round(5*bhM), 0.2+0.4*_bhM)));
   except Logger.Error('WalkToDefend exception: %s', [GetExceptionMessage]); end;
 end;
 
@@ -2056,15 +2030,15 @@ begin
   SetLength(probs, len);
 
   // Calculate raw probabilities
-  if RandomBoolean(Self.attkC[5].U) then
+  if RandomBoolean(Self.attkC[5]) then
   begin
-    lambda := 0.3 + 1.7 * Self.attkC[6].U;
+    lambda := 0.3 + 1.7 * Self.attkC[6];
     for i := 0 to len - 1 do
       probs[i] := Exp(-lambda * i);
   end
   else
   begin
-    alpha := 0.5 + 1.5 * Self.attkC[6].U;
+    alpha := 0.5 + 1.5 * Self.attkC[6];
     for i := 0 to len - 1 do
       probs[i] := 1.0 / Power(i + 1, alpha);
   end;
@@ -2136,8 +2110,8 @@ begin
   if Time < Self.Deseq.LastNoiseReroll + Self.Deseq.NoiseInterval then Exit;
   Self.Deseq.WinNoise := TruncGauss(1.0, 0.05, 0.9, 1.1);
   Self.Deseq.InactiveNoise := TruncGauss(1.0, 0.07, 0.85, 1.15);
-  Self.Deseq.NoiseInterval := Round((3000 + 5000 * Power(Self.Deseq.U[0].U, 0.5 +
-    Self.Deseq.U[1].U)) * TruncGauss(1.0, 0.15, 0.7, 1.3));
+  Self.Deseq.NoiseInterval := Round((3000 + 5000 * Power(Self.Deseq.U[0], 0.5 +
+    Self.Deseq.U[1])) * TruncGauss(1.0, 0.15, 0.7, 1.3));
   Self.Deseq.LastNoiseReroll := Time;
 end;
 
@@ -2151,25 +2125,25 @@ begin
   Self.RerollDeseqNoise();
 
   // Per-account portal threshold: 200-500, power-transformed
-  portalThresh := (200 + 300 * Power(Self.Deseq.U[0].U, 0.5 + 1.5 * Self.Deseq.U[1].U))
+  portalThresh := (200 + 300 * Power(Self.Deseq.U[0], 0.5 + 1.5 * Self.Deseq.U[1]))
                 * Self.Deseq.WinThreshGame * Self.Deseq.WinNoise;
 
   // Some accounts factor in game time
-  useTime := Self.Deseq.U[2].U > 0.6;
+  useTime := Self.Deseq.U[2] > 0.6;
   gameTime := Time - Self.GameStart;
 
   if useTime then
   begin
     // Time-based: game > 80-100s AND portals below threshold
-    timeThresh := 80000 + 20000 * Self.Deseq.U[2].U;
+    timeThresh := 80000 + 20000 * Self.Deseq.U[2];
     Result := (gameTime > timeThresh) and (Self.ReadPortalHP < portalThresh);
   end
   else
     Result := Self.ReadPortalHP < portalThresh;
 
   // Knight safety factor: some accounts also check knight HP
-  if Result and (Self.Deseq.U[3].U > 0.5) then
-    Result := Self.ReadKnightHP > 50 + Round(Self.Deseq.KnightHPLvl * Self.Deseq.U[3].U);
+  if Result and (Self.Deseq.U[3] > 0.5) then
+    Result := Self.ReadKnightHP > 50 + Round(Self.Deseq.KnightHPLvl * Self.Deseq.U[3]);
 end;
 
 function TPestControl.UserIsInactive(): Boolean;
@@ -2181,13 +2155,13 @@ begin
   Self.RerollDeseqNoise();
 
   // Per-account source: LastAttack vs LastXPTime
-  if Self.Deseq.U[4].U < 0.5 then
+  if Self.Deseq.U[4] < 0.5 then
     source := Time - Self.LastAttack
   else
     source := Time - Self.LastXPTime;
 
   // Per-account threshold: 4-15s, power-transformed
-  thresh := (4000 + 11000 * Power(Self.Deseq.U[5].U, 0.5 + 1.5 * Self.Deseq.U[6].U))
+  thresh := (4000 + 11000 * Power(Self.Deseq.U[5], 0.5 + 1.5 * Self.Deseq.U[6]))
           * Self.Deseq.InactiveThreshGame * Self.Deseq.InactiveNoise;
 
   Result := source > thresh;
@@ -2219,7 +2193,7 @@ procedure TPestControl.PaceInGame();
 begin
   if Self.UserDisablePace then Exit();
   Self.WalkToDefend();
-  Sleep(ExpoGaussRT(Self.bRT*3*_bhM.u));
+  Sleep(ExpoGaussRT(Self.bRT*3*_bhM));
 end;
 
 procedure TPestControl.ChillActivities();
@@ -2299,16 +2273,16 @@ begin
   try
     Writeln('Distance to Squire: ', Self.Squire.DistanceTo(Map.Position()));
     if not Self.InGame() then Exit;
-    if Self.Squire.DistanceTo(Map.Position()) > (8+Random(4)+Round(5*bhM.U)) then
+    if Self.Squire.DistanceTo(Map.Position()) > (8+Random(4)+Round(5*bhM)) then
       if Map.Walker.WebWalk(Self.Squire.Coordinates[0].Offset(Random(-5, 5),
-        Random(5, 10)), 3+Round(3*(bhM.U)), 0.2+0.5*bhM.U) then
+        Random(5, 10)), 3+Round(3*(bhM)), 0.2+0.5*bhM) then
           Writeln('Walked towards Squire');
     if not Self.InGame() then Exit;
-    if Self.Squire.Interact(['Leave Squire', 'eave Squire'], 1+Round(3*bhM.U)) then
+    if Self.Squire.Interact(['Leave Squire', 'eave Squire'], 1+Round(3*bhM)) then
     begin
       Self.LeaveGameCount+=1;
       WriteLn('Left game at ', FormatMilliseconds(GetTimeRunning, TIME_SHORT));
-      SleepUntil(not Self.InGame(), Round(200+random(200)), Round(17000+9000*bhM.U));
+      SleepUntil(not Self.InGame(), Round(200+random(200)), Round(17000+9000*bhM));
     end else
       Writeln('Failed to leave game');
   except Writeln('TPestControl.LeaveTheGame - ', GetExceptionMessage); end;
@@ -2320,10 +2294,12 @@ begin
     (PCData.OutpostIsland.Contains(position) and PCData.GameIsland.Contains(destination)) then
       begin
         walker^.Walking := False;
+        {$IFDEF WL_FATIGUE_INCLUDED}
         if Fatigue.ShouldLapse then
-          Sleep(ExpoGaussRT(Self.bRT*RandomLeft(1.1, 7.7)))
-        else
+          Sleep(ExpoGaussRT(Self.bRT*RandomLeft(1.1, 6.7)));
+        {$ELSE}
           Sleep(ExpoGaussRT());
+        {$ENDIF}
         Exit;
       end;
   if (Self.State = EPestState.WALK_MID) then
@@ -2336,17 +2312,17 @@ var
   bhInt: Int32;
   xpVar, lowVar: Double;
 begin
-  bhInt := Trunc(bhM.U * 1000);
+  bhInt := Trunc(bhM * 1000);
 
   // Session variance (±8%)
   xpVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
   lowVar := EnsureRange(GaussRand(1.0, 0.04), 0.88, 1.12);
 
-  Self.Tempo.XPMean := Round((2573 + 990 * bhM.U) * xpVar);
+  Self.Tempo.XPMean := Round((2573 + 990 * bhM) * xpVar);
   Self.Tempo.XPStick := 0.20 + 0.18 * ((bhInt shr 5) mod 1000 / 1000.0);
   Self.XPAttkDelay := ExpoGaussRT(Self.Tempo.XPMean);
 
-  Self.Tempo.LowMean := Round((750 + 350 * _bhM.U) * lowVar);
+  Self.Tempo.LowMean := Round((750 + 350 * _bhM) * lowVar);
   Self.Tempo.LowStick := 0.20 + 0.18 * (((bhInt shr 5) xor 913) mod 1000 / 1000.0);
   Self.NextAttkDelay := ExpoGaussRT(Self.Tempo.LowMean);
 
@@ -2491,9 +2467,9 @@ var
   total: Double;
 begin
   //0..7
-  Self.attkC.Create(['profileU', 'selfU', 'knightU', 'randU', 'stickU', 'decayType', 'decayParam']);
+  Self.attkC.CreateU(['profileU', 'selfU', 'knightU', 'randU', 'stickU', 'decayType', 'decayParam']);
 
-  if Self.attkC[0].U < 0.5 then
+  if Self.attkC[0] < 0.5 then
     baseWeights := [55.0, 40.0, 5.0]  // Self-primary
   else
     baseWeights := [40.0, 55.0, 5.0]; // Knight-primary
@@ -2501,7 +2477,7 @@ begin
   total := 0;
   for i := 0 to 2 do
   begin
-    Self.AttackWeights[i] := baseWeights[i] * (0.67 + 0.66 * Self.attkC[i+1].U);
+    Self.AttackWeights[i] := baseWeights[i] * (0.67 + 0.66 * Self.attkC[i+1]);
     Self.AttackWeights[i] *= EnsureRange(GaussRand(1.0, 0.04), 0.84, 1.16);
     total += Self.AttackWeights[i];
   end;
@@ -2509,7 +2485,7 @@ begin
   for i := 0 to 2 do
     Self.AttackWeights[i] := Self.AttackWeights[i] / total;
 
-  Self.AttackStick := 0.15 + 0.25 * Self.attkC[4].U;
+  Self.AttackStick := 0.15 + 0.25 * Self.attkC[4];
   Self.AttackStick *= EnsureRange(GaussRand(1.0, 0.025), 0.925, 1.075);
 
   if Self.AttackWeights[0] > Self.AttackWeights[1] then
@@ -2527,14 +2503,14 @@ var
   clickMinBase, clickMaxBase: Int32;
   speedVar, gravVar, windVar, clickVar: Double;
 begin
-  Self.M.Create(['speed', 'gravity', 'wind', 'click min', 'click max', 'miss chance']);
+  Self.M.CreateU(['speed', 'gravity', 'wind', 'click min', 'click max', 'miss chance']);
 
   // Base values
-  speedBase := 10.0 + 4.0 * Self.M[0].U;
-  gravBase := 7.0 + 4.0 * Self.M[1].U;
-  windBase := 3.0 + 4.0 * Self.M[2].U;
-  clickMinBase := 50 + Round(30.0 * Self.M[3].U);
-  clickMaxBase := 120 + Round(80.0 * Self.M[4].U);
+  speedBase := 10.0 + 4.0 * Self.M[0];
+  gravBase := 7.0 + 4.0 * Self.M[1];
+  windBase := 3.0 + 4.0 * Self.M[2];
+  clickMinBase := 50 + Round(30.0 * Self.M[3]);
+  clickMaxBase := 120 + Round(80.0 * Self.M[4]);
 
   // Session variance (±8%)
   speedVar := TruncGauss(1.0, 0.04, 0.88, 1.12);
@@ -2549,7 +2525,7 @@ begin
   Mouse.PressMin := Round(clickMinBase * clickVar);
   Mouse.PressMax := Round(clickMaxBase * clickVar);
 
-  Mouse.MissChance := 0.01 + 0.03 * Self.M[5].U;
+  Mouse.MissChance := 0.01 + 0.03 * Self.M[5];
 
   Logger.Info('Mouse - Speed:%.2f Grav:%.2f Wind:%.2f Click:%d-%dms Miss:%.2f%%',
     [Mouse.Speed, Mouse.Gravity, Mouse.Wind, Mouse.PressMin, Mouse.PressMax, Mouse.MissChance*100]);
@@ -2561,20 +2537,20 @@ begin
   Logger.Setup('Pest Control JDS');
   Logger.RepeatedMessages := True;
 
-  bhM.Create('bhM');
-  Self.Flag.Choices.Create(['NoPray', 'NoLeave', 'NoBoatMove1', 'NoBoatMove2', 'DelayBoatMove', 'BoatBehavior']);
-  _bhM.Create('_bhM');
-  Self.B.Create(['shape', 'scale']);
-  Self.P.Create(['U_Prayer1', 'U_Prayer2', 'U_Prayer3']);
-  Self.RT.Create(['RT_U1', 'RT_U2', 'RTC_U', 'LogNormal', 'Weibull', 'rtdist0', 'rtdist1']);
-  Self.Deseq.U.Create(['win_portal_base', 'win_portal_curve', 'win_use_time', 'win_knight_factor',
+  bhM.CreateU('bhM');
+  Self.Flag.Choices.CreateU(['NoPray', 'NoLeave', 'NoBoatMove1', 'NoBoatMove2', 'DelayBoatMove', 'BoatBehavior']);
+  _bhM.CreateU('_bhM');
+  Self.B.CreateU(['shape', 'scale']);
+  Self.P.CreateU(['U_Prayer1', 'U_Prayer2', 'U_Prayer3']);
+  Self.RT.CreateU(['RT_U1', 'RT_U2', 'RTC_U', 'LogNormal', 'Weibull', 'rtdist0', 'rtdist1']);
+  Self.Deseq.U.CreateU(['win_portal_base', 'win_portal_curve', 'win_use_time', 'win_knight_factor',
                    'inactive_source', 'inactive_base', 'inactive_curve']);
-  Self.Deseq.NoiseInterval := 3000 + Round(5000 * Power(Self.Deseq.U[0].U, 0.5 + Self.Deseq.U[1].U));
+  Self.Deseq.NoiseInterval := 3000 + Round(5000 * Power(Self.Deseq.U[0], 0.5 + Self.Deseq.U[1]));
   Self.Deseq.KnightHPLvl := Random(80, 100);
 
   // Result: 160-336ms with Gaussian distribution around personality baseline
   self.bRT := Round(TruncGauss(200, 30, 173, 227) + 123
-    * bhM.U * TruncGauss(1.0, 0.05, 0.85, 1.15));
+    * bhM * TruncGauss(1.0, 0.05, 0.85, 1.15));
   {$IFDEF WL_FATIGUE_INCLUDED}
   if not Self.UserDisableFatigue then
   begin
@@ -2625,7 +2601,7 @@ begin
   Self.Shifter := TRSEntity.Create(
     @Map.Walker,
     [1, 1, 1],
-    14 + Round(3*bhM.U),
+    14 + Round(3*bhM),
     [PCData.Knight],
     ['tack Shifter', 'Attack Shifter'],
     [ERSMinimapDot.NPC]
@@ -2658,7 +2634,7 @@ var
   JustDidAntiban: Boolean;
 begin
   Self.Init();
-  tRand := Round(Random(0, 80+100*bhM.U));
+  tRand := Round(Random(0, 80+100*bhM));
   Profiles[ProfileIndex].Worlds := [344];
 
   Self.State := EPestState.INIT;
@@ -2734,8 +2710,8 @@ begin
       EPestState.AT_PLANK: Self.EnterBoat();
       EPestState.WALK_PLANK: Map.Walker.WalkBlind(
         Self.AtPlank.Offset(
-          Biometrics.RandomModeInteger(2, -5, 5),
-          Biometrics.RandomModeInteger(2, -5, 5)));
+          Biometrics.RandomModeInteger(2, -3, 3),
+          Biometrics.RandomModeInteger(2, -3, 3)));
 
       EPestState.NO_ACTIVITY, EPestState.MAX_ACTIONS,
       EPestState.MAX_TIME, EPestState.END_SCRIPT: Exit;
