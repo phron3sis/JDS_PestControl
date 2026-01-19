@@ -167,6 +167,7 @@ type
     TotalSleep_h: Double;
     TotalWake_h: Double;
     OffTaskStart_ms: Int64;
+    ProjectedWake_ms: Int64;
   end;
 
   TFatigueRuntime = record
@@ -179,7 +180,6 @@ type
     P_sleep: Double;
     Z_raw: Double;
     F_level: Double;
-    F_norm: Double;
     Drift: Double;
     DriftMixer: UInt64;
     BifurcationWarned: Boolean;
@@ -927,7 +927,8 @@ procedure TFatigue.SimulateBackwards(days: Integer);
 var
   schedHour, schedLength_h, schedVar: Double;
   sleepHour, sleepLength_h, wakeDuration_h: Double;
-  sleepTime_ms, wakeTime_ms, prevWakeTime_ms, dayStart_ms: Int64;
+  sleepTime_ms, wakeTime_ms, prevWakeTime_ms: Int64;
+  timeUntilSleep_ms: Int64;
   d: Integer;
 begin
   Self.State.SleepDurations_h := [];
@@ -936,39 +937,58 @@ begin
 
   if Length(Antiban.Sleeps) = 0 then Exit;
 
-  schedHour := Self.ParseTimeToHour(Antiban.Sleeps[0].Time);
   schedLength_h := Antiban.Sleeps[0].Length / Double(ONE_HOUR);
   schedVar := Antiban.Sleeps[0].StdVar;
 
-  // First wake: day before simulation starts
-  prevWakeTime_ms := Time() - Int64(days + 1) * ONE_DAY + Trunc((schedHour + schedLength_h) * ONE_HOUR);
+  // Get next sleep time from Antiban
+  timeUntilSleep_ms := Trunc(Antiban.Sleeps[0].Next) - GetTimeRunning();
 
-  for d := days downto 1 do
+  // Most recent sleep time (today or yesterday)
+  sleepTime_ms := Time() + timeUntilSleep_ms;
+  while sleepTime_ms > Time() do
+    sleepTime_ms -= ONE_DAY;  // Sleep already happened today, use yesterday's
+
+  schedLength_h := Antiban.Sleeps[0].Length / Double(ONE_HOUR);
+  schedVar := Antiban.Sleeps[0].StdVar;
+
+  // Last wake = most recent sleep + sleep duration
+  sleepLength_h := Abs(GaussRand(schedLength_h, schedLength_h * schedVar));
+  wakeTime_ms := sleepTime_ms + Trunc(sleepLength_h * ONE_HOUR);
+
+  WriteLn('timeUntilSleep_ms: ' + ToStr(timeUntilSleep_ms));
+  WriteLn('sleepTime_ms after while: ' + ToStr(sleepTime_ms));
+  WriteLn('Time(): ' + ToStr(Time()));
+  WriteLn('wakeTime_ms: ' + ToStr(wakeTime_ms));
+
+  // Only if wake is in the past
+  if wakeTime_ms < Time() then
   begin
-    dayStart_ms := Time() - Int64(d) * ONE_DAY;
-
-    // Gaussian variance same as Antiban.TakeSleep uses
-    sleepHour := schedHour + GaussRand(0, schedVar * 2);
-    if sleepHour >= 24.0 then sleepHour -= 24.0;
-    if sleepHour < 0.0 then sleepHour += 24.0;
-
-    sleepLength_h := GaussRand(schedLength_h, schedLength_h * schedVar);
-    sleepLength_h := Max(3.0, Min(14.0, sleepLength_h));
-
-    sleepTime_ms := dayStart_ms + Trunc(sleepHour * ONE_HOUR);
-    wakeTime_ms := sleepTime_ms + Trunc(sleepLength_h * ONE_HOUR);
-    wakeDuration_h := (sleepTime_ms - prevWakeTime_ms) / Double(ONE_HOUR);
-
     Self.State.SleepDurations_h += sleepLength_h;
     Self.State.SleepTimestamps_ms += sleepTime_ms;
+    Self.State.LastSleep_ms := sleepTime_ms;
+    Self.State.LastWake_ms := wakeTime_ms;
+  end;
+
+  // Now build older history
+  prevWakeTime_ms := Self.State.LastWake_ms;
+  for d := 1 to days do
+  begin
+    sleepTime_ms -= ONE_DAY;  // Move to previous day FIRST
+
+    sleepLength_h := Abs(GaussRand(schedLength_h, schedLength_h * schedVar));
+    wakeTime_ms := sleepTime_ms + Trunc(sleepLength_h * ONE_HOUR);
+
+    wakeDuration_h := (prevWakeTime_ms - wakeTime_ms) / Double(ONE_HOUR);  // Time from this wake to next sleep
+
+    Self.State.SleepDurations_h := [sleepLength_h] + Self.State.SleepDurations_h;
+    Self.State.SleepTimestamps_ms := [sleepTime_ms] + Self.State.SleepTimestamps_ms;
     if wakeDuration_h > 0 then
-      Self.State.WakeDurations_h += wakeDuration_h;
+      Self.State.WakeDurations_h := [wakeDuration_h] + Self.State.WakeDurations_h;
 
     prevWakeTime_ms := wakeTime_ms;
   end;
 
   Self.State.LastSleep_ms := Self.State.SleepTimestamps_ms[High(Self.State.SleepTimestamps_ms)];
-  Self.State.LastWake_ms := prevWakeTime_ms;
   Self.State.IsAsleep := False;
   Self.State.I := 0;
   Self.State.Debt := 0;
@@ -983,54 +1003,89 @@ var
   dayStart_ms, sleepTime_ms, wakeTime_ms: Int64;
 begin
   if Self.State.LastSave_ms <= 0 then Exit;
-
   gap_h := (Time() - Self.State.LastSave_ms) / Double(ONE_HOUR);
   if gap_h < 0.25 then Exit;
-
   if Length(Antiban.Sleeps) = 0 then Exit;
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'Reconstructing ' + ToStr(Round(gap_h, 1)) + 'h gap...'));
 
   schedHour := Self.ParseTimeToHour(Antiban.Sleeps[0].Time);
   schedLength_h := Antiban.Sleeps[0].Length / Double(ONE_HOUR);
   schedVar := Antiban.Sleeps[0].StdVar;
 
-  // Check each day in gap
   dayStart_ms := Self.State.LastSave_ms - (Self.State.LastSave_ms mod ONE_DAY);
+
+  // Handle mid-sleep from save time
+  if Self.State.IsAsleep and (Self.State.LastSleep_ms > 0) then
+  begin
+    if Self.State.ProjectedWake_ms > 0 then
+      wakeTime_ms := Self.State.ProjectedWake_ms
+    else
+      wakeTime_ms := Self.State.LastSleep_ms + Trunc(schedLength_h * ONE_HOUR);  // fallback
+
+    if wakeTime_ms < Time() then
+    begin
+      // Sleep completed
+      sleepLength_h := (wakeTime_ms - Self.State.LastSleep_ms) / Double(ONE_HOUR);
+      Self.State.LastWake_ms := wakeTime_ms;
+      Self.State.I := Self.Profile.InertiaMag * Exp(-(Time() - wakeTime_ms) / Double(ONE_HOUR) / Self.Profile.InertiaTau_h);
+    end
+    else
+    begin
+      // Sleep interrupted
+      sleepLength_h := (Time() - Self.State.LastSleep_ms) / Double(ONE_HOUR);
+      Self.State.LastWake_ms := Time();
+      Self.State.I := Self.Profile.InertiaMag;
+    end;
+
+    Self.State.SleepDurations_h += sleepLength_h;
+    Self.State.SleepTimestamps_ms += Self.State.LastSleep_ms;
+    Self.State.WakeDurations_h += (Self.State.LastSleep_ms - Self.State.LastWake_ms) / Double(ONE_HOUR);
+    Self.State.IsAsleep := False;
+    Self.State.ProjectedWake_ms := 0;
+    Self.Runtime.ToT := 0;
+  end;
+
   while dayStart_ms < Time() do
   begin
     sleepTime_ms := dayStart_ms + Trunc(schedHour * ONE_HOUR);
-
     if (sleepTime_ms > Self.State.LastSave_ms) and (sleepTime_ms < Time()) then
     begin
       sleepLength_h := GaussRand(schedLength_h, schedLength_h * schedVar);
       sleepLength_h := Max(3.0, Min(14.0, sleepLength_h));
       wakeTime_ms := sleepTime_ms + Trunc(sleepLength_h * ONE_HOUR);
-
-      Self.State.SleepDurations_h += sleepLength_h;
-      Self.State.SleepTimestamps_ms += sleepTime_ms;
-      Self.State.WakeDurations_h += (sleepTime_ms - Self.State.LastWake_ms) / Double(ONE_HOUR);
-
-      Self.State.LastSleep_ms := sleepTime_ms;
-      Self.State.LastWake_ms := wakeTime_ms;
-      Self.Runtime.ToT := 0;  // Sleep resets ToT
+      if wakeTime_ms < Time() then
+      begin
+        Self.State.SleepDurations_h += sleepLength_h;
+        Self.State.SleepTimestamps_ms += sleepTime_ms;
+        Self.State.WakeDurations_h += (sleepTime_ms - Self.State.LastWake_ms) / Double(ONE_HOUR);
+        Self.State.LastSleep_ms := sleepTime_ms;
+        Self.State.LastWake_ms := wakeTime_ms;
+        Self.Runtime.ToT := 0;
+        if Self.Debugging then
+          WriteLn(GetDebugLn('Fatigue', 'Recorded sleep in gap. Slept ' + ToStr(Round(sleepLength_h, 1)) + 'h'));
+      end;
     end;
-
     dayStart_ms += ONE_DAY;
   end;
 
-  // ToT decay for non-sleep gap time
+  // ToT decay for off-task time
   if Self.State.OffTaskStart_ms > 0 then
     offTask_h := (Time() - Self.State.OffTaskStart_ms) / Double(ONE_HOUR)
   else
     offTask_h := gap_h;
-
   if Self.Runtime.ToT > 0 then
     Self.Runtime.ToT := Self.Runtime.ToT * Exp(-Self.Session.ToTOffLong_ph * offTask_h);
-
   Self.State.OffTaskStart_ms := 0;
 
-  // Update S
+  // Update S based on time since wake
   Self.State.S := Self.Profile.S_min + (Self.Profile.S_max - Self.Profile.S_min) *
     (1.0 - Exp(-(Time() - Self.State.LastWake_ms) / Double(ONE_HOUR) / Self.Profile.TauWake_h));
+
+  if Self.Debugging then
+    WriteLn(GetDebugLn('Fatigue', 'Gap reconstructed. S=' + ToStr(Round(Self.State.S, 3)) +
+      ' Awake=' + ToStr(Round((Time() - Self.State.LastWake_ms) / Double(ONE_HOUR), 1)) + 'h'));
 end;
 
 // ============================================================================
@@ -1138,6 +1193,10 @@ begin
   FileAppend(WLEnv.ConfigsDir + path,
   ToStr(Time()) + ',' +
   ToStr(Self.State.IsAsleep) + ',' +
+  ToStr(Self.State.LastSleep_ms) + ',' +
+  ToStr(FormatMilliseconds(Self.State.LastSleep_ms, TIME_SHORT)) + ',' +
+  ToStr(Self.State.ProjectedWake_ms) + ',' +
+  ToStr(FormatMilliseconds(Self.State.ProjectedWake_ms, TIME_SHORT)) + ',' +
   ToStr(Round((Time() - Self.State.LastWake_ms) / Double(ONE_HOUR), 2)) + ',' +
   ToStr(Self.State.OffTaskStart_ms) + ',' +
   ToStr(onTask) + ',' +
@@ -1149,7 +1208,7 @@ begin
   ToStr(Round(Self.Runtime.S_norm, 4)) + ',' +
   ToStr(Round(Self.Runtime.P_sleep, 4)) + ',' +
   ToStr(Round(Self.Runtime.Z_raw, 4)) + ',' +
-  ToStr(Round(Self.Runtime.F_norm, 4)) + ',' +
+  ToStr(Round(Self.Runtime.F_level, 4)) + ',' +
   ToStr(Round(Self.Runtime.Drift, 4)) +
   LINE_SEP);
 end;
@@ -1255,7 +1314,6 @@ begin
     Self.State.I + Self.Runtime.Drift;
 
   Self.Runtime.F_level := Max(0.0, Min(Self.Profile.FatigueCeiling, Self.Runtime.Z_raw));
-  Self.Runtime.F_norm := Self.Runtime.F_level / Self.Profile.FatigueCeiling;
 
   Self.Runtime.LastUpdate_ms := now_ms;
 
@@ -1292,6 +1350,7 @@ end;
 // OnSleep - biological transition
 procedure TFatigue.OnSleep();
 begin
+  WriteLn(GetDebugLn('Fatigue', 'OnSleep() called. Setting IsAsleep=True'));
   Self.State.IsAsleep := True;
   Self.State.LastSleep_ms := Time();
 
@@ -1311,6 +1370,7 @@ var
   sleepDuration_h: Double;
 begin
   Self.State.IsAsleep := False;
+  Self.State.ProjectedWake_ms := 0;
   sleepDuration_h := (Time() - Self.State.LastSleep_ms) / 3600000.0;
   Self.State.LastWake_ms := Time();
 
@@ -1342,42 +1402,42 @@ end;
 property TFatigue.FatigueNormalized: Double;
 begin
   Self._EnsureUpdated();
-  Result := Self.Runtime.F_norm;
+  Result := Self.Runtime.F_level / Self.Profile.FatigueCeiling;
 end;
 
 // RT μ: research shows NS effect under fatigue, linear
 property TFatigue.RTMuMultiplier: Double;
 begin
   Self._EnsureUpdated();
-  Result := 1.0 + Self.Runtime.F_norm * (Self.Profile.RTMuGrowth - 1.0);
+  Result := 1.0 + Self.Runtime.F_level * (Self.Profile.RTMuGrowth - 1.0);
 end;
 
 // RT σ: research shows NS effect, linear
 property TFatigue.RTSigmaMultiplier: Double;
 begin
   Self._EnsureUpdated();
-  Result := 1.0 + Self.Runtime.F_norm * (Self.Profile.RTSigmaGrowth - 1.0);
+  Result := 1.0 + Self.Runtime.F_level * (Self.Profile.RTSigmaGrowth - 1.0);
 end;
 
 // RT τ: research shows MAJOR effect (128%±79%), nonlinear with per-account power
 property TFatigue.RTTauMultiplier: Double;
 begin
   Self._EnsureUpdated();
-  Result := 1.0 + Power(Self.Runtime.F_norm, Self.Profile.TauPower) * (Self.Profile.RTTauGrowth - 1.0);
+  Result := 1.0 + Power(Self.Runtime.F_level, Self.Profile.TauPower) * (Self.Profile.RTTauGrowth - 1.0);
 end;
 
 // Error rate: per-account power determines curve shape (threshold-like vs gradual)
 property TFatigue.ErrorRate: Double;
 begin
   Self._EnsureUpdated();
-  Result := Power(Self.Runtime.F_norm, Self.Profile.ErrPower) * Self.Profile.ErrRateMax;
+  Result := Power(Self.Runtime.F_level, Self.Profile.ErrPower) * Self.Profile.ErrRateMax;
 end;
 
 // Lapse rate: per-account power, correlated with but distinct from error power
 property TFatigue.LapseRate: Double;
 begin
   Self._EnsureUpdated();
-  Result := Power(Self.Runtime.F_norm, Self.Profile.LapsePower) * Self.Profile.LapseRateMax;
+  Result := Power(Self.Runtime.F_level, Self.Profile.LapsePower) * Self.Profile.LapseRateMax;
 end;
 
 // Attention: behavioral alertness dimension (INDEPENDENT of cognitive per research)
@@ -1388,7 +1448,7 @@ var
 begin
   Self._EnsureUpdated();
   floor := Max(0.55, 1.0 - Self.Profile.AttentionSens * 1.5);
-  Result := Max(floor, 1.0 - Self.Runtime.F_norm * Self.Profile.AttentionSens);
+  Result := Max(floor, 1.0 - Self.Runtime.F_level * Self.Profile.AttentionSens);
 end;
 
 // Precision: motor dimension (weakly correlated with cognitive)
@@ -1399,7 +1459,7 @@ var
 begin
   Self._EnsureUpdated();
   floor := Max(0.82, 1.0 - Self.Profile.PrecisionSens * 1.5);
-  Result := Max(floor, 1.0 - Self.Runtime.F_norm * Self.Profile.PrecisionSens);
+  Result := Max(floor, 1.0 - Self.Runtime.F_level * Self.Profile.PrecisionSens);
 end;
 
 // Impatience: decision fatigue dimension
@@ -1407,7 +1467,7 @@ end;
 property TFatigue.ImpatienceMultiplier: Double;
 begin
   Self._EnsureUpdated();
-  Result := 1.0 + Self.Runtime.F_norm * Self.Profile.ImpatienceSens;
+  Result := 1.0 + Self.Runtime.F_level * Self.Profile.ImpatienceSens;
 end;
 
 // ============================================================================
@@ -1505,6 +1565,7 @@ begin
   Fjson.AddFloat('Kappa', Self.State.Kappa);
   Fjson.AddInt('LastWake_ms', Self.State.LastWake_ms);
   Fjson.AddInt('LastSleep_ms', Self.State.LastSleep_ms);
+  Fjson.AddInt('ProjectedWake_ms', Self.State.ProjectedWake_ms);
   Fjson.AddBool('IsAsleep', Self.State.IsAsleep);
   Fjson.AddFloat('TotalSleep_h', Self.State.TotalSleep_h);
   Fjson.AddFloat('TotalWake_h', Self.State.TotalWake_h);
@@ -1555,6 +1616,7 @@ begin
   if Fjson.Has('Kappa') then Self.State.Kappa := Fjson.Item['Kappa'].AsFloat;
   if Fjson.Has('LastWake_ms') then Self.State.LastWake_ms := Fjson.Item['LastWake_ms'].AsInt;
   if Fjson.Has('LastSleep_ms') then Self.State.LastSleep_ms := Fjson.Item['LastSleep_ms'].AsInt;
+  if Fjson.Has('ProjectedWake_ms') then Self.State.ProjectedWake_ms := Fjson.Item['ProjectedWake_ms'].AsInt;
   if Fjson.Has('IsAsleep') then Self.State.IsAsleep := Fjson.Item['IsAsleep'].AsBool;
   if Fjson.Has('TotalSleep_h') then Self.State.TotalSleep_h := Fjson.Item['TotalSleep_h'].AsFloat;
   if Fjson.Has('TotalWake_h') then Self.State.TotalWake_h := Fjson.Item['TotalWake_h'].AsFloat;
@@ -1616,6 +1678,13 @@ end;
 
 procedure _Fatigue_OnSleeping(task: PSleepTask; var countdown: TCountdown);
 begin
+  if not Fatigue.State.IsAsleep then
+  begin
+    Writeln(GetDebugLn('Fatigue', 'OnSleep wasn''t called earlier, calling now', ELogLevel.WARN, True));
+    Fatigue.OnSleep();
+  end;
+  if Fatigue.State.ProjectedWake_ms = 0 then
+    Fatigue.State.ProjectedWake_ms := Time() + countdown.Remaining;
   Fatigue._EnsureUpdated(False);
 end;
 
@@ -1672,7 +1741,6 @@ begin
     if Self.Debugging then
       WriteLn(GetDebugLn('Fatigue', 'Forced awake state on script start'));
   end;
-
 
   Self.Runtime.BoutStart_ms := Time();
   Self.Runtime.LastUpdate_ms := Time();
@@ -1756,12 +1824,12 @@ begin
   else
     awake_h := 0;
   sleepAvg_h := Self.GetAverageSleepDuration();
-  pct := Round(Self.FatigueLevel * 100);
+  pct := Round(Self.FatigueNormalized * 100);
   if Self.State.IsAsleep then
     state := 'ZZZ';
   WriteLn(GetDebugLn('+====================================================================+', ELogLevel.SUCCESS, False));
   WriteLn('|                     FATIGUE STATUS REPORT                          |');
-  WriteLn('  TIREDNESS:    ' + _FBar(Self.FatigueLevel, 1.0, 30) + ' ' + ToStr(pct) + '%');
+  WriteLn('  TIREDNESS:    ' + _FBar(Self.FatigueNormalized, 1.0, 30) + ' ' + ToStr(pct) + '%');
   WriteLn('  State: ' + state + '   |   Awake: ' + ToStr(Round(awake_h, 1)) + 'h   |   Avg Sleep: ' + ToStr(Round(sleepAvg_h, 1)) + 'h/night');
   WriteLn('+--------------------------------------------------------------------+');
   WriteLn('|  FATIGUE SOURCES                                                   |');
