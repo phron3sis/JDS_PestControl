@@ -3170,20 +3170,20 @@ begin
   enableGroup.SetBounds(500, 0, 150, 150);
   enableGroup.Caption := 'Options to enable';
 
-  GUI.ChkChillIfActive := TLazCheckBox.CreateEx(enableGroup, 'Chill if active',
-    'Reduce activity if above threshold');
-  GUI.ChkChillIfActive.Align := ELazAlign.Top;
-  GUI.ChkChillIfActive.SetChecked(False);
+  GUI.ChkRestAfterGame := TLazCheckBox.CreateEx(enableGroup, 'Rest After Game',
+    'Sometimes decide to pause briefly after a game ends');
+  GUI.ChkRestAfterGame.Align := ELazAlign.Top;
+  GUI.ChkRestAfterGame.SetChecked(False);
 
   GUI.ChkQuickPrayer := TLazCheckBox.CreateEx(enableGroup, 'Use quick prayers',
     'Enable quick prayers during combat');
   GUI.ChkQuickPrayer.Align := ELazAlign.Top;
   GUI.ChkQuickPrayer.SetChecked(False);
 
-  GUI.ChkRestAfterGame := TLazCheckBox.CreateEx(enableGroup, 'Rest After Game',
-    'Sometimes decide to pause briefly after a game ends');
-  GUI.ChkRestAfterGame.Align := ELazAlign.Top;
-  GUI.ChkRestAfterGame.SetChecked(False);
+  GUI.ChkChillIfActive := TLazCheckBox.CreateEx(enableGroup, 'Chill if active',
+    'Reduce activity if above threshold');
+  GUI.ChkChillIfActive.Align := ELazAlign.Top;
+  GUI.ChkChillIfActive.SetChecked(False);
 
   disableGroup := TLazGroupBox.create(tab);
   disableGroup.Parent := tab;
