@@ -31,12 +31,9 @@ type
 
 var
   PCData: TPestControlGameData;
-// =============================================================================
-// ENUMS
-// =============================================================================
 
 type
-  EPestState = (
+  EPestState = enum(
     INIT,
     LOGIN,
     CMBT_LVL,
@@ -54,15 +51,13 @@ type
 
     NO_ACTIVITY, UNKNOWN, MAX_ACTIONS, MAX_TIME, END_SCRIPT
   );
-  EAttackChoice = (Self, Knight, Rand);
-// =============================================================================
-// TYPES
-// =============================================================================
+  EAttackChoice = enum(Self, Knight, Rand);
+
 type
   TDeseqState = record
     U: TDoubleArray;
 
-    // Per-game (set in SetPerGame)
+    // Per-game
     WinThreshGame: Double;
     InactiveThreshGame: Double;
     KnightHPLvl: Integer;
@@ -71,7 +66,7 @@ type
     WinNoise: Double;
     InactiveNoise: Double;
     LastNoiseReroll: UInt64;
-    NoiseInterval: UInt64;  // 3-8s from U at init
+    NoiseInterval: UInt64;
   end;
 
 type
@@ -165,9 +160,7 @@ var
   PestControl: TPestControl;
   bhM, _bhM: Double;
 
-// =============================================================================
-// HELPER FUNCTIONS - Distribution Math
-// =============================================================================
+// Helper functions/distribution math
 function SoftRandBool(U: Double; _power: Double = 2.0; scale: Double = 1.0): Boolean;
 begin
   Result := RandomBoolean(Power(U, _power) * scale);
