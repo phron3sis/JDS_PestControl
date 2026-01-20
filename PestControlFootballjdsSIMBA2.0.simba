@@ -152,11 +152,11 @@ type
     PtsStart, PtsEarned, PtsTotal, SkillInterfacesClosed: Int32;
 
     UserDisableHUD, UserDisableMoveInBoat, UserDisablePace, UserDisableLeaveGame: Boolean;
-    UserDisableFatigue: Boolean;
+    UserDisableFatigue, UserDisableInactive: Boolean;
     Actions, MaxActions, MaxTime: UInt64;
-    UserActiveThreshold, UserCombatLevel, UserSpendPointsAt, UserEmoteAmount: Int32;
-    UserRewards: TStringArray;
-    UserRwardAmmount, UserEmoteList: TIntegerArray;
+    UserActiveThreshold, UserCombatLevel, UserSpendPointsAt, UserEmoteAmount, UserRewardAmount: Int32;
+    UserReward: String;
+    UserEmoteListI, UserEmoteListC, UserEmoteListW: TIntegerArray;
     UserEmoteInactive, UserEmoteChilling, UserEmoteWinning: Boolean;
     UserQuickPrayer, UserChillIfActive, UserSpendPoints, UserRestAfterGame: Boolean;
   end;
@@ -748,7 +748,7 @@ begin
       Sleep(60, 200);
     end;
     if self.NPC.DistanceTo(Map.Position()) > RandomMode(4, 4, 7) then
-      Map.Walker.WebWalk(Self.NPC.Coordinates[Random(0, Self.NPC.Coordinates.High)], 2, 0.3);
+      Map.Walker.WalkBlind(Self.NPC.Coordinates[Random(0, Self.NPC.Coordinates.High)], 5);
     if Self.NPC.Interact(['Exchange Void Knight', 'Exchange Void'], 1) then
       if Self.WaitOpen() then
         Exit(True);
@@ -766,11 +766,8 @@ end;
 
 function TRSPestShop.BuyReward(reward:String; pts: Integer): Boolean;
 var
-  ptBox, textBox: Tbox;
-  f: TRSFonts;
-  s: String;
   xpBefore: UInt64;
-  idx, i, invCt: Integer;// TBoxArray index of reward string
+  idx, invCt: Integer;// TBoxArray index of reward string
 begin
   if not Self.IsOpen() then Exit;
   if not Self.RewardStrings.Contains(reward) then
@@ -806,7 +803,7 @@ begin
   end;
 end;
 
-procedure TRSPestShop.PurchaseExp(expString: String; stopAt: Integer);
+function TRSPestShop.PurchaseExp(expString: String; stopAt: Integer): Boolean;
 var
   spend, remaining, before, fails, attempts: Integer;
   tEnd: UInt64;
@@ -835,13 +832,21 @@ begin
       Inc(fails);
     Sleep(120, 500);
   until (Self.SpendablePoints <= stopAt) or (Time >= tEnd) or (fails >= attempts);
+  Result := (Self.SpendablePoints <= stopAt) and (Time < tEnd) and (fails < attempts);
 end;
 
 function TPestControl.SpendPestPoints(): Boolean;
+var
+  stopAt: Integer;
 begin
+  if (Self.UserRewardAmount = -1) then
+    stopAt := 0
+  else
+    stopAt := Self.PtsTotal-Self.UserRewardAmount;
   Sleep(ExpoGaussRT(Self.bRT));
-  // PestShop.PurchaseExp('Prayer', 0);
+  Result := PestShop.PurchaseExp(Self.UserReward, stopAt);
   Sleep(ExpoGaussRT(Self.bRT));
+  Writeln(GetDebugLn('Reward purchase', 'Sucuessfuly purchased='+ToStr(Result), ELogLevel.WARN));
 end;
 
 // Override include to set zoom if it is wrong
@@ -2104,7 +2109,7 @@ end;
 
 // Emote help
 // Use: Self.eHelper();
-procedure TPestControl.eHelper();
+procedure TPestControl.eHelper(emoteList: TIntegerArray);
 var
   i, limit: Integer;
 begin
@@ -2113,7 +2118,7 @@ begin
   limit := Self.UserEmoteAmount;
   for i := 0 to limit do
   begin
-    Emotes.UseEmote(ERSEmote(Random(Self.UserEmoteList.Length)));
+    Emotes.UseEmote(ERSEmote(emoteList.Random));
     // Different players mean sleep, 2s to 6s, expogaussianRT?
   end;
   // then do emote and set last emote time
@@ -2488,6 +2493,8 @@ begin
   WriteLn('[INIT] Pest Control - SIMBA2000');
   Logger.Setup('Pest Control JDS');
   Logger.RepeatedMessages := True;
+  if PestControl.UserSpendPoints then
+    Logger.Success('We''ll spend our points at %d', [PestControl.UserSpendPointsAt]);
   PCData.InitPCData();
   bhM.CreateU('bhM');
   Self.Flag.Choices.CreateU(['NoPray', 'NoLeave', 'NoBoatMove1', 'NoBoatMove2',
@@ -2664,10 +2671,7 @@ begin
       EPestState.EXIT_GAME: Self.LeaveTheGame();
       EPestState.SPEND_PTS: Self.SpendPestPoints();
       EPestState.AT_PLANK: Self.EnterBoat();
-      EPestState.WALK_PLANK: Map.Walker.WalkBlind(
-        Self.AtPlank.Offset(
-          Biometrics.RandomModeInteger(2, -3, 3),
-          Biometrics.RandomModeInteger(2, -3, 3)));
+      EPestState.WALK_PLANK: Map.Walker.WalkBlind(Self.AtPlank, 0);
 
       EPestState.NO_ACTIVITY, EPestState.MAX_ACTIONS,
       EPestState.MAX_TIME, EPestState.END_SCRIPT: Exit;
@@ -2691,19 +2695,61 @@ type
 
     ChkQuickPrayer,
     ChkChillIfActive,
-    ChkDisableFatigue: TLazCheckBox;
-
+    ChkDisableFatigue,
     ChkDisableHUD,
     ChkDisableMoveInBoat,
     ChkDisablePace,
-    ChkDisableLeaveGame: TLazCheckBox;
+    ChkDisableLeaveGame,
+    ChkRestAfterGame,
+    ChkDisableInactive: TLazCheckBox;
 
     EditPointsPerWin,
     EditSpendPointsAt,
     EditCombatLevel,
-    EditActiveThreshold: TLazSpinEdit;
+    EditActiveThreshold,
+    EditRewardAmount: TLazSpinEdit;
 
+    ComboUserRewards: TLazComboBox;
+
+    // Emotes
+    EditEmoteInactive,
+    EditEmoteChilling,
+    EditEmoteWinning: TLazSpinEdit;
+
+    EditEmoteMinS,
+    EditEmoteMaxS: TLazFloatSpinEdit;
+
+    UserListInactive,
+    UserListChilling,
+    UserListWinning: TIntegerArray;
+
+    UserMemoInactive,
+    UserMemoChilling,
+    UserMemoWinning: TLazMemo;
+
+    CheckListInactive,
+    CheckListChilling,
+    CheckListWinning: TLazListBox;
+
+    btnClearAllEmotes: TLazButton;
   end;
+const
+  EMOTE_NAMES: TStringArray =[
+    'Yes','No','Bow','Angry',
+    'Think','Wave','Shrug','Cheer',
+    'Beckon','Laugh','Jump for Joy','Yawn',
+    'Dance','Jig','Spin','Headbang',
+    'Cry','Blow Kiss','Panic','Raspberry',
+    'Clap','Salute','Goblin Bow','Goblin Salute',
+    'Glass Box','Climb Rope','Lean','Glass Wall',
+    'Idea','Stamp','Flap','Slap Head',
+    'Zombie Walk','Zombie Dance','Scared','Rabbit Hop',
+    'Sit up','Push up','Star jump','Jog',
+    'Flex','Zombie Hand','Hypermobile Drinker','Skill Cape',
+    'Air Guitar','Uri transform','Smooth dance','Crazy dance',
+    'Premier Shield','Explore','Relic unlock','Party',
+    'Trick','Fortis Salute','Sit down','Crab dance'
+  ];
 var
   GUI: TPCForm;
 
@@ -2727,7 +2773,6 @@ begin
     GUI.CountdownLabel := nil;
   end;
 end;
-
 
 procedure OnTimerTick(sender: TLazObject);
 begin
@@ -2766,7 +2811,6 @@ begin
   GUI.DisplayTimer.OnTimer := @UpdateCountdown;
   GUI.DisplayTimer.Enabled := True;
 
-  // Find bottom panel (Start button's parent)
   bottomPanel := TLazPanel(GUI.Form.Start.Parent);
 
   GUI.CountdownLabel := TLazLabel.CreateEx(bottomPanel);
@@ -2774,8 +2818,8 @@ begin
   GUI.CountdownLabel.Font.Size := 9;
   GUI.CountdownLabel.Font.Color := $0000FF;  // Red
   GUI.CountdownLabel.Transparent := True;
-  GUI.CountdownLabel.Left := GUI.Form.Start.Left - 100;  // Left of Start button
-  GUI.CountdownLabel.Top := (bottomPanel.Height - 16) div 2;  // Centered vertically
+  GUI.CountdownLabel.Left := GUI.Form.Start.Left - 100;
+  GUI.CountdownLabel.Top := (bottomPanel.Height - 16) div 2;
   GUI.CountdownLabel.Width := 100;
   GUI.CountdownLabel.Height := 16;
 end;
@@ -2804,10 +2848,22 @@ begin
   PestControl.UserCombatLevel := GUI.EditCombatLevel.Value;
   PestControl.UserDisableFatigue := GUI.ChkDisableFatigue.IsChecked();
   PestControl.UserSpendPointsAt := Gui.EditSpendPointsAt.Value;
-  PestControl.UserSpendPoints := Gui.EditSpendPointsAt.Value > GUI.EditPointsPerWin.Value;
+  PestControl.UserDisableInactive := GUI.ChkDisableInactive.IsChecked();
+  PestControl.UserRestAfterGame := GUI.ChkRestAfterGame.IsChecked();
+  PestControl.UserReward := GUI.ComboUserRewards.Text;
+  PestControl.UserRewardAmount := GUI.EditRewardAmount.Value;
+  PestControl.UserEmoteListI := GUI.UserListInactive;
+  PestControl.UserEmoteListC := GUI.UserListChilling;
+  PestControl.UserEmoteListW := GUI.UserListWinning;
+  PestControl.UserEmoteInactive := PestControl.UserEmoteListI.Length > 0;
+  PestControl.UserEmoteChilling := PestControl.UserEmoteListC.Length > 0;
+  PestControl.UserEmoteWinning := PestControl.UserEmoteListW.Length > 0;
 
-  if PestControl.UserSpendPoints then
-    Logger.Success('We''ll spend out points at %d', [PestControl.UserSpendPointsAt]);
+  PestControl.UserSpendPoints := (PestControl.UserSpendPointsAt > PestControl.PtsPerGame)
+    and (PestControl.UserReward <> '') and (PestControl.UserRewardAmount <> 0);
+
+  writeln(PestControl.UserReward);
+  writeln(PestControl.UserRewardAmount);
 
   GUI.config.SetConfig('goal_actions', Self.Goals.Actions.Value);
   GUI.config.SetConfig('goal_time', Self.Goals.Time.Value);
@@ -2821,22 +2877,200 @@ begin
   GUI.config.SetConfig('disable_leave_game', PestControl.UserDisableLeaveGame);
   GUI.config.SetConfig('disable_fatigue', PestControl.UserDisableFatigue);
   GUI.config.SetConfig('combat_level', PestControl.UserCombatLevel);
+  GUI.config.SetConfig('disable_inactive', PestControl.UserDisableInactive);
+  GUI.config.SetConfig('rest_after_game', PestControl.UserRestAfterGame);
 
   GUI.config.Save();
 end;
 
+procedure OnInactiveEmoteClick(sender: TLazObject);
+var
+  idx, i: Integer;
+begin
+  idx := TLazListBox(sender).ItemIndex;
+  if GUI.UserListInactive.Length >= 100 then Exit;
+  GUI.UserListInactive+=idx;
+  GUI.UserMemoInactive.Text := Format('(%d selected) ', [GUI.UserListInactive.Length]);
+  for i := 0 to GUI.UserListInactive.High do
+    GUI.UserMemoInactive.Text+=EMOTE_NAMES[GUI.UserListInactive[i]]+', ';
+end;
+
+procedure OnChillingEmoteClick(sender: TLazObject);
+var
+  idx, i: Integer;
+begin
+  idx := TLazListBox(sender).ItemIndex;
+  if GUI.UserListChilling.Length >= 100 then Exit;
+  GUI.UserListChilling+=idx;
+  GUI.UserMemoChilling.Text := Format('(%d selected) ', [GUI.UserListChilling.Length]);
+  for i := 0 to GUI.UserListChilling.High do
+    GUI.UserMemoChilling.Text+=EMOTE_NAMES[GUI.UserListChilling[i]]+', ';
+end;
+
+procedure OnWinningEmoteClick(sender: TLazObject);
+var
+  idx, i: Integer;
+begin
+  idx := TLazListBox(sender).ItemIndex;
+  if Gui.UserListWinning.Length >= 100 then Exit;
+  Gui.UserListWinning+=idx;
+  GUI.UserMemoWinning.Text := Format('(%d selected) ', [GUI.UserListWinning.Length]);
+  for i := 0 to GUI.UserListWinning.High do
+    GUI.UserMemoWinning.Text+=EMOTE_NAMES[GUI.UserListWinning[i]]+', ';
+end;
+
+procedure OnClickClearEmotesButton(sender: TLazObject);
+begin
+  GUI.UserListInactive.Clear();
+  GUI.UserListChilling.Clear();
+  GUI.UserListWinning.Clear();
+  GUI.UserMemoInactive.Clear();
+  GUI.UserMemoChilling.Clear();
+  GUI.UserMemoWinning.Clear();
+end;
+
+function TScriptForm.CreateEmotesTab(): TLazTabSheet;
+var
+  groupInactive, groupChilling, groupWinning, groupSettings: TLazGroupBox;
+  emoteInfo, lblMin, lblMax: TLazLabel;
+begin
+  Result := Self.CreateTab('Emotes');
+
+  GUI.btnClearAllEmotes := TLazButton.CreateEx(Result, 'CLEAR ALL EMOTES', 'Clear everything and start-over');
+  GUI.btnClearAllEmotes.AutoSize := True;
+  GUI.btnClearAllEmotes.Align := ELazAlign.Top;
+  GUI.btnClearAllEmotes.Cursor := ELazCursor.NoDrop;
+  GUI.btnClearAllEmotes.OnClick := @OnClickClearEmotesButton;
+
+  groupChilling := TLazGroupBox.Create(Result);
+  groupChilling.Parent := Result;
+  groupChilling.Caption := 'Chilling Emotes (amount)';
+  groupChilling.Align := ELazAlign.Left;
+  groupChilling.Width := 255;
+  groupChilling.BorderSpacing.Left := 10;
+  groupChilling.BorderSpacing.Right := 10;
+
+  GUI.CheckListChilling := TLazListBox.CreateEx(groupChilling, '', 'click to select emotes');
+  GUI.CheckListChilling.Items.AddStrings(EMOTE_NAMES);
+  GUI.CheckListChilling.Align := ELazAlign.Client;
+  GUI.CheckListChilling.ClickOnSelChange := False;
+  GUI.CheckListChilling.OnClick := @OnChillingEmoteClick;
+
+  GUI.UserMemoChilling := TLazMemo.CreateEx(groupChilling, '', 'pool of emotes to sample when chilling');
+  GUI.UserMemoChilling.ReadOnly := True;
+  GUI.UserMemoChilling.ScrollBars := ELazScrollStyle.AutoVertical;
+  GUI.UserMemoChilling.Align := ELazAlign.Bottom;
+
+  GUI.EditEmoteChilling := TLazSpinEdit.CreateEx(groupChilling, '', 'amount of samples from pool each burst');
+  GUI.EditEmoteChilling.Align := ELazAlign.Top;
+  GUI.EditEmoteChilling.MinValue := 1;
+  GUI.EditEmoteChilling.MaxValue := 10;
+  GUI.EditEmoteChilling.ValueEmpty := True;
+  GUI.EditEmoteChilling.Value := 1;
+
+  groupInactive := TLazGroupBox.Create(Result);
+  groupInactive.Parent := Result;
+  groupInactive.Caption := 'Inactive Emotes (amount)';
+  groupInactive.Align := ELazAlign.Left;
+  groupInactive.Width := 255;
+  groupInactive.BorderSpacing.Left := 10;
+  groupInactive.BorderSpacing.Right := 10;
+
+  GUI.CheckListInactive := TLazListBox.CreateEx(groupInactive, '', 'click to select emotes');
+  GUI.CheckListInactive.Items.AddStrings(EMOTE_NAMES);
+  GUI.CheckListInactive.Align := ELazAlign.Client;
+  GUI.CheckListInactive.ClickOnSelChange := False;
+  GUI.CheckListInactive.OnClick := @OnInactiveEmoteClick;
+
+  GUI.UserMemoInactive := TLazMemo.CreateEx(groupInactive, '', 'pool of emotes to sample when inactive');
+  GUI.UserMemoInactive.ReadOnly := True;
+  GUI.UserMemoInactive.ScrollBars := ELazScrollStyle.AutoVertical;
+  GUI.UserMemoInactive.Align := ELazAlign.Bottom;
+
+  GUI.EditEmoteInactive := TLazSpinEdit.CreateEx(groupInactive, '', 'amount of samples from pool each burst');
+  GUI.EditEmoteInactive.Align := ELazAlign.Top;
+  GUI.EditEmoteInactive.MinValue := 1;
+  GUI.EditEmoteInactive.MaxValue := 10;
+  GUI.EditEmoteInactive.ValueEmpty := True;
+  GUI.EditEmoteInactive.Value := 1;
+
+  groupWinning := TLazGroupBox.Create(Result);
+  groupWinning.Parent := Result;
+  groupWinning.Caption := 'Winning Emotes (amount)';
+  groupWinning.Align := ELazAlign.Client;
+  groupWinning.BorderSpacing.Left := 10;
+  groupWinning.BorderSpacing.Right := 10;
+
+  GUI.CheckListWinning := TLazListBox.CreateEx(groupWinning, '', 'click to select emotes');
+  GUI.CheckListWinning.Items.AddStrings(EMOTE_NAMES);
+  GUI.CheckListWinning.Align := ELazAlign.Client;
+  GUI.CheckListWinning.ClickOnSelChange := False;
+  GUI.CheckListWinning.OnClick := @OnWinningEmoteClick;
+
+  GUI.UserMemoWinning := TLazMemo.CreateEx(groupWinning, '', 'pool of emotes to sample when winning');
+  GUI.UserMemoWinning.ReadOnly := True;
+  GUI.UserMemoWinning.ScrollBars := ELazScrollStyle.AutoVertical;
+  GUI.UserMemoWinning.Align := ELazAlign.Bottom;
+
+  GUI.EditEmoteWinning := TLazSpinEdit.CreateEx(groupWinning, '', 'amount of samples from pool each burst');
+  GUI.EditEmoteWinning.Align := ELazAlign.Top;
+  GUI.EditEmoteWinning.MinValue := 1;
+  GUI.EditEmoteWinning.MaxValue := 10;
+  GUI.EditEmoteWinning.ValueEmpty := True;
+  GUI.EditEmoteWinning.Value := 1;
+
+  groupSettings := TLazGroupBox.Create(Result);
+  groupSettings.Parent := Result;
+  groupSettings.Caption := 'Emote Settings (Min and Max delay between emoting, in seconds)';
+  groupSettings.Align := ELazAlign.Bottom;
+
+  lblMin := TLazLabel.CreateEx(groupSettings, 'Min (s):', 'Minimum delay before emoting', 10, 10, 50, 25);
+  GUI.EditEmoteMinS := TLazFloatSpinEdit.CreateEx(groupSettings);
+  GUI.EditEmoteMinS.Hint := 'these values will be randomized';
+  GUI.EditEmoteMinS.ShowHint := True;
+  GUI.EditEmoteMinS.SetBounds(65, 8, 80, 25);
+  GUI.EditEmoteMinS.MinValue := 7.0;
+  GUI.EditEmoteMinS.MaxValue := 3600.0;
+  GUI.EditEmoteMinS.Increment := Random(0.1, 0.49);
+  GUI.EditEmoteMinS.Value := Random(17.0, 47.0);
+
+  lblMax := TLazLabel.CreateEx(groupSettings, 'Max (s):', 'Maximum delay before emoting', 160, 10, 50, 25);
+  GUI.EditEmoteMaxS := TLazFloatSpinEdit.CreateEx(groupSettings);
+  GUI.EditEmoteMaxS.Hint := 'these values will be randomized';
+  GUI.EditEmoteMaxS.ShowHint := True;
+  GUI.EditEmoteMaxS.SetBounds(215, 8, 80, 25);
+  GUI.EditEmoteMaxS.MinValue := 21.0;
+  GUI.EditEmoteMaxS.MaxValue := 43200.0;
+  GUI.EditEmoteMaxS.Increment := RandomRight(0.5, 3.5);
+  GUI.EditEmoteMaxS.Value := GUI.EditEmoteMinS.Value * Random(2.9, 3.1);
+
+  emoteInfo := TLazLabel.CreateEx(groupSettings);
+  emoteInfo.Align := ELazAlign.Bottom;
+  emoteInfo.Alignment := ELazAlignment.Center;
+  emoteInfo.Caption := 'Select emotes you''d like to perform when "Inactive", "Chilling" or "Winning".' + LINE_SEP
+    + 'Amount controls how many emotes to do at once. Min and Max is the delay between in seconds.' + LINE_SEP
+    + 'The emote(s) performed will be random. To perform a specific emote more often than others, simply select it multiple times.';
+
+end;
+
 procedure TScriptForm.Init();
+const
+  ShopRewardsString = ['Attack', 'Defence', 'Magic', 'Prayer', 'Strength', 'Ranged', 'Hitpoints',
+    'Herb Pack', 'Mineral Pack', 'Seed Pack',
+    'Void Knight Mace', 'Void Knight Top', 'Void Knight Robes', 'Void Knight Gloves',
+    'Void Mage Helm', 'Void Ranger Helm', 'Void Melee Helm', 'Void Knight Seal'];
 var
   tab: TLazTabSheet;
   goalsPanel: TLazPanel;
-  lblQuickPrayer,
+  enableGroup, disableGroup: TLazGroupBox;
   lblCombatLevel,
-  lblChillActive,
   lblActiveThresh,
   lblPointsPerWin,
   titleLabel,
   authorLabel,
-  lblSpendPoints: TLazLabel;
+  lblSpendPoints,
+  lblRewards,
+  lblRewardAmount: TLazLabel;
   bgImage: TLazImage;
   y: Int32;
 begin
@@ -2846,14 +3080,12 @@ begin
   if USE_AUTO_START then
     Self.Form.OnShow := @StartAutoTimer;
 
-  // ===== Settings Tab =====
   tab := Self.CreateTab('Settings');
   tab.Color := $1A1A1A;
 
   if not FileExists(SimbaEnv.DataPath+'jdsBackground.png') then
     URLFetchToFile('https://i.imgur.com/xN2rmA4.png', SimbaEnv.DataPath+'jdsBackground.png');
 
-  // Background image
   bgImage := TLazImage.CreateEx(tab);
   bgImage.Align := ELazAlign.Client;
   bgImage.Picture.LoadFromFile(SimbaEnv.DataPath + 'jdsBackground.png');
@@ -2863,17 +3095,13 @@ begin
 
   y := 20;
 
-  // Activity Threshold
   lblActiveThresh := TLazLabel.CreateEx(tab, 'Relax at:',
     'Stop playing at this threshold, lightly randomized', 20, y, 180, 30);
   lblActiveThresh.Font.Size := 14;
   lblActiveThresh.Font.Color := $F0F0F0;
-  lblActiveThresh.Color := $2A2A2A;
-  lblActiveThresh.Transparent := False;
-  lblActiveThresh.Alignment := ELazAlignment.Center;
-  lblActiveThresh.Layout := ELazTextLayout.Center;
+  lblActiveThresh.Font.Style := [ELazFontStyles.Bold];
 
-  GUI.EditActiveThreshold := TLazSpinEdit.CreateEx(tab);
+  GUI.EditActiveThreshold := TLazSpinEdit.CreateEx(tab, '', 'disengage at this threshold');
   GUI.EditActiveThreshold.SetBounds(170, y, 100, 30);
   GUI.EditActiveThreshold.MinValue := 50;
   GUI.EditActiveThreshold.MaxValue := 100;
@@ -2882,23 +3110,12 @@ begin
   GUI.EditActiveThreshold.Font.Size := 14;
   GUI.EditActiveThreshold.Font.Color := $F0F0F0;
   GUI.EditActiveThreshold.Color := $2A2A2A;
+  Inc(y, 50);
 
-  GUI.ChkChillIfActive := TLazCheckBox.CreateEx(tab, 'Relax in game',
-    'Reduce activity if above threshold',330, y, 560, 30);
-  GUI.ChkChillIfActive.Font.Size := 14;
-  GUI.ChkChillIfActive.Font.Color := $F0F0F0;
-  GUI.ChkChillIfActive.SetChecked(False);
-
-  Inc(y, 45);
-
-  // Points Per Win
   lblPointsPerWin := TLazLabel.CreateEx(tab, 'Points/Win:', '', 20, y, 140, 30);
   lblPointsPerWin.Font.Size := 14;
   lblPointsPerWin.Font.Color := $F0F0F0;
-  lblPointsPerWin.Color := $2A2A2A;
-  lblPointsPerWin.Transparent := False;
-  lblPointsPerWin.Alignment := ELazAlignment.Center;
-  lblPointsPerWin.Layout := ELazTextLayout.Center;
+  lblPointsPerWin.Font.Style := [ELazFontStyles.Bold];
 
   GUI.EditPointsPerWin := TLazSpinEdit.CreateEx(tab);
   GUI.EditPointsPerWin.SetBounds(170, y, 100, 30);
@@ -2909,23 +3126,12 @@ begin
   GUI.EditPointsPerWin.Font.Size := 14;
   GUI.EditPointsPerWin.Font.Color := $F0F0F0;
   GUI.EditPointsPerWin.Color := $2A2A2A;
-
-  GUI.ChkQuickPrayer := TLazCheckBox.CreateEx(tab, 'Use quick prayers',
-    'Enable quick prayers during combat', 330, y, 0, 0);
-  GUI.ChkQuickPrayer.Font.Size := 14;
-  GUI.ChkQuickPrayer.ShowHint := True;
-  GUI.ChkQuickPrayer.SetChecked(True);
-
   Inc(y, 50);
 
-  // Combat Level
   lblCombatLevel := TLazLabel.CreateEx(tab, 'Combat Level:', '', 20, y, 140, 30);
   lblCombatLevel.Font.Size := 14;
   lblCombatLevel.Font.Color := $F0F0F0;
-  lblCombatLevel.Color := $2A2A2A;
-  lblCombatLevel.Transparent := False;
-  lblCombatLevel.Alignment := ELazAlignment.Center;
-  lblCombatLevel.Layout := ELazTextLayout.Center;
+  lblCombatLevel.Font.Style := [ELazFontStyles.Bold];
 
   GUI.EditCombatLevel := TLazSpinEdit.CreateEx(tab);
   GUI.EditCombatLevel.SetBounds(170, y, 100, 30);
@@ -2937,71 +3143,90 @@ begin
   GUI.EditCombatLevel.Font.Color := $F0F0F0;
   GUI.EditCombatLevel.Color := $2A2A2A;
   Inc(y, 50);
+  
+  lblRewards := TLazLabel.CreateEx(tab, 'Reward:',
+    'Select experience or items', 20, y, 80, 30);
+  lblRewards.Font.Size := 14;
+  lblRewards.Font.Color := $F0F0F0;
+  lblRewards.Font.Style := [ELazFontStyles.Bold];
 
-  // === Advanced Options Header ===
-  lblQuickPrayer := TLazLabel.CreateEx(tab, 'User Options', '', 20, y, 220, 30);
-  lblQuickPrayer.Font.Size := 14;
-  lblQuickPrayer.Font.Color := $3B9FFF;
-  lblQuickPrayer.Font.Style := [ELazFontStyles.Bold];
-  lblQuickPrayer.Color := $2A2A2A;
-  lblQuickPrayer.Transparent := False;
-  lblQuickPrayer.Alignment := ELazAlignment.Center;
-  lblQuickPrayer.Layout := ELazTextLayout.Center;
-  Inc(y, 40);
+  GUI.ComboUserRewards := TLazComboBox.CreateEx(tab);
+  GUI.ComboUserRewards.SetBounds(110, y, 160, 30);
+  GUI.ComboUserRewards.Items.AddStrings(ShopRewardsString);
+  GUI.ComboUserRewards.AutoSelected := False;
+  Inc(y, 30);
 
-  // Disable HUD
-  GUI.ChkDisableHUD := TLazCheckBox.CreateEx(tab);
-  GUI.ChkDisableHUD.SetBounds(20, y, 300, 30);
-  GUI.ChkDisableHUD.Caption := 'Disable HUD';
-  GUI.ChkDisableHUD.Hint := 'Turn off in-game overlay';
-  GUI.ChkDisableHUD.ShowHint := True;
-  GUI.ChkDisableHUD.Font.Size := 14;
-  GUI.ChkDisableHUD.Font.Color := $F0F0F0;
+  lblRewardAmount := TLazLabel.CreateEx(tab, 'Amount:',
+    'amount of points to spend, -1 for all, 0 disable', 20, y, 80, 30);
+  lblRewardAmount.Font.Size := 14;
+  lblRewardAmount.Font.Color := $F0F0F0;
+  lblRewardAmount.Font.Style := [ELazFontStyles.Bold];
+
+  GUI.EditRewardAmount := TLazSpinEdit.CreateEx(tab);
+  GUI.EditRewardAmount.SetBounds(110, y, 80, 30);
+  GUI.EditRewardAmount.MinValue := -1;
+  GUI.EditRewardAmount.MaxValue := 4000;
+  GUI.EditRewardAmount.Value := 0;
+  GUI.EditRewardAmount.Font.Size := 14;
+  GUI.EditRewardAmount.Font.Color := $F0F0F0;
+  GUI.EditRewardAmount.Color := $2A2A2A;
+  Inc(y, 50);
+
+  enableGroup := TLazGroupBox.create(tab);
+  enableGroup.Parent := tab;
+  enableGroup.SetBounds(500, 0, 150, 150);
+  enableGroup.Caption := 'Options to enable';
+
+  GUI.ChkChillIfActive := TLazCheckBox.CreateEx(enableGroup, 'Chill if active',
+    'Reduce activity if above threshold');
+  GUI.ChkChillIfActive.Align := ELazAlign.Top;
+  GUI.ChkChillIfActive.SetChecked(False);
+
+  GUI.ChkQuickPrayer := TLazCheckBox.CreateEx(enableGroup, 'Use quick prayers',
+    'Enable quick prayers during combat');
+  GUI.ChkQuickPrayer.Align := ELazAlign.Top;
+  GUI.ChkQuickPrayer.SetChecked(False);
+
+  GUI.ChkRestAfterGame := TLazCheckBox.CreateEx(enableGroup, 'Rest After Game',
+    'Sometimes decide to pause briefly after a game ends');
+  GUI.ChkRestAfterGame.Align := ELazAlign.Top;
+  GUI.ChkRestAfterGame.SetChecked(False);
+
+  disableGroup := TLazGroupBox.create(tab);
+  disableGroup.Parent := tab;
+  disableGroup.SetBounds(650, 0, 150, 150);
+  disableGroup.Caption := 'Options to disable';
+
+  GUI.ChkDisableHUD := TLazCheckBox.CreateEx(disableGroup, 'Disable HUD',
+    'Turn off in-game overlay');
+  GUI.ChkDisableHUD.Align := ELazAlign.Top;
   GUI.ChkDisableHUD.SetChecked(False);
 
-  // Disable Boat Movement
-  GUI.ChkDisableMoveInBoat := TLazCheckBox.CreateEx(tab);
-  GUI.ChkDisableMoveInBoat.SetBounds(390, y, 330, 30);
-  GUI.ChkDisableMoveInBoat.Caption := 'Disable Boat Move';
-  GUI.ChkDisableMoveInBoat.Hint := 'Disable boat movement entirely';
-  GUI.ChkDisableMoveInBoat.ShowHint := True;
-  GUI.ChkDisableMoveInBoat.Font.Size := 14;
-  GUI.ChkDisableMoveInBoat.Font.Color := $F0F0F0;
+  GUI.ChkDisableMoveInBoat := TLazCheckBox.CreateEx(disableGroup, 'Disable Boat Move',
+    'Disable boat movement entirely');
+  GUI.ChkDisableMoveInBoat.Align := ELazAlign.Top;
   GUI.ChkDisableMoveInBoat.SetChecked(False);
-  Inc(y, 35);
 
-  // Disable Pacing
-  GUI.ChkDisablePace := TLazCheckBox.CreateEx(tab);
-  GUI.ChkDisablePace.SetBounds(20, y, 300, 30);
-  GUI.ChkDisablePace.Caption := 'Disable Pacing';
-  GUI.ChkDisablePace.Hint := 'Disable game movement entirely';
-  GUI.ChkDisablePace.ShowHint := True;
-  GUI.ChkDisablePace.Font.Size := 14;
-  GUI.ChkDisablePace.Font.Color := $F0F0F0;
+  GUI.ChkDisablePace := TLazCheckBox.CreateEx(disableGroup, 'Disable Pacing',
+    'Disable game movement entirely');
+  GUI.ChkDisablePace.Align := ELazAlign.Top;
   GUI.ChkDisablePace.SetChecked(False);
 
-  // Disable Leave Game
-  GUI.ChkDisableLeaveGame := TLazCheckBox.CreateEx(tab);
-  GUI.ChkDisableLeaveGame.SetBounds(390, y, 330, 30);
-  GUI.ChkDisableLeaveGame.Caption := 'Disable Auto-Leave';
-  GUI.ChkDisableLeaveGame.Hint := 'Never leave a game, even if activity drops';
-  GUI.ChkDisableLeaveGame.ShowHint := True;
-  GUI.ChkDisableLeaveGame.Font.Size := 14;
-  GUI.ChkDisableLeaveGame.Font.Color := $F0F0F0;
+  GUI.ChkDisableLeaveGame := TLazCheckBox.CreateEx(disableGroup, 'Disable Auto-Leave',
+    'Never leave a game, even if activity drops to 0');
+  GUI.ChkDisableLeaveGame.Align := ELazAlign.Top;
   GUI.ChkDisableLeaveGame.SetChecked(False);
-  Inc(y, 35);
 
-  // Disable Fatigue
-  GUI.ChkDisableFatigue := TLazCheckBox.CreateEx(tab);
-  GUI.ChkDisableFatigue.SetBounds(20, y, 300, 30);
-  GUI.ChkDisableFatigue.Caption := 'Disable Fatigue';
-  GUI.ChkDisableFatigue.Hint := 'Disable fatigue system';
-  GUI.ChkDisableFatigue.ShowHint := True;
-  GUI.ChkDisableFatigue.Font.Size := 14;
-  GUI.ChkDisableFatigue.Font.Color := $F0F0F0;
+  GUI.ChkDisableFatigue := TLazCheckBox.CreateEx(disableGroup, 'Disable Fatigue',
+    'Disable fatigue system (will be disabled if unavailable)');
+  GUI.ChkDisableFatigue.Align := ELazAlign.Top;
   GUI.ChkDisableFatigue.SetChecked(False);
 
-  // Title and Author in bottom right
+  GUI.ChkDisableInactive := TLazCheckBox.CreateEx(disableGroup, 'Disable Inactive',
+    'Disable activities performed when inactive');
+  GUI.ChkDisableInactive.Align := ELazAlign.Top;
+  GUI.ChkDisableInactive.SetChecked(False);
+
   titleLabel := TLazLabel.CreateEx(tab, 'Pest Control LITE', '', 520, 420, 250, 35);
   titleLabel.Font.Size := 24;
   titleLabel.Font.Color := $3B9FFF;
@@ -3009,36 +3234,14 @@ begin
   titleLabel.Transparent := True;
   titleLabel.Alignment := ELazAlignment.RightJustify;
 
-  authorLabel := TLazLabel.CreateEx(tab, 'by footballjds', '', 580, 455, 190, 20);
+  authorLabel := TLazLabel.CreateEx(tab, 'by footballjds', 'Thanks to WaspLib contributors!!!', 580, 455, 190, 20);
   authorLabel.Font.Size := 12;
   authorLabel.Font.Color := $3B9FFF;
   authorLabel.Transparent := True;
   authorLabel.Alignment := ELazAlignment.RightJustify;
 
-  // Load saved config
-  if GUI.config.Data.Has('quick_prayer') then
-    GUI.ChkQuickPrayer.SetChecked(GUI.config.Data.Item['quick_prayer'].AsBool);
-  if GUI.config.Data.Has('chill_if_active') then
-    GUI.ChkChillIfActive.SetChecked(GUI.config.Data.Item['chill_if_active'].AsBool);
-  if GUI.config.Data.Has('active_threshold') then
-    GUI.EditActiveThreshold.Text := ToStr(GUI.config.Data.Item['active_threshold'].AsInt);
-  if GUI.config.Data.Has('points_per_win') then
-    GUI.EditPointsPerWin.Text := ToStr(GUI.config.Data.Item['points_per_win'].AsInt);
+  Self.CreateEmotesTab();
 
-  if GUI.config.Data.Has('disable_hud') then
-    GUI.ChkDisableHUD.SetChecked(GUI.config.Data.Item['disable_hud'].AsBool);
-  if GUI.config.Data.Has('disable_move_in_boat') then
-    GUI.ChkDisableMoveInBoat.SetChecked(GUI.config.Data.Item['disable_move_in_boat'].AsBool);
-  if GUI.config.Data.Has('disable_pace') then
-    GUI.ChkDisablePace.SetChecked(GUI.config.Data.Item['disable_pace'].AsBool);
-  if GUI.config.Data.Has('disable_leave_game') then
-    GUI.ChkDisableLeaveGame.SetChecked(GUI.config.Data.Item['disable_leave_game'].AsBool);
-  if GUI.config.Data.Has('disable_fatigue') then
-    GUI.ChkDisableFatigue.SetChecked(GUI.config.Data.Item['disable_fatigue'].AsBool);
-  if GUI.config.Data.Has('combat_level') then
-    GUI.EditCombatLevel.Text := ToStr(GUI.config.Data.Item['combat_level'].AsInt);
-
-  // Goals panel at bottom
   goalsPanel := Self.CreateGoals(tab, True, True, False, EOrientation.HORIZONTAL);
   goalsPanel.Align := ELazAlign.Bottom;
   goalsPanel.Color := $3B9FFF;
@@ -3057,20 +3260,42 @@ begin
   GUI.EditSpendPointsAt.Align := ELazAlign.Right;
   GUI.EditSpendPointsAt.BorderSpacing.Around := 8;
   GUI.EditSpendPointsAt.MinValue := -1;
-  GUI.EditSpendPointsAt.MaxValue := 4000;
+  GUI.EditSpendPointsAt.MaxValue := Random(3500, 3800);
   GUI.EditSpendPointsAt.Value := -1;
   GUI.EditSpendPointsAt.ValueEmpty := True;
-  GUI.EditSpendPointsAt.Increment := Random(25, 50);
+  GUI.EditSpendPointsAt.Increment := Random(17, 63);
 
   if GUI.config.Data.Has('goal_actions') then
     Self.Goals.Actions.Value := GUI.config.Data.Item['goal_actions'].AsInt;
   if GUI.config.Data.Has('goal_time') then
     Self.Goals.Time.Value := GUI.config.Data.Item['goal_time'].AsInt;
+  if GUI.config.Data.Has('quick_prayer') then
+    GUI.ChkQuickPrayer.SetChecked(GUI.config.Data.Item['quick_prayer'].AsBool);
+  if GUI.config.Data.Has('chill_if_active') then
+    GUI.ChkChillIfActive.SetChecked(GUI.config.Data.Item['chill_if_active'].AsBool);
+  if GUI.config.Data.Has('active_threshold') then
+    GUI.EditActiveThreshold.Text := ToStr(GUI.config.Data.Item['active_threshold'].AsInt);
+  if GUI.config.Data.Has('points_per_win') then
+    GUI.EditPointsPerWin.Text := ToStr(GUI.config.Data.Item['points_per_win'].AsInt);
+  if GUI.config.Data.Has('disable_hud') then
+    GUI.ChkDisableHUD.SetChecked(GUI.config.Data.Item['disable_hud'].AsBool);
+  if GUI.config.Data.Has('disable_move_in_boat') then
+    GUI.ChkDisableMoveInBoat.SetChecked(GUI.config.Data.Item['disable_move_in_boat'].AsBool);
+  if GUI.config.Data.Has('disable_pace') then
+    GUI.ChkDisablePace.SetChecked(GUI.config.Data.Item['disable_pace'].AsBool);
+  if GUI.config.Data.Has('disable_leave_game') then
+    GUI.ChkDisableLeaveGame.SetChecked(GUI.config.Data.Item['disable_leave_game'].AsBool);
+  if GUI.config.Data.Has('disable_fatigue') then
+    GUI.ChkDisableFatigue.SetChecked(GUI.config.Data.Item['disable_fatigue'].AsBool);
+  if GUI.config.Data.Has('combat_level') then
+    GUI.EditCombatLevel.Text := ToStr(GUI.config.Data.Item['combat_level'].AsInt);
+  if GUI.config.Data.Has('disable_inactive') then
+    GUI.ChkDisableFatigue.SetChecked(GUI.config.Data.Item['disable_inactive'].AsBool);
+  if GUI.config.Data.Has('rest_after_game') then
+    GUI.ChkDisableFatigue.SetChecked(GUI.config.Data.Item['rest_after_game'].AsBool);
 
-  // ===== Antiban Tab =====
   Self.CreateAntibanTab();
 
-  // Hook interactions
   GUI.ChkQuickPrayer.OnChange := @OnAnyInteraction;
   GUI.ChkChillIfActive.OnChange := @OnAnyInteraction;
   GUI.EditActiveThreshold.OnChange := @OnAnyInteraction;
@@ -3081,9 +3306,14 @@ begin
   GUI.ChkDisableLeaveGame.OnChange := @OnAnyInteraction;
   GUI.EditCombatLevel.OnChange := @OnAnyInteraction;
   GUI.ChkDisableFatigue.OnChange := @OnAnyInteraction;
+  Gui.EditSpendPointsAt.OnChange := @OnAnyInteraction;
+  GUI.ChkDisableInactive.OnChange := @OnAnyInteraction;
+  GUI.ChkRestAfterGame.OnChange := @OnAnyInteraction;
+  GUI.ComboUserRewards.OnChange := @OnAnyInteraction;
+  GUI.EditRewardAmount.OnChange := @OnAnyInteraction;
   Self.Goals.Actions.OnChange := @OnAnyInteraction;
   Self.Goals.Time.OnChange := @OnAnyInteraction;
-  Gui.EditSpendPointsAt.OnChange := @OnAnyInteraction;
+  Self.PageControl.OnChange := @OnAnyInteraction;
   Self.Run();
 end;
 
