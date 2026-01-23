@@ -55,6 +55,7 @@ type
 
 type
   TDeseqState = record
+    // Deseq traits
     U: TDoubleArray;
 
     // Per-game
@@ -91,7 +92,9 @@ type
     StateT: UInt64;
     StateTimer: TStateTimer;
     
-    // Map coordinates
+    // Map coordinates, rename for clarity or wait for refactor
+    // Your script looks like toilet paper used by Donald Trump
+    // Seperate your concerns instead of monolithic type declaration
     Center, AtPlank, CrossPlank: TPoint;
     BoatBox: TBox;
 
@@ -176,7 +179,7 @@ begin
     Result := FormatMilliseconds(ms, 'h\h m\m');
 end;
 
-// Truncated Gaussian with re-sample instead of clamps
+// Truncated Gaussian with re-sample instead of clamp
 function TruncGauss(mu, sigma, lo, hi: Double): Double;
 begin
   if lo > hi then
@@ -198,7 +201,6 @@ end;
 // John D. Cook approximation ported to Simba 2.0
 // Domain: x > 0
 // Exposes: Gamma(x), LogGamma(x)
-
 function LogGamma(x: Double): Double; forward;
 
 function Gamma(x: Double): Double;
@@ -654,7 +656,7 @@ begin
   self.ConfirmButton.EnabledColors := [[$1F98FF, 0]];
 
   Self.NPC := TRSEntity.Create(
-    @Map.Walker,
+    Map.Walker,
     [1, 1, 1],
     20,
     [[10648, 39826], [10640, 39826]],
@@ -1592,7 +1594,7 @@ begin
   else
     TerminateScript('[INIT] Combat level too low: ' + ToStr(Self.CombatLevel));
 
-  Self.Gangplank := TRSObject.Create(@Map.Walker, [1, 1, 1], [Self.CrossPlank], ['Cross Gang']);
+  Self.Gangplank := TRSObject.Create(Map.Walker, [1, 1, 1], [Self.CrossPlank], ['Cross Gang']);
 end;
 
 procedure TPestControl.MoveInBoat();
@@ -2553,9 +2555,9 @@ begin
   Map.Walker.OnWalkEvent := @Self.OnWalkerEvent;
   Map.Walker.TargetUpText := ['tack Shifter', 'Attack Shifter'];
   Self.Center := PCData.Knight.Offset(2, 0);
-  Self.Squire := TRSEntity.Create(@Map.Walker, [1, 1, 4], 5, [PCData.LeaveNPC], ['to Squire', 'Talk-to'], [ERSMinimapDot.NPC]);
+  Self.Squire := TRSEntity.Create(Map.Walker, [1, 1, 4], 5, [PCData.LeaveNPC], ['to Squire', 'Talk-to'], [ERSMinimapDot.NPC]);
   Self.Shifter := TRSEntity.Create(
-    @Map.Walker,
+    Map.Walker,
     [1, 1, 1],
     14 + Round(3*bhM),
     [PCData.Knight],
