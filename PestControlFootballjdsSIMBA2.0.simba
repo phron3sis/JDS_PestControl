@@ -2,7 +2,6 @@
 {$DEFINE SCRIPT_REVISION := '2'}
 {$DEFINE SCRIPT_GUI}
 {$I WaspLib/osrs.simba}
-//{$I WaspLib/osrs/antiban/fatigue.simba}
 const
   USE_AUTO_START    = TRUE; //auto-start
   AUTO_START_DELAY  = 30;   //delay(in seconds) before auto-starting
