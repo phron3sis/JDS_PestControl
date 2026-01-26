@@ -1632,7 +1632,7 @@ begin
 
   until (current.DistanceTo(target) > (5 + (Random(3, 5) * Self.B[5])));
 
-  destMS := Map.Walker.GetQuadMS(current, target, [1], Minimap.CompassRadians);
+  destMS := Map.Walker.GetQuadMS(current, target, [1, 1], Minimap.CompassRadians);
   if not Mainscreen.Bounds.ContainsQuad(destMS) then Exit;
 
   // Using EMouseDistribution to move to different point in QuadMS
@@ -1646,9 +1646,10 @@ begin
 
   Sleep(ExpoGaussRT());
 
-  Self.LastBoatMove := Time;
+  Self.LastBoatMove := Time();
   Self.BoatMoveDelay := Round(WeibullEx(1.3 + 1.2*Self.B[7],
-    (8000 + 20000*Self.B[8]) * TruncGauss(1.0, 0.15, 0.7, 1.3)));
+    (13000 + 20000*Self.B[8]) * TruncGauss(1.0, 0.15, 0.7, 1.3)));
+  Logger.Info('Just moved in boat. Boat Move Delay: %d', [Self.BoatMoveDelay]);
 end;
 
 procedure TPestControl.WhileInBoat();
@@ -1824,7 +1825,7 @@ begin
     uniqueMiddle := midP;
     uniqueMiddle.X += Round(-9 + 18 * SampleBeta(1 + 3*Self.LocU[4], 1 + 3*(1-Self.LocU[4])));
     uniqueMiddle.Y += Round(-9 + 18 * SampleBeta(1 + 3*Self.LocU[5], 1 + 3*(1-Self.LocU[5])));
-    quadMS := Minimap.Point2MSQuad(uniqueMiddle, [1], Minimap.CompassRadians);
+    quadMS := Minimap.Point2MSQuad(uniqueMiddle, [1,1], Minimap.CompassRadians);
     if Mainscreen.Bounds.ContainsQuad(quadMS) then
     begin
       distIdx := Floor(4 * SampleBeta(1 + 3*Self.LocU[6], 1 + 3*(1-Self.LocU[6]))) + 1;
